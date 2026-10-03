@@ -1,0 +1,16 @@
+# Personal settings, held originals, and the convert record
+app/settings.json
+app/pending.json
+app/convert-log.tsv
+
+# Too large for GitHub. License text stays.
+tools/*.exe
+
+# Shortcut is rewritten for this PC
+*.lnk
+
+# Uploaded separately as a GitHub Release
+video_dehydrator.exe
+
+Thumbs.db
+desktop.ini

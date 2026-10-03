@@ -1,0 +1,6 @@
+HandBrakeCLI.exe
+  HandBrake, GPL-2.0. https://handbrake.fr/
+  The license text is HandBrake-LICENSE.txt.
+
+ffmpeg.exe, ffprobe.exe, ffplay.exe
+  FFmpeg, GPL-3.0. See FFmpeg-LICENSE.txt.
