@@ -1,12 +1,14 @@
 # Video Dehydrator
 
-Version 1.0.0
+Version 1.0.1
 
 A Windows program that finds videos that are too big for their picture size, encodes a smaller copy, and puts that copy where the original was.
 
 Double-click **Video Dehydrator** in this folder. If that shortcut does nothing, open `app\launch.vbs` once. That starts the program and repairs the shortcut.
 
 Choose a folder and click Scan. Checked rows are the ones Convert will shrink. The original is kept in `.vd-originals` until you delete it. Compare plays the new file. Undo puts the last conversion back.
+
+Check for updates looks for a newer version on GitHub. Update downloads that version and opens the setup program. The setup replaces the installed copy and keeps your settings.
 
 ## Tools
 

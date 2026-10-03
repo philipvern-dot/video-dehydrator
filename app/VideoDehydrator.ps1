@@ -336,6 +336,12 @@ $script:HandBrake = $bundled.HandBrake
 $script:SettingsPath = Join-Path $script:AppDir 'settings.json'
 $script:PendingPath = Join-Path $script:AppDir 'pending.json'
 $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
+$script:UpdateRepo = 'video-dehydrator'
+$script:UpdateAsset = 'video_dehydrator.exe'
+$script:UpdateProduct = 'Video Dehydrator'
+$script:UpdateFallback = '1.0.1'
+$script:UpdateOffer = $null
+$script:UpdateClosing = $false
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -1046,6 +1052,7 @@ function Update-Buttons {
     foreach ($box in @($script:BudgetBoxes)) {
         if ($box) { $box.Enabled = -not $busy }
     }
+    Update-UpdateButtons
     Update-Savings
 }
 
@@ -2100,6 +2107,252 @@ function Invoke-UiTick {
     }
 }
 
+function Test-UpdateBusy {
+    return ($script:Work -ne 'idle')
+}
+
+function Remove-VersionPrefix([string]$text) {
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    $clean = $text.Trim()
+    if (($clean.StartsWith('v') -or $clean.StartsWith('V')) -and $clean.Length -gt 1) {
+        $rest = $clean.Substring(1)
+        if ($rest -match '^\d+\.\d+\.\d+$') { return $rest }
+    }
+    return $clean
+}
+
+function ConvertTo-VersionNumbers([string]$text) {
+    $clean = ''
+    if ($null -ne $text) { $clean = $text.Trim() }
+    if ($clean -match '^(\d+)\.(\d+)\.(\d+)$') {
+        $numbers = @([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+        return ,$numbers
+    }
+    return $null
+}
+
+function Compare-AppVersion([string]$left, [string]$right) {
+    $a = ConvertTo-VersionNumbers (Remove-VersionPrefix $left)
+    $b = ConvertTo-VersionNumbers (Remove-VersionPrefix $right)
+    if ($null -eq $a -or $null -eq $b) { return $null }
+    for ($i = 0; $i -lt 3; $i++) {
+        if ($a[$i] -gt $b[$i]) { return 1 }
+        if ($a[$i] -lt $b[$i]) { return -1 }
+    }
+    return 0
+}
+
+function Get-AppVersion {
+    $path = Join-Path $script:AppDir 'version.txt'
+    if (Test-Path -LiteralPath $path) {
+        $text = ''
+        try { $text = [IO.File]::ReadAllText($path).Trim() } catch { $text = '' }
+        if ($text -match '^\d+\.\d+\.\d+$') { return $text }
+    }
+    return [string]$script:UpdateFallback
+}
+
+function Test-InstalledCopy {
+    $programs = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs'))
+    if (-not $programs.EndsWith('\')) { $programs = $programs + '\' }
+    $root = [IO.Path]::GetFullPath($script:Root)
+    if (-not $root.EndsWith('\')) { $root = $root + '\' }
+    return $root.StartsWith($programs, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Update-UpdateButtons {
+    $busy = Test-UpdateBusy
+    if ($script:CheckUpdateButton) { $script:CheckUpdateButton.Enabled = -not $busy }
+    if ($script:UpdateButton) {
+        $ready = (-not $busy) -and ($null -ne $script:UpdateOffer) -and [bool]$script:UpdateOffer.Newer
+        $script:UpdateButton.Enabled = $ready
+    }
+}
+
+function Get-UpdateOffer($release) {
+    $remote = Remove-VersionPrefix ([string]$release.tag_name)
+    $cmp = Compare-AppVersion $remote (Get-AppVersion)
+    $asset = $null
+    foreach ($item in @($release.assets)) {
+        if ($null -eq $item) { continue }
+        if ([string]$item.name -eq $script:UpdateAsset) { $asset = $item }
+    }
+    $result = [pscustomobject]@{
+        Newer = $false
+        Version = $remote
+        Url = ''
+        Size = [int64]0
+        Message = ''
+        Kind = 'idle'
+    }
+    if ($null -eq $cmp) {
+        $result.Message = 'The latest release has no version number.'
+        $result.Kind = 'err'
+        return $result
+    }
+    $url = ''
+    $size = [int64]0
+    if ($null -ne $asset) {
+        $url = [string]$asset.browser_download_url
+        try { $size = [int64]$asset.size } catch { $size = 0 }
+    }
+    if ([string]::IsNullOrWhiteSpace($url) -or $size -le 0 -or $url -notmatch '^https://github\.com/philipvern-dot/') {
+        $result.Message = 'The latest release does not include the setup program.'
+        $result.Kind = 'err'
+        return $result
+    }
+    if ($cmp -le 0) {
+        $result.Message = 'You have the latest version (' + (Get-AppVersion) + ').'
+        $result.Kind = 'ok'
+        return $result
+    }
+    $result.Newer = $true
+    $result.Url = $url
+    $result.Size = $size
+    $result.Message = 'Version ' + $remote + ' is available.'
+    $result.Kind = 'ok'
+    return $result
+}
+
+function Apply-UpdateOffer($offer) {
+    if ($offer.Newer) { $script:UpdateOffer = $offer } else { $script:UpdateOffer = $null }
+    Update-UpdateButtons
+    Set-Status $offer.Message $offer.Kind
+    $kind = 'dim'
+    if ($offer.Kind -eq 'err') { $kind = 'err' }
+    elseif ($offer.Newer) { $kind = 'ok' }
+    Write-Activity $offer.Message $kind
+}
+
+function Start-UpdateCheck {
+    if (Test-UpdateBusy) {
+        [Windows.Forms.MessageBox]::Show($script:Form, 'Finish or cancel the current job before checking for updates.', $script:UpdateProduct, 'OK', 'Information') | Out-Null
+        return
+    }
+    $script:UpdateOffer = $null
+    Update-UpdateButtons
+    Set-Status 'Checking for updates...' 'busy'
+    $script:Form.Cursor = [Windows.Forms.Cursors]::WaitCursor
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $url = 'https://api.github.com/repos/philipvern-dot/' + $script:UpdateRepo + '/releases/latest'
+        $headers = @{ 'User-Agent' = $script:UpdateProduct; 'Accept' = 'application/vnd.github+json' }
+        $release = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+        Apply-UpdateOffer (Get-UpdateOffer $release)
+    } catch {
+        $script:UpdateOffer = $null
+        Update-UpdateButtons
+        $status = 0
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($status -eq 404) { $message = 'No published update was found.' }
+        else { $message = 'Could not reach GitHub to check for updates.' }
+        Set-Status $message 'err'
+        Write-Activity $message 'err'
+    } finally {
+        $script:Form.Cursor = [Windows.Forms.Cursors]::Default
+    }
+}
+
+function Receive-SetupFile([string]$url, [string]$dest, [int64]$expected) {
+    if (Test-Path -LiteralPath $dest) {
+        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $client = New-Object Net.WebClient
+    $client.Headers['User-Agent'] = $script:UpdateProduct
+    $dialog = New-Object Windows.Forms.Form
+    $dialog.Text = 'Update'
+    $dialog.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
+    $dialog.StartPosition = [Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.ClientSize = New-Object Drawing.Size(420, 128)
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.ControlBox = $false
+    $dialog.Font = $script:FontUi
+    $label = New-Object Windows.Forms.Label
+    $label.Text = 'Downloading the update...'
+    $label.SetBounds(20, 18, 380, 24)
+    $bar = New-Object Windows.Forms.ProgressBar
+    $bar.SetBounds(20, 50, 380, 22)
+    $bar.Minimum = 0
+    $bar.Maximum = 100
+    $cancel = New-Button 'Cancel' 'secondary' 100 32
+    $cancel.SetBounds(300, 82, 100, 32)
+    $dialog.Controls.Add($label)
+    $dialog.Controls.Add($bar)
+    $dialog.Controls.Add($cancel)
+    $state = New-Object psobject -Property @{ Done = $false; Error = $null; Cancelled = $false }
+    $client.add_DownloadProgressChanged({
+        try {
+            $pct = [int]$args[1].ProgressPercentage
+            if ($pct -lt 0) { $pct = 0 }
+            if ($pct -gt 100) { $pct = 100 }
+            $bar.Value = $pct
+            $label.Text = 'Downloading the update... ' + $pct + '%'
+        } catch { }
+    })
+    $client.add_DownloadFileCompleted({
+        $state.Done = $true
+        if ($args[1].Cancelled) { $state.Cancelled = $true }
+        elseif ($args[1].Error) { $state.Error = $args[1].Error }
+        try { if (-not $dialog.IsDisposed) { $dialog.Close() } } catch { }
+    })
+    $cancel.Add_Click({
+        $state.Cancelled = $true
+        try { $client.CancelAsync() } catch { }
+    })
+    $dialog.Add_Shown({
+        try { $client.DownloadFileAsync([Uri]$url, $dest) }
+        catch {
+            $state.Done = $true
+            $state.Error = $_.Exception
+            try { $dialog.Close() } catch { }
+        }
+    })
+    [void]$dialog.ShowDialog($script:Form)
+    $client.Dispose()
+    if ($state.Cancelled) {
+        if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue }
+        Set-Status 'Update cancelled.' 'idle'
+        Write-Activity 'Update cancelled.' 'dim'
+        return $false
+    }
+    if ($state.Error -or -not (Test-Path -LiteralPath $dest)) {
+        if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue }
+        Set-Status 'The download did not finish.' 'err'
+        Write-Activity 'The download did not finish.' 'err'
+        return $false
+    }
+    $got = [int64](Get-Item -LiteralPath $dest).Length
+    if ($expected -gt 0 -and $got -ne $expected) {
+        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+        Set-Status 'The download did not match the size published on GitHub.' 'err'
+        Write-Activity ('The download was ' + $got + ' bytes. GitHub published ' + $expected + ' bytes.') 'err'
+        return $false
+    }
+    return $true
+}
+
+function Start-UpdateInstall {
+    if (Test-UpdateBusy) {
+        [Windows.Forms.MessageBox]::Show($script:Form, 'Finish or cancel the current job before updating.', $script:UpdateProduct, 'OK', 'Information') | Out-Null
+        return
+    }
+    $offer = $script:UpdateOffer
+    if ($null -eq $offer -or -not $offer.Newer) { return }
+    $prompt = 'Version ' + $offer.Version + ' is ready to install. This window will close and the setup program will open.'
+    if (-not (Test-InstalledCopy)) {
+        $prompt = 'Version ' + $offer.Version + ' is ready to install. This folder was not installed by the setup program, so the setup installs the new version for this Windows user and leaves this folder as it is. This window will close.'
+    }
+    $answer = [Windows.Forms.MessageBox]::Show($script:Form, $prompt, $script:UpdateProduct, 'OKCancel', 'Question')
+    if ($answer -ne [Windows.Forms.DialogResult]::OK) { return }
+    $dest = Join-Path $env:TEMP ($script:UpdateAsset.Replace('.exe', '') + '-' + $offer.Version + '.exe')
+    if (-not (Receive-SetupFile $offer.Url $dest $offer.Size)) { return }
+    Start-Process -FilePath $dest | Out-Null
+    $script:UpdateClosing = $true
+    $script:Form.Close()
+}
+
 function Layout-Actions {
     $panel = $script:ActionPanel
     if ($null -eq $panel -or $panel.ClientSize.Width -lt 20) { return }
@@ -2335,8 +2588,16 @@ function Layout-FileColumns {
 function Update-ChromeLayout {
     $header = $script:Header
     if ($header -and $header.ClientSize.Width -gt 0) {
-        $script:TitleLabel.SetBounds(28, 16, ($header.ClientSize.Width - 56), 36)
-        $script:SubtitleLabel.SetBounds(28, 54, ($header.ClientSize.Width - 56), 48)
+        $reserve = 28
+        if ($script:CheckUpdateButton -and $script:UpdateButton) {
+            $right = $header.ClientSize.Width - 24
+            $script:UpdateButton.Location = New-Object Drawing.Point(($right - $script:UpdateButton.Width), 18)
+            $script:CheckUpdateButton.Location = New-Object Drawing.Point(($script:UpdateButton.Left - 8 - $script:CheckUpdateButton.Width), 18)
+            $reserve = $header.ClientSize.Width - $script:CheckUpdateButton.Left + 16
+        }
+        $textWidth = [Math]::Max(160, ($header.ClientSize.Width - 28 - $reserve))
+        $script:TitleLabel.SetBounds(28, 16, $textWidth, 36)
+        $script:SubtitleLabel.SetBounds(28, 54, $textWidth, 48)
     }
     $status = $script:StatusPanel
     if ($status -and $status.ClientSize.Width -gt 0) {
@@ -2386,6 +2647,10 @@ function Get-HelpSections {
         @{
             Title = 'Auto'
             Body = "Delete originals automatically does the deletion as soon as a file checks out. The program asks once before a convert with Auto turned on. With Auto off, every original stays until you press Delete originals."
+        },
+        @{
+            Title = 'Updates'
+            Body = "Check for updates looks on GitHub for a newer version of this program. When one is there, Update downloads it and opens the setup program. The setup replaces the installed copy and keeps your settings.`r`n`r`nFinish or cancel the current job before you update. The program closes while the setup runs, then you can open it again."
         },
         @{
             Title = 'What is in this folder'
@@ -2578,8 +2843,13 @@ $script:SubtitleLabel.Text = "Shrink videos that are too big for their picture s
 $script:SubtitleLabel.Font = $script:FontSubtitle
 $script:SubtitleLabel.ForeColor = $script:ColorHeaderMuted
 $script:SubtitleLabel.BackColor = $script:ColorHeader
+$script:CheckUpdateButton = New-Button 'Check for updates' 'secondary' 168 34
+$script:UpdateButton = New-Button 'Update' 'primary' 100 34
+$script:UpdateButton.Enabled = $false
 $script:Header.Controls.Add($script:TitleLabel)
 $script:Header.Controls.Add($script:SubtitleLabel)
+$script:Header.Controls.Add($script:CheckUpdateButton)
+$script:Header.Controls.Add($script:UpdateButton)
 
 $script:StatusPanel = New-Object Windows.Forms.Panel
 $script:StatusPanel.Dock = 'Bottom'
@@ -2872,6 +3142,8 @@ $script:CompareButton.Add_Click({ Show-Compare })
 $script:UndoButton.Add_Click({ Start-UndoLast })
 $script:DeleteButton.Add_Click({ Remove-CheckedOriginals })
 $script:HelpButton.Add_Click({ Show-Help })
+$script:CheckUpdateButton.Add_Click({ Start-UpdateCheck })
+$script:UpdateButton.Add_Click({ Start-UpdateInstall })
 
 $activityLabel = New-Object Windows.Forms.Label
 $activityLabel.Text = 'Activity'
@@ -2934,6 +3206,8 @@ Set-Tip $script:CompareButton 'Play the original and the new file side by side.'
 Set-Tip $script:UndoButton 'Put the originals from the last conversion back, and delete the new files. The program asks first.'
 Set-Tip $script:DeleteButton 'Delete the checked originals that are waiting in .vd-originals. The new files stay.'
 Set-Tip $script:HelpButton 'Open a short guide to the size rule, comparing, and what each part of this folder is for.'
+Set-Tip $script:CheckUpdateButton 'Look on GitHub for a newer version of Video Dehydrator.'
+Set-Tip $script:UpdateButton 'Download the newer version and open its setup program. This window closes while that setup runs.'
 Set-Tip $script:FolderPick 'Folders that have bloated files. A show is listed with the folders inside it. Pick one to make a smaller convert job.'
 Set-Tip $script:SelectFolderButton 'Check the bloated files in the folder shown here, and clear the other checks.'
 Set-Tip $script:SelectAllButton 'Check every row.'
@@ -2954,7 +3228,7 @@ $script:Form.Add_KeyDown({
 })
 $script:Form.Add_FormClosing({
     if ($script:SmokeTest) { return }
-    if ($script:Work -ne 'idle') {
+    if (-not $script:UpdateClosing -and $script:Work -ne 'idle') {
         $answer = [Windows.Forms.MessageBox]::Show($script:Form, 'Work is still running. Stop it and close?', 'Video Dehydrator', 'YesNo', 'Question')
         if ($answer -ne [Windows.Forms.DialogResult]::Yes) {
             $_.Cancel = $true
@@ -3100,6 +3374,7 @@ function Add-SmokeFile([string]$Path) {
 
 function Invoke-FolderSelectCheck {
     $savedFolder = [string]$script:FolderBox.Text
+    $script:Files.Items.Clear()
     $script:Folder = 'C:\Library'
     $script:FolderBox.Text = 'C:\Library'
     Add-SmokeFile 'C:\Library\Show\Season 1\a.mkv'
@@ -3224,6 +3499,44 @@ function Invoke-SmokeTest {
     Assert-True ($script:HelpBox.Text -match 'one-minute countdown') 'The guide was missing shutdown'
     Assert-True ($script:HelpBox.Text -match 'Undo puts back the last conversion') 'The guide was missing undo'
     Assert-True ($script:UndoButton.Text -eq 'Undo') 'Undo button was missing'
+    Assert-True ($script:HelpBox.Text -match 'Check for updates') 'The guide was missing updates'
+    Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
+    Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
+    Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
+    Assert-True ((Get-AppVersion) -eq '1.0.1') 'Version file was not 1.0.1'
+    Assert-True ((Compare-AppVersion '1.0.1' '1.0.0') -eq 1) 'A newer version compared as older'
+    Assert-True ((Compare-AppVersion '1.0.1' '1.0.1') -eq 0) 'The same version did not match'
+    Assert-True ((Compare-AppVersion '1.0.1' '1.0.2') -eq -1) 'An older version compared as newer'
+    Assert-True ($null -eq (Compare-AppVersion 'not-a-version' '1.0.1')) 'A name was treated as a version'
+    Assert-True ((Compare-AppVersion 'v1.2.0' '1.1.9') -eq 1) 'A v prefix was not read'
+    $sameOffer = Get-UpdateOffer ([pscustomobject]@{
+        tag_name = 'v1.0.1'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.1/video_dehydrator.exe'; size = 12 })
+    })
+    Assert-True (-not $sameOffer.Newer) 'The current version was offered as an update'
+    $bareOffer = Get-UpdateOffer ([pscustomobject]@{ tag_name = 'v9.9.9'; assets = @() })
+    Assert-True ($bareOffer.Message -match 'setup program') 'A release without a setup program was accepted'
+    $offer = Get-UpdateOffer ([pscustomobject]@{
+        tag_name = 'v9.9.9'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v9.9.9/video_dehydrator.exe'; size = 12 })
+    })
+    Assert-True ($offer.Newer) 'A newer release was not offered'
+    Apply-UpdateOffer $offer
+    Assert-True ($script:UpdateButton.Enabled) 'Update stayed disabled after a newer release'
+    $script:Work = 'encode'
+    Update-UpdateButtons
+    Assert-True ((-not $script:CheckUpdateButton.Enabled) -and (-not $script:UpdateButton.Enabled)) 'Update buttons stayed enabled during a job'
+    $script:Work = 'idle'
+    $script:UpdateOffer = $null
+    Update-UpdateButtons
+    Assert-True ($script:CheckUpdateButton.Enabled -and -not $script:UpdateButton.Enabled) 'Update buttons did not return to normal after the job'
+    $keptWidth = $script:Form.ClientSize.Width
+    $script:Form.ClientSize = New-Object Drawing.Size(900, $script:Form.ClientSize.Height)
+    Update-ChromeLayout
+    Assert-True ($script:TitleLabel.Right -le $script:CheckUpdateButton.Left) 'The title overlaps Check for updates'
+    Assert-True ($script:UpdateButton.Right -le ($script:Header.ClientSize.Width - 8)) 'Update sits outside the header'
+    $script:Form.ClientSize = New-Object Drawing.Size($keptWidth, $script:Form.ClientSize.Height)
+    Update-ChromeLayout
     $nestedPending = ,@(
         [pscustomobject]@{ id = 'a'; source = 's1'; kept = 'k1'; new = 'n1' },
         [pscustomobject]@{ id = 'b'; source = 's2'; kept = 'k2'; new = 'n2' }

@@ -3,7 +3,7 @@
 ; Compile with Inno Setup 6:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" VideoDehydrator.iss
 
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #define Repo ".."
 #define ToolExe "E:\Programming\video_dehydrator\tools"
 
@@ -28,16 +28,17 @@ WizardStyle=modern
 Uninstallable=yes
 UninstallDisplayName=Video Dehydrator
 UninstallDisplayIcon={sys}\imageres.dll
-VersionInfoVersion=1.0.0.0
+VersionInfoVersion=1.0.1.0
 VersionInfoProductName=Video Dehydrator
 VersionInfoCompany=Video Dehydrator
 VersionInfoDescription=Installs Video Dehydrator and the tools it needs
-CloseApplications=no
+CloseApplications=yes
 
 [Files]
 Source: "{#Repo}\app\VideoDehydrator.ps1"; DestDir: "{app}\app"
 Source: "{#Repo}\app\Engine.ps1"; DestDir: "{app}\app"
 Source: "{#Repo}\app\launch.vbs"; DestDir: "{app}\app"
+Source: "{#Repo}\app\version.txt"; DestDir: "{app}\app"
 Source: "{#Repo}\LICENSE"; DestDir: "{app}"
 Source: "{#Repo}\tools\FFmpeg-LICENSE.txt"; DestDir: "{app}\tools"
 Source: "{#Repo}\tools\HandBrake-LICENSE.txt"; DestDir: "{app}\tools"
@@ -49,6 +50,9 @@ Source: "{#ToolExe}\HandBrakeCLI.exe"; DestDir: "{app}\tools"
 
 [Icons]
 Name: "{autoprograms}\Video Dehydrator"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; IconFilename: "{sys}\imageres.dll"; IconIndex: 189; Comment: "Shrink videos that are too big for their picture size"
+
+[Run]
+Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; Description: "Open Video Dehydrator"; Flags: postinstall nowait skipifsilent
 
 [UninstallDelete]
 Type: files; Name: "{app}\Video Dehydrator.lnk"
