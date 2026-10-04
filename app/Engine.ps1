@@ -266,6 +266,29 @@ function Format-Rate {
     return ('{0:0.00}' -f [double]$GiBPerHour)
 }
 
+function Get-OverRatio($GiBph, $BudgetGiBph) {
+    if ($null -eq $GiBph -or $null -eq $BudgetGiBph) { return $null }
+    if ([string]$GiBph -eq '' -or [string]$BudgetGiBph -eq '') { return $null }
+    $used = [double]$GiBph
+    $budget = [double]$BudgetGiBph
+    if ($budget -le 0) { return $null }
+    return ($used / $budget)
+}
+
+function Get-OverBandId($Ratio) {
+    if ($null -eq $Ratio -or [string]$Ratio -eq '') { return '' }
+    $value = [double]$Ratio
+    if ($value -lt 1) { return '' }
+    if ($value -lt 1.5) { return 'slight' }
+    if ($value -lt 3) { return 'heavy' }
+    return 'extreme'
+}
+
+function Format-OverRatio($Ratio) {
+    if ($null -eq $Ratio -or [string]$Ratio -eq '') { return '' }
+    return ('{0:0.0}x' -f [double]$Ratio)
+}
+
 function Get-HandBrakeFraction {
     param([string]$Line)
     if ($Line -notmatch 'Encoding:\s*task\s+(\d+)\s+of\s+(\d+),\s*([\d.]+)\s*%') { return $null }
@@ -1000,6 +1023,17 @@ function Invoke-EngineSelfTest {
     Assert-Engine ([math]::Abs($hevc1080 - 3.0) -lt 0.0001) '1080p HEVC line'
     $budget4k = Get-BudgetGiBPerHour -Width 3840 -Height 2160 -Efficient $false
     Assert-Engine ([math]::Abs($budget4k - 8.0) -lt 0.0001) '4K budget'
+    Assert-Engine ($null -eq (Get-OverRatio $null 2)) 'missing rate has no overage'
+    Assert-Engine ($null -eq (Get-OverRatio 4 0)) 'zero budget has no overage'
+    Assert-Engine ([math]::Abs((Get-OverRatio 4 2) - 2) -lt 0.0001) 'twice the budget'
+    Assert-Engine ((Get-OverBandId 1.2) -eq 'slight') 'barely over is slight'
+    Assert-Engine ((Get-OverBandId 1.49) -eq 'slight') 'under 1.5x is slight'
+    Assert-Engine ((Get-OverBandId 1.5) -eq 'heavy') '1.5x is heavy'
+    Assert-Engine ((Get-OverBandId 2.9) -eq 'heavy') 'under 3x is heavy'
+    Assert-Engine ((Get-OverBandId 3) -eq 'extreme') '3x is extreme'
+    Assert-Engine ((Get-OverBandId 0.8) -eq '') 'under budget is not a band'
+    Assert-Engine ((Format-OverRatio 2) -eq '2.0x') 'over format'
+    Assert-Engine ((Format-OverRatio $null) -eq '') 'blank over format'
 
     $hour = 3600.0
     $bloated = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]3GB) -DurationSec $hour -VideoBitrate 15000000)

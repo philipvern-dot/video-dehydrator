@@ -339,7 +339,7 @@ $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.1'
+$script:UpdateFallback = '1.0.2'
 $script:UpdateOffer = $null
 $script:UpdateClosing = $false
 
@@ -377,6 +377,10 @@ $script:ColorLogErr = [Drawing.Color]::FromArgb(252, 165, 165)
 $script:ColorLogMuted = [Drawing.Color]::FromArgb(156, 163, 175)
 $script:ColorOkText = [Drawing.Color]::FromArgb(22, 101, 52)
 $script:ColorErrText = [Drawing.Color]::FromArgb(153, 27, 27)
+$script:ColorOverSlightBack = [Drawing.Color]::FromArgb(220, 252, 231)
+$script:ColorOverHeavyBack = [Drawing.Color]::FromArgb(254, 249, 195)
+$script:ColorOverHeavyFore = [Drawing.Color]::FromArgb(133, 77, 14)
+$script:ColorOverExtremeBack = [Drawing.Color]::FromArgb(254, 226, 226)
 
 $script:Work = 'idle'
 $script:Cancel = $false
@@ -759,11 +763,12 @@ function Get-RowText($tag, [int]$index) {
         }
         4 { return (Format-Rate $tag.GiBph) }
         5 { return (Format-Rate $tag.BudgetGiBph) }
-        6 {
+        6 { return (Format-OverRatio (Get-OverRatio $tag.GiBph $tag.BudgetGiBph)) }
+        7 {
             if ($tag.TargetKbps) { return "$($tag.TargetKbps) kbps" }
             return ''
         }
-        7 {
+        8 {
             if ($tag.EstimateBytes) { return (Format-ByteSize ([int64]$tag.EstimateBytes)) }
             return ''
         }
@@ -771,19 +776,67 @@ function Get-RowText($tag, [int]$index) {
     }
 }
 
+function Get-OverBands {
+    return @(
+        @{ Id = 'slight'; Label = 'Slight'; Phrase = 'slightly over budget' },
+        @{ Id = 'heavy'; Label = 'Heavy'; Phrase = 'heavily over budget' },
+        @{ Id = 'extreme'; Label = 'Extreme'; Phrase = 'extremely over budget' }
+    )
+}
+
+function Get-OverBand($id) {
+    foreach ($band in @(Get-OverBands)) {
+        if ($band.Id -eq [string]$id) { return $band }
+    }
+    return $null
+}
+
+function Get-RowOverBand($tag) {
+    if ($null -eq $tag) { return '' }
+    $status = [string]$tag.Status
+    if ($status -ne 'Bloated' -and $status -ne 'Failed') { return '' }
+    return (Get-OverBandId (Get-OverRatio $tag.GiBph $tag.BudgetGiBph))
+}
+
+function Update-OverCell($item) {
+    if ($null -eq $item -or $item.SubItems.Count -le 6) { return }
+    $cell = $item.SubItems[6]
+    $bandId = Get-RowOverBand $item.Tag
+    if ($bandId -eq 'slight') {
+        $cell.ForeColor = $script:ColorOkText
+        $cell.BackColor = $script:ColorOverSlightBack
+    } elseif ($bandId -eq 'heavy') {
+        $cell.ForeColor = $script:ColorOverHeavyFore
+        $cell.BackColor = $script:ColorOverHeavyBack
+    } elseif ($bandId -eq 'extreme') {
+        $cell.ForeColor = $script:ColorDanger
+        $cell.BackColor = $script:ColorOverExtremeBack
+    } else {
+        $cell.ForeColor = $script:ColorInk
+        $cell.BackColor = [Drawing.Color]::White
+    }
+}
+
 function Update-ResultRow($item) {
     if ($null -eq $item) { return }
     $tag = $item.Tag
     $item.Text = Get-RowText $tag 0
-    for ($i = 1; $i -le 8; $i++) { $item.SubItems[$i].Text = Get-RowText $tag $i }
+    for ($i = 1; $i -le 9; $i++) { $item.SubItems[$i].Text = Get-RowText $tag $i }
+    Update-OverCell $item
     $tip = [string]$tag.Path
     if ($tag.Reason) { $tip = $tip + "`r`n" + [string]$tag.Reason }
+    $bandId = Get-RowOverBand $tag
+    if ($bandId) {
+        $band = Get-OverBand $bandId
+        $tip = $tip + "`r`n" + (Get-RowText $tag 6) + ' the budget (' + $band.Label + ').'
+    }
     $item.ToolTipText = $tip
 }
 
 function Add-ResultRow($tag) {
     $item = New-Object Windows.Forms.ListViewItem (Get-RowText $tag 0)
-    for ($i = 1; $i -le 8; $i++) { [void]$item.SubItems.Add((Get-RowText $tag $i)) }
+    $item.UseItemStyleForSubItems = $false
+    for ($i = 1; $i -le 9; $i++) { [void]$item.SubItems.Add((Get-RowText $tag $i)) }
     $item.Tag = $tag
     $item.Checked = ($tag.Status -eq 'Bloated' -or $tag.Status -eq 'Failed' -or $tag.Status -eq 'Ready to delete')
     [void]$script:Files.Items.Add($item)
@@ -943,6 +996,186 @@ function Update-BloatFolders {
     if ($match -ge 0) { $script:FolderPick.SelectedIndex = $match }
     elseif ($script:FolderPick.Items.Count -gt 0) { $script:FolderPick.SelectedIndex = 0 }
     $script:FolderPick.EndUpdate()
+    Update-OverChoices
+    Update-Buttons
+}
+
+function Get-SelectedOverId {
+    if (-not $script:OverPick -or $script:OverPick.SelectedIndex -lt 0 -or -not $script:OverBandIds) { return 'slight' }
+    if ($script:OverPick.SelectedIndex -ge $script:OverBandIds.Count) { return 'slight' }
+    return [string]$script:OverBandIds[$script:OverPick.SelectedIndex]
+}
+
+function Update-OverButton {
+    if (-not $script:SelectOverButton) { return }
+    $band = Get-OverBand (Get-SelectedOverId)
+    if ($band) { $script:SelectOverButton.Text = ('Select ' + ([string]$band.Label).ToLowerInvariant()) }
+}
+
+function Update-OverChoices {
+    if (-not $script:OverPick) { return }
+    $keep = Get-SelectedOverId
+    $script:LoadingOver = $true
+    $script:OverPick.BeginUpdate()
+    try {
+        $script:OverPick.Items.Clear()
+        $ids = New-Object System.Collections.Generic.List[string]
+        $counts = @{}
+        $match = 0
+        $index = 0
+        foreach ($band in @(Get-OverBands)) {
+            $count = 0
+            $listed = @()
+            if ($script:Files) { $listed = @($script:Files.Items) }
+            foreach ($item in $listed) {
+                if ((Get-RowOverBand $item.Tag) -eq $band.Id) { $count++ }
+            }
+            $word = if ($count -eq 1) { 'file' } else { 'files' }
+            [void]$script:OverPick.Items.Add(([string]$band.Label) + '  (' + $count + ' ' + $word + ')')
+            [void]$ids.Add([string]$band.Id)
+            $counts[[string]$band.Id] = $count
+            if ($band.Id -eq $keep) { $match = $index }
+            $index++
+        }
+        $script:OverBandIds = $ids
+        $script:OverBandCounts = $counts
+        if ($script:OverPick.Items.Count -gt 0) { $script:OverPick.SelectedIndex = $match }
+    }
+    finally {
+        $script:OverPick.EndUpdate()
+        $script:LoadingOver = $false
+    }
+    Update-OverButton
+}
+
+function Select-OverBand([string]$BandId) {
+    if ($script:Work -ne 'idle') { return }
+    if (-not $BandId) { $BandId = Get-SelectedOverId }
+    $band = Get-OverBand $BandId
+    if (-not $band) { return }
+    if ($script:OverPick -and $script:OverBandIds) {
+        for ($i = 0; $i -lt $script:OverBandIds.Count; $i++) {
+            if ($script:OverBandIds[$i] -eq $BandId) {
+                if ($script:OverPick.SelectedIndex -ne $i) { $script:OverPick.SelectedIndex = $i }
+                break
+            }
+        }
+    }
+    $checked = 0
+    $script:BulkCheck = $true
+    try {
+        $script:Files.BeginUpdate()
+        foreach ($item in @($script:Files.Items)) {
+            $inside = ((Get-RowOverBand $item.Tag) -eq $BandId)
+            $item.Checked = $inside
+            if ($inside) { $checked++ }
+        }
+    }
+    finally {
+        $script:Files.EndUpdate()
+        $script:BulkCheck = $false
+    }
+    Update-Buttons
+    $word = if ($checked -eq 1) { 'file' } else { 'files' }
+    Write-Activity ("Checked $checked $word " + $band.Phrase + '.') 'text'
+}
+
+function Get-RowSortKey($tag, [int]$Column) {
+    if ($null -eq $tag) { return $null }
+    switch ($Column) {
+        0 { return [string]$tag.Path }
+        1 {
+            $w = 0
+            $h = 0
+            [void][int]::TryParse([string]$tag.Width, [ref]$w)
+            [void][int]::TryParse([string]$tag.Height, [ref]$h)
+            if ($w -le 0 -or $h -le 0) { return $null }
+            return [double](($w * 100000) + $h)
+        }
+        2 {
+            if ($null -eq $tag.DurationSec -or [string]$tag.DurationSec -eq '') { return $null }
+            return [double]$tag.DurationSec
+        }
+        3 {
+            if ($null -eq $tag.SizeBytes -or [string]$tag.SizeBytes -eq '') { return $null }
+            return [double]$tag.SizeBytes
+        }
+        4 {
+            if ($null -eq $tag.GiBph -or [string]$tag.GiBph -eq '') { return $null }
+            return [double]$tag.GiBph
+        }
+        5 {
+            if ($null -eq $tag.BudgetGiBph -or [string]$tag.BudgetGiBph -eq '') { return $null }
+            return [double]$tag.BudgetGiBph
+        }
+        6 { return (Get-OverRatio $tag.GiBph $tag.BudgetGiBph) }
+        7 {
+            if ($null -eq $tag.TargetKbps -or [string]$tag.TargetKbps -eq '') { return $null }
+            return [double]$tag.TargetKbps
+        }
+        8 {
+            if ($null -eq $tag.EstimateBytes -or [string]$tag.EstimateBytes -eq '') { return $null }
+            return [double]$tag.EstimateBytes
+        }
+        default {
+            if (-not $tag.Status) { return $null }
+            return [string]$tag.Status
+        }
+    }
+}
+
+function Update-SortHeaders {
+    if (-not $script:Files -or -not $script:ColumnTitles) { return }
+    for ($i = 0; $i -lt $script:ColumnTitles.Count -and $i -lt $script:Files.Columns.Count; $i++) {
+        $title = [string]$script:ColumnTitles[$i]
+        if ($i -eq $script:SortColumn) {
+            if ($script:SortAscending) { $title += ' ^' } else { $title += ' v' }
+        }
+        if ($script:Files.Columns[$i].Text -ne $title) { $script:Files.Columns[$i].Text = $title }
+    }
+}
+
+function Sort-FileList([int]$Column) {
+    if ($script:Work -ne 'idle') { return }
+    if ($script:SortColumn -eq $Column) {
+        $script:SortAscending = -not $script:SortAscending
+    } else {
+        $script:SortColumn = $Column
+        $script:SortAscending = ($Column -ne 6)
+    }
+    $rows = @()
+    foreach ($item in @($script:Files.Items)) {
+        $key = Get-RowSortKey $item.Tag $Column
+        $missing = 0
+        $number = 0.0
+        $text = [string]$item.Tag.Path
+        $numeric = $true
+        if ($null -eq $key) { $missing = 1 }
+        elseif ($key -is [string]) { $text = [string]$key; $numeric = $false }
+        else { $number = [double]$key }
+        $rows += [pscustomobject]@{ Item = $item; Missing = $missing; Number = $number; Text = $text; Numeric = $numeric; Path = [string]$item.Tag.Path }
+    }
+    $present = @($rows | Where-Object { $_.Missing -eq 0 })
+    $absent = @($rows | Where-Object { $_.Missing -eq 1 })
+    if ($present.Count -gt 0) {
+        if ([bool]$present[0].Numeric) {
+            if ($script:SortAscending) { $present = @($present | Sort-Object Number, Path) }
+            else { $present = @($present | Sort-Object @{ Expression = 'Number'; Descending = $true }, @{ Expression = 'Path'; Ascending = $true }) }
+        } else {
+            $present = @($present | Sort-Object @{ Expression = 'Text'; Descending = (-not $script:SortAscending) }, @{ Expression = 'Path'; Ascending = $true })
+        }
+    }
+    $script:BulkCheck = $true
+    try {
+        $script:Files.BeginUpdate()
+        $script:Files.Items.Clear()
+        foreach ($row in @($present + $absent)) { [void]$script:Files.Items.Add($row.Item) }
+    }
+    finally {
+        $script:Files.EndUpdate()
+        $script:BulkCheck = $false
+    }
+    Update-SortHeaders
     Update-Buttons
 }
 
@@ -1046,6 +1279,11 @@ function Update-Buttons {
     if ($script:SelectFolderButton) {
         $script:SelectFolderButton.Enabled = [bool]($pickReady -and $script:FolderPick.SelectedIndex -ge 0)
     }
+    $overCount = 0
+    $overId = Get-SelectedOverId
+    if ($script:OverBandCounts -and $script:OverBandCounts.ContainsKey($overId)) { $overCount = [int]$script:OverBandCounts[$overId] }
+    if ($script:OverPick) { $script:OverPick.Enabled = -not $busy }
+    if ($script:SelectOverButton) { $script:SelectOverButton.Enabled = ((-not $busy) -and $overCount -gt 0) }
     foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
         if ($chk) { $chk.Enabled = -not $busy }
     }
@@ -2565,14 +2803,26 @@ function Layout-Folder {
 function Layout-ListHeader {
     $panel = $script:ListHeader
     if ($null -eq $panel -or $panel.ClientSize.Width -lt 20) { return }
+    if (-not $script:SelectOverButton -or -not $script:OverPick) { return }
     $script:ListLabel.Location = New-Object Drawing.Point(0, 6)
     $script:SelectNoneButton.Location = New-Object Drawing.Point(($panel.ClientSize.Width - $script:SelectNoneButton.Width), 2)
     $script:SelectAllButton.Location = New-Object Drawing.Point(($script:SelectNoneButton.Left - 8 - $script:SelectAllButton.Width), 2)
-    $script:SelectFolderButton.Location = New-Object Drawing.Point(($script:SelectAllButton.Left - 8 - $script:SelectFolderButton.Width), 2)
+    $script:SelectOverButton.Location = New-Object Drawing.Point(($script:SelectAllButton.Left - 8 - $script:SelectOverButton.Width), 2)
+    $overWidth = 176
     $left = $script:ListLabel.Right + 12
-    $width = $script:SelectFolderButton.Left - 8 - $left
-    if ($width -lt 120) { $width = 120 }
-    $script:FolderPick.SetBounds($left, 3, $width, 26)
+    $folderRoom = $script:SelectOverButton.Left - 8 - $overWidth - 8 - $script:SelectFolderButton.Width - 8 - $left
+    if ($folderRoom -lt 120) {
+        $overWidth = [Math]::Max(128, $overWidth - (120 - $folderRoom))
+        $folderRoom = $script:SelectOverButton.Left - 8 - $overWidth - 8 - $script:SelectFolderButton.Width - 8 - $left
+    }
+    if ($folderRoom -lt 72) { $folderRoom = 72 }
+    $script:SelectFolderButton.Location = New-Object Drawing.Point(($left + $folderRoom + 8), 2)
+    $overLeft = $script:SelectFolderButton.Right + 8
+    if (($overLeft + $overWidth) -gt ($script:SelectOverButton.Left - 8)) {
+        $overWidth = [Math]::Max(110, ($script:SelectOverButton.Left - 8 - $overLeft))
+    }
+    $script:OverPick.SetBounds($overLeft, 3, $overWidth, 26)
+    $script:FolderPick.SetBounds($left, 3, $folderRoom, 26)
 }
 
 function Layout-FileColumns {
@@ -2630,7 +2880,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Scanning'
-            Body = "Browse, or drop a folder onto the path, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows the bloated files, checked and ready to convert.`r`n`r`nSelect all checks every row. Deselect all clears every check. The folder list names each folder that has bloated files, and a show is listed along with the season folders inside it. Select folder checks only the bloated files in the folder you picked and clears the other checks, so Convert is that smaller job. Right-click a row for the same choices.`r`n`r`nGiB/h is the size of the whole file per hour of runtime. Budget is the line for that picture size. Target is the video rate the new file will use. About is a rough guess of the new size when the current video rate can be read. Estimated savings is the current size minus About, added up for the checked files. It changes as those checks change. A file with no About figure is left out of the total."
+            Body = "Browse, or drop a folder onto the path, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows the bloated files, checked and ready to convert.`r`n`r`nSelect all checks every row. Deselect all clears every check. The folder list names each folder that has bloated files, and a show is listed along with the season folders inside it. Select folder checks only the bloated files in the folder you picked and clears the other checks, so Convert is that smaller job. Right-click a row for the same choices.`r`n`r`nGiB/h is the size of the whole file per hour of runtime. Budget is the line for that picture size. Over is how many times that budget the file uses. 2.0x is twice the line. Slight, shown in green, is under 1.5 times and barely over. Heavy, shown in yellow, is from 1.5 times up to 3 times. Extreme, shown in red, is 3 times the budget or more. Click a heading to sort. The first click on Over puts the worst files first.`r`n`r`nThe list beside Select folder offers Slight, Heavy, and Extreme. Select slight, Select heavy, or Select extreme checks only that group and clears the other checks, so Convert is that group. Right-click a row for the same choice.`r`n`r`nTarget is the video rate the new file will use. About is a rough guess of the new size when the current video rate can be read. Estimated savings is the current size minus About, added up for the checked files. It changes as those checks change. A file with no About figure is left out of the total."
         },
         @{
             Title = 'Converting'
@@ -2982,19 +3232,36 @@ $script:FolderPick.IntegralHeight = $false
 $script:FolderPick.DropDownHeight = 320
 $script:FolderPick.DropDownWidth = 520
 $script:SelectFolderButton = New-Button 'Select folder' 'secondary' 124 28
+$script:OverPick = New-Object Windows.Forms.ComboBox
+$script:OverPick.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+$script:OverPick.Font = $script:FontUi
+$script:OverPick.IntegralHeight = $false
+$script:OverPick.DropDownHeight = 160
+$script:OverPick.DropDownWidth = 240
+$script:SelectOverButton = New-Button 'Select slight' 'secondary' 136 28
 $script:SelectAllButton = New-Button 'Select all' 'secondary' 104 28
 $script:SelectNoneButton = New-Button 'Deselect all' 'secondary' 120 28
 $script:SelectFolderButton.Margin = New-Object Windows.Forms.Padding(0)
+$script:SelectOverButton.Margin = New-Object Windows.Forms.Padding(0)
 $script:SelectAllButton.Margin = New-Object Windows.Forms.Padding(0)
 $script:SelectNoneButton.Margin = New-Object Windows.Forms.Padding(0)
 $script:ListHeader.Controls.Add($script:ListLabel)
 $script:ListHeader.Controls.Add($script:FolderPick)
 $script:ListHeader.Controls.Add($script:SelectFolderButton)
+$script:ListHeader.Controls.Add($script:OverPick)
+$script:ListHeader.Controls.Add($script:SelectOverButton)
 $script:ListHeader.Controls.Add($script:SelectAllButton)
 $script:ListHeader.Controls.Add($script:SelectNoneButton)
 $script:SelectFolderButton.Add_Click({ Select-ChosenFolder })
+$script:SelectOverButton.Add_Click({ Select-OverBand (Get-SelectedOverId) })
+$script:OverPick.Add_SelectedIndexChanged({
+    if ($script:LoadingOver) { return }
+    Update-OverButton
+    Update-Buttons
+})
 $script:SelectAllButton.Add_Click({ Set-AllChecks $true })
 $script:SelectNoneButton.Add_Click({ Set-AllChecks $false })
+Update-OverChoices
 
 $script:Files = New-Object Windows.Forms.ListView
 $script:Files.Dock = 'Fill'
@@ -3010,15 +3277,20 @@ $script:Files.ForeColor = $script:ColorInk
 $script:Files.BorderStyle = 'FixedSingle'
 $script:Files.ShowItemToolTips = $true
 $script:Files.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 4)
+$script:ColumnTitles = @('File', 'Picture', 'Length', 'Size', 'GiB/h', 'Budget', 'Over', 'Target', 'About', 'Status')
+$script:SortColumn = -1
+$script:SortAscending = $true
 [void]$script:Files.Columns.Add('File', 280)
 [void]$script:Files.Columns.Add('Picture', 110)
 [void]$script:Files.Columns.Add('Length', 80)
 [void]$script:Files.Columns.Add('Size', 170)
 [void]$script:Files.Columns.Add('GiB/h', 70)
 [void]$script:Files.Columns.Add('Budget', 70)
+[void]$script:Files.Columns.Add('Over', 78)
 [void]$script:Files.Columns.Add('Target', 100)
 [void]$script:Files.Columns.Add('About', 90)
 [void]$script:Files.Columns.Add('Status', 150)
+$script:Files.Add_ColumnClick({ Sort-FileList $_.Column })
 $script:Files.Add_ItemChecked({ if (-not $script:BulkCheck) { Update-Buttons } })
 $script:Files.Add_SelectedIndexChanged({ Update-Buttons })
 $script:FileMenu = New-Object Windows.Forms.ContextMenuStrip
@@ -3026,15 +3298,27 @@ $script:FileMenu.Font = $script:FontUi
 [void]$script:FileMenu.Items.Add('Select all')
 [void]$script:FileMenu.Items.Add('Deselect all')
 [void]$script:FileMenu.Items.Add('Select files in this folder')
+[void]$script:FileMenu.Items.Add('Select this overage')
 $script:FileMenu.Items[0].Add_Click({ Set-AllChecks $true })
 $script:FileMenu.Items[1].Add_Click({ Set-AllChecks $false })
 $script:FileMenu.Items[2].Add_Click({ Select-FolderOfSelectedFile })
+$script:FileMenu.Items[3].Add_Click({
+    if ($script:Files.SelectedItems.Count -ne 1) { return }
+    $bandId = Get-RowOverBand $script:Files.SelectedItems[0].Tag
+    if ($bandId) { Select-OverBand $bandId }
+})
 $script:FileMenu.Add_Opening({
     $busy = ($script:Work -ne 'idle')
     $hasRow = ($script:Files.SelectedItems.Count -eq 1)
+    $bandId = ''
+    if ($hasRow) { $bandId = Get-RowOverBand $script:Files.SelectedItems[0].Tag }
+    $band = Get-OverBand $bandId
+    if ($band) { $script:FileMenu.Items[3].Text = ('Select ' + ([string]$band.Label).ToLowerInvariant() + ' files') }
+    else { $script:FileMenu.Items[3].Text = 'Select this overage' }
     $script:FileMenu.Items[0].Enabled = -not $busy
     $script:FileMenu.Items[1].Enabled = -not $busy
     $script:FileMenu.Items[2].Enabled = ((-not $busy) -and $hasRow)
+    $script:FileMenu.Items[3].Enabled = ((-not $busy) -and $null -ne $band)
 })
 $script:Files.ContextMenuStrip = $script:FileMenu
 $script:Files.Add_MouseDown({
@@ -3210,9 +3494,11 @@ Set-Tip $script:CheckUpdateButton 'Look on GitHub for a newer version of Video D
 Set-Tip $script:UpdateButton 'Download the newer version and open its setup program. This window closes while that setup runs.'
 Set-Tip $script:FolderPick 'Folders that have bloated files. A show is listed with the folders inside it. Pick one to make a smaller convert job.'
 Set-Tip $script:SelectFolderButton 'Check the bloated files in the folder shown here, and clear the other checks.'
+Set-Tip $script:OverPick 'How far each file is over its budget. Slight is under 1.5 times, Heavy is under 3 times, and Extreme is 3 times or more.'
+Set-Tip $script:SelectOverButton 'Check the files in the group shown here, and clear the other checks. Convert then shrinks that group.'
 Set-Tip $script:SelectAllButton 'Check every row.'
 Set-Tip $script:SelectNoneButton 'Clear every check.'
-Set-Tip $script:Files 'Bloated videos are checked. Right-click a row to select that folder. Double-click a file that is ready to delete to compare it.'
+Set-Tip $script:Files 'Bloated videos are checked. Over shows how many times the budget each file uses. Click a heading to sort. Right-click a row to select that folder or that overage. Double-click a file that is ready to delete to compare it.'
 Set-Tip $script:Log 'Saved space, skipped videos, and problems are listed here.'
 Set-Tip $script:ProgressTrack 'How far the current file has been encoded.'
 Set-Tip $script:StatusLabel 'What the program is doing right now.'
@@ -3349,6 +3635,75 @@ function Invoke-PlayerCheck {
     }
 }
 
+function Add-OverFile([string]$Path, $GiBph, $Budget, [string]$Status) {
+    if (-not $Status) { $Status = 'Bloated' }
+    $tag = @{
+        Status = $Status
+        Path = $Path
+        Kept = ''
+        New = ''
+        Source = $Path
+        Width = 1920
+        Height = 1080
+        DurationSec = 60
+        SizeBytes = 100000000
+        OldBytes = $null
+        GiBph = $GiBph
+        BudgetGiBph = $Budget
+        TargetKbps = 3000
+        EstimateBytes = 20000000
+        Codec = 'h264'
+        PendingId = ''
+        Reason = 'smoke over'
+    }
+    Add-ResultRow $tag | Out-Null
+}
+
+function Invoke-OverCheck {
+    $script:Files.Items.Clear()
+    $script:SortColumn = -1
+    Update-SortHeaders
+    Add-OverFile 'C:\Library\slight.mkv' 2.4 2 'Bloated'
+    Add-OverFile 'C:\Library\heavy.mkv' 4 2 'Bloated'
+    Add-OverFile 'C:\Library\extreme.mkv' 10 2 'Bloated'
+    Add-OverFile 'C:\Library\done.mkv' 8 2 'Ready to delete'
+    Update-OverChoices
+    $byPath = @{}
+    foreach ($item in @($script:Files.Items)) { $byPath[[string]$item.Tag.Path] = $item }
+    $slight = $byPath['C:\Library\slight.mkv']
+    $heavy = $byPath['C:\Library\heavy.mkv']
+    $extreme = $byPath['C:\Library\extreme.mkv']
+    $done = $byPath['C:\Library\done.mkv']
+    Assert-True ($slight.SubItems[6].Text -eq '1.2x') ("Slight over was $($slight.SubItems[6].Text)")
+    Assert-True ($heavy.SubItems[6].Text -eq '2.0x') ("Heavy over was $($heavy.SubItems[6].Text)")
+    Assert-True ($extreme.SubItems[6].Text -eq '5.0x') ("Extreme over was $($extreme.SubItems[6].Text)")
+    Assert-True ($slight.SubItems[6].BackColor.ToArgb() -eq $script:ColorOverSlightBack.ToArgb()) 'Slight was not green'
+    Assert-True ($heavy.SubItems[6].BackColor.ToArgb() -eq $script:ColorOverHeavyBack.ToArgb()) 'Heavy was not yellow'
+    Assert-True ($extreme.SubItems[6].BackColor.ToArgb() -eq $script:ColorOverExtremeBack.ToArgb()) 'Extreme was not red'
+    Assert-True ($done.SubItems[6].Text -eq '4.0x') 'A finished row hid its ratio'
+    Assert-True ($done.SubItems[6].BackColor.ToArgb() -eq [Drawing.Color]::White.ToArgb()) 'A finished row was colored as an offender'
+    Assert-True ($script:OverPick.Items[0] -match 'Slight' -and $script:OverPick.Items[0] -match '1 file') 'Slight count'
+    Assert-True ($script:OverPick.Items[2] -match 'Extreme' -and $script:OverPick.Items[2] -match '1 file') 'Extreme count'
+    $script:OverPick.SelectedIndex = 2
+    Assert-True ($script:SelectOverButton.Text -eq 'Select extreme') ("Overage button was $($script:SelectOverButton.Text)")
+    Select-OverBand 'extreme'
+    $checked = @($script:Files.Items | Where-Object { $_.Checked })
+    Assert-True ($checked.Count -eq 1 -and [string]$checked[0].Tag.Path -match 'extreme') 'Select extreme checked the wrong rows'
+    Sort-FileList 6
+    Assert-True ($script:Files.Columns[6].Text -eq 'Over v') ("Over heading was $($script:Files.Columns[6].Text)")
+    Assert-True ([string]$script:Files.Items[0].Tag.Path -match 'extreme') 'Worst overage was not first'
+    Sort-FileList 6
+    Assert-True ($script:Files.Columns[6].Text -eq 'Over ^') 'Second click did not reverse Over'
+    Assert-True ([string]$script:Files.Items[0].Tag.Path -match 'slight') 'Smallest overage was not first'
+    Update-ChromeLayout
+    [Windows.Forms.Application]::DoEvents()
+    Save-FormImage $script:Form (Join-Path $env:TEMP 'vdh-over.png')
+    $script:Files.Items.Clear()
+    $script:SortColumn = -1
+    Update-SortHeaders
+    Update-OverChoices
+}
+
 function Add-SmokeFile([string]$Path) {
     $tag = @{
         Status = 'Bloated'
@@ -3431,6 +3786,7 @@ function Set-BudgetBoxPick([string]$Id, [string]$PickId) {
 
 function Invoke-BudgetCheck {
     Assert-True (@($script:BudgetBoxes).Count -eq 4) 'Budget dropdowns missing'
+    foreach ($id in @('2160', '1080', '720', '480')) { Set-BudgetBoxPick $id 'recommended' }
     $expected = @{
         '2160' = 'Recommended, 8 GiB/h'
         '1080' = 'Recommended, 2 GiB/h'
@@ -3485,6 +3841,7 @@ function Invoke-SmokeTest {
     Start-Sleep -Milliseconds 200
     [Windows.Forms.Application]::DoEvents()
     Invoke-FolderSelectCheck
+    Invoke-OverCheck
     Invoke-BudgetCheck
     Save-FormImage $script:Form (Join-Path $env:TEMP 'vdh-main.png')
     Show-Help
@@ -3494,6 +3851,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:HelpBox.Text -match '12000 kbps') 'The guide was missing the 4K rate'
     Assert-True ($script:HelpBox.Text -match '\.vd-originals') 'The guide was missing the holding folder'
     Assert-True ($script:HelpBox.Text -match 'Select folder') 'The guide was missing folder selection'
+    Assert-True ($script:HelpBox.Text -match 'Slight' -and $script:HelpBox.Text -match 'Extreme') 'The guide was missing overage groups'
     Assert-True ($script:HelpBox.Text -match 'Estimated savings') 'The guide was missing the savings total'
     Assert-True ($script:HelpBox.Text -match 'starts on Recommended') 'The guide was missing the budget choices'
     Assert-True ($script:HelpBox.Text -match 'one-minute countdown') 'The guide was missing shutdown'
@@ -3503,15 +3861,15 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.1') 'Version file was not 1.0.1'
+    Assert-True ((Get-AppVersion) -eq '1.0.2') 'Version file was not 1.0.2'
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.0') -eq 1) 'A newer version compared as older'
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.1') -eq 0) 'The same version did not match'
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.2') -eq -1) 'An older version compared as newer'
     Assert-True ($null -eq (Compare-AppVersion 'not-a-version' '1.0.1')) 'A name was treated as a version'
     Assert-True ((Compare-AppVersion 'v1.2.0' '1.1.9') -eq 1) 'A v prefix was not read'
     $sameOffer = Get-UpdateOffer ([pscustomobject]@{
-        tag_name = 'v1.0.1'
-        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.1/video_dehydrator.exe'; size = 12 })
+        tag_name = 'v1.0.2'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.2/video_dehydrator.exe'; size = 12 })
     })
     Assert-True (-not $sameOffer.Newer) 'The current version was offered as an update'
     $bareOffer = Get-UpdateOffer ([pscustomobject]@{ tag_name = 'v9.9.9'; assets = @() })
@@ -3535,6 +3893,10 @@ function Invoke-SmokeTest {
     Update-ChromeLayout
     Assert-True ($script:TitleLabel.Right -le $script:CheckUpdateButton.Left) 'The title overlaps Check for updates'
     Assert-True ($script:UpdateButton.Right -le ($script:Header.ClientSize.Width - 8)) 'Update sits outside the header'
+    Assert-True ($script:FolderPick.Right -le ($script:SelectFolderButton.Left + 1)) 'Folder list overlaps Select folder'
+    Assert-True ($script:SelectFolderButton.Right -le ($script:OverPick.Left + 1)) 'Select folder overlaps the overage list'
+    Assert-True ($script:OverPick.Right -le ($script:SelectOverButton.Left + 1)) 'Overage list overlaps its button'
+    Assert-True ($script:SelectNoneButton.Right -le ($script:ListHeader.ClientSize.Width + 1)) 'Deselect all sits outside the list header'
     $script:Form.ClientSize = New-Object Drawing.Size($keptWidth, $script:Form.ClientSize.Height)
     Update-ChromeLayout
     $nestedPending = ,@(
