@@ -339,7 +339,7 @@ $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.2'
+$script:UpdateFallback = '1.0.3'
 $script:UpdateOffer = $null
 $script:UpdateClosing = $false
 
@@ -2851,7 +2851,14 @@ function Update-ChromeLayout {
     }
     $status = $script:StatusPanel
     if ($status -and $status.ClientSize.Width -gt 0) {
-        $script:StatusLabel.SetBounds(24, 8, ($status.ClientSize.Width - 48), 22)
+        $versionGap = 0
+        if ($script:VersionLabel) {
+            $vw = $script:VersionLabel.PreferredSize.Width
+            if ($vw -lt 1) { $vw = 48 }
+            $script:VersionLabel.SetBounds(($status.ClientSize.Width - 24 - $vw), 8, $vw, 22)
+            $versionGap = $vw + 12
+        }
+        $script:StatusLabel.SetBounds(24, 8, ([Math]::Max(80, $status.ClientSize.Width - 48 - $versionGap)), 22)
         $script:ProgressTrack.SetBounds(24, 36, ([Math]::Max(0, $status.ClientSize.Width - 48)), 8)
         Set-Progress $script:ProgressValue
     }
@@ -2892,7 +2899,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Originals and deleting'
-            Body = "Delete originals removes the checked files that are still in .vd-originals. The new files stay. The button refuses to delete anything outside that holding folder. If the new file is missing, the original is kept.`r`n`r`nUndo puts back the last conversion. The originals return to where they were, and the new files are deleted. The program lists the files and asks before it does this. One use covers every file from that convert. It can only undo a conversion whose original is still in .vd-originals. If those originals were already deleted, there is nothing to put back.`r`n`r`nA .plexignore file in the video's folder tells Plex to skip .vd-originals. Held originals are remembered in app\pending.json, so they are still listed the next time you open the program.`r`n`r`nEach result is also written to app\convert-log.tsv."
+            Body = "Delete originals removes the checked files that are still in .vd-originals. The new files stay. The button refuses to delete anything outside that holding folder. If the new file is missing, the original is kept.`r`n`r`nUndo puts back the last conversion. The originals return to where they were, and the new files are deleted. The program lists the files and asks before it does this. One use covers every file from that convert. It can only undo a conversion whose original is still in .vd-originals. If those originals were already deleted, there is nothing to put back.`r`n`r`nA .plexignore file in the video's folder tells Plex to skip .vd-originals while originals are held there. When that holding folder is removed, the .plexignore file is removed too. If the file also names other things for Plex to skip, those lines stay. Held originals are remembered in app\pending.json, so they are still listed the next time you open the program.`r`n`r`nEach result is also written to app\convert-log.tsv."
         },
         @{
             Title = 'Auto'
@@ -2900,7 +2907,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Updates'
-            Body = "Check for updates looks on GitHub for a newer version of this program. When one is there, Update downloads it and opens the setup program. The setup replaces the installed copy and keeps your settings.`r`n`r`nFinish or cancel the current job before you update. The program closes while the setup runs, then you can open it again."
+            Body = "The bottom right corner shows this copy's version.`r`n`r`nCheck for updates looks on GitHub for a newer version of this program. When one is there, Update downloads it and opens the setup program. The setup replaces the installed copy and keeps your settings.`r`n`r`nFinish or cancel the current job before you update. The program closes while the setup runs, then you can open it again."
         },
         @{
             Title = 'What is in this folder'
@@ -3111,6 +3118,13 @@ $script:StatusLabel.Font = $script:FontUi
 $script:StatusLabel.ForeColor = $script:ColorMuted
 $script:StatusLabel.AutoEllipsis = $true
 $script:StatusLabel.BackColor = [Drawing.Color]::White
+$script:VersionLabel = New-Object Windows.Forms.Label
+$script:VersionLabel.Text = Get-AppVersion
+$script:VersionLabel.Font = $script:FontHint
+$script:VersionLabel.ForeColor = $script:ColorMuted
+$script:VersionLabel.BackColor = [Drawing.Color]::White
+$script:VersionLabel.TextAlign = 'MiddleRight'
+$script:VersionLabel.AutoSize = $true
 $script:ProgressTrack = New-Object Windows.Forms.Panel
 $script:ProgressTrack.BackColor = [Drawing.Color]::FromArgb(229, 231, 235)
 $script:ProgressTrack.Height = 8
@@ -3120,6 +3134,7 @@ $script:ProgressFill.Height = 8
 $script:ProgressFill.Width = 0
 $script:ProgressTrack.Controls.Add($script:ProgressFill)
 $script:StatusPanel.Controls.Add($script:StatusLabel)
+$script:StatusPanel.Controls.Add($script:VersionLabel)
 $script:StatusPanel.Controls.Add($script:ProgressTrack)
 $script:StatusPanel.Add_Paint({
     $pen = New-Object Drawing.Pen $script:ColorLine
@@ -3502,6 +3517,7 @@ Set-Tip $script:Files 'Bloated videos are checked. Over shows how many times the
 Set-Tip $script:Log 'Saved space, skipped videos, and problems are listed here.'
 Set-Tip $script:ProgressTrack 'How far the current file has been encoded.'
 Set-Tip $script:StatusLabel 'What the program is doing right now.'
+Set-Tip $script:VersionLabel 'This copy of Video Dehydrator.'
 
 if ($settings.Folder) { Set-FolderText $settings.Folder }
 $script:Loading = $false
@@ -3856,20 +3872,24 @@ function Invoke-SmokeTest {
     Assert-True ($script:HelpBox.Text -match 'starts on Recommended') 'The guide was missing the budget choices'
     Assert-True ($script:HelpBox.Text -match 'one-minute countdown') 'The guide was missing shutdown'
     Assert-True ($script:HelpBox.Text -match 'Undo puts back the last conversion') 'The guide was missing undo'
+    Assert-True ($script:HelpBox.Text -match '\.plexignore file is removed') 'The guide was missing plexignore cleanup'
     Assert-True ($script:UndoButton.Text -eq 'Undo') 'Undo button was missing'
     Assert-True ($script:HelpBox.Text -match 'Check for updates') 'The guide was missing updates'
+    Assert-True ($script:HelpBox.Text -match 'bottom right corner shows this copy') 'The guide was missing the version corner'
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.2') 'Version file was not 1.0.2'
+    Assert-True ((Get-AppVersion) -eq '1.0.3') 'Version file was not 1.0.3'
+    Assert-True ($script:VersionLabel.Text -eq (Get-AppVersion)) 'Version label did not show the version'
+    Assert-True ($script:VersionLabel.Parent -eq $script:StatusPanel) 'Version is not in the status bar'
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.0') -eq 1) 'A newer version compared as older'
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.1') -eq 0) 'The same version did not match'
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.2') -eq -1) 'An older version compared as newer'
     Assert-True ($null -eq (Compare-AppVersion 'not-a-version' '1.0.1')) 'A name was treated as a version'
     Assert-True ((Compare-AppVersion 'v1.2.0' '1.1.9') -eq 1) 'A v prefix was not read'
     $sameOffer = Get-UpdateOffer ([pscustomobject]@{
-        tag_name = 'v1.0.2'
-        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.2/video_dehydrator.exe'; size = 12 })
+        tag_name = 'v1.0.3'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.3/video_dehydrator.exe'; size = 12 })
     })
     Assert-True (-not $sameOffer.Newer) 'The current version was offered as an update'
     $bareOffer = Get-UpdateOffer ([pscustomobject]@{ tag_name = 'v9.9.9'; assets = @() })
@@ -3893,6 +3913,8 @@ function Invoke-SmokeTest {
     Update-ChromeLayout
     Assert-True ($script:TitleLabel.Right -le $script:CheckUpdateButton.Left) 'The title overlaps Check for updates'
     Assert-True ($script:UpdateButton.Right -le ($script:Header.ClientSize.Width - 8)) 'Update sits outside the header'
+    Assert-True ($script:VersionLabel.Right -le ($script:StatusPanel.ClientSize.Width - 8)) 'Version sits outside the status bar'
+    Assert-True ($script:StatusLabel.Right -le ($script:VersionLabel.Left + 1)) 'Status overlaps the version'
     Assert-True ($script:FolderPick.Right -le ($script:SelectFolderButton.Left + 1)) 'Folder list overlaps Select folder'
     Assert-True ($script:SelectFolderButton.Right -le ($script:OverPick.Left + 1)) 'Select folder overlaps the overage list'
     Assert-True ($script:OverPick.Right -le ($script:SelectOverButton.Left + 1)) 'Overage list overlaps its button'

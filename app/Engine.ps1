@@ -630,10 +630,14 @@ function Test-EncodedFile {
     }
 }
 
+function Get-PlexIgnoreLines {
+    return @('.vd-originals', '.vd-originals/*')
+}
+
 function Add-PlexIgnore {
     param([Parameter(Mandatory)][string]$Directory)
     $path = Join-Path $Directory '.plexignore'
-    $lines = @('.vd-originals', '.vd-originals/*')
+    $lines = @(Get-PlexIgnoreLines)
     if (Test-Path -LiteralPath $path) {
         $existing = [IO.File]::ReadAllText($path)
         $missing = @($lines | Where-Object { $existing -notmatch ('(?m)^\s*' + [regex]::Escape($_) + '\s*$') })
@@ -645,6 +649,42 @@ function Add-PlexIgnore {
     [IO.File]::WriteAllText($path, (($lines -join "`r`n") + "`r`n"))
 }
 
+function Remove-PlexIgnore {
+    param([Parameter(Mandatory)][string]$Directory)
+    $hold = Join-Path $Directory '.vd-originals'
+    if (Test-Path -LiteralPath $hold) { return }
+    $path = Join-Path $Directory '.plexignore'
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $owned = @(Get-PlexIgnoreLines)
+    try {
+        $lines = @([IO.File]::ReadAllLines($path))
+        $kept = New-Object System.Collections.Generic.List[string]
+        $removed = 0
+        foreach ($line in $lines) {
+            $drop = $false
+            foreach ($name in $owned) {
+                if ($line -match ('^\s*' + [regex]::Escape($name) + '\s*$')) { $drop = $true; break }
+            }
+            if ($drop) { $removed++; continue }
+            [void]$kept.Add($line)
+        }
+        $meaningful = 0
+        foreach ($line in $kept) {
+            if ($line.Trim() -ne '') { $meaningful++ }
+        }
+        if ($meaningful -eq 0) {
+            Remove-Item -LiteralPath $path -Force
+            return
+        }
+        if ($removed -eq 0) { return }
+        while ($kept.Count -gt 0 -and $kept[$kept.Count - 1].Trim() -eq '') {
+            $kept.RemoveAt($kept.Count - 1)
+        }
+        [IO.File]::WriteAllText($path, (($kept.ToArray() -join "`r`n") + "`r`n"))
+    }
+    catch { }
+}
+
 function Remove-EmptyDirectory {
     param([string]$Directory)
     if (-not $Directory) { return }
@@ -653,6 +693,11 @@ function Remove-EmptyDirectory {
     if ($left.Count -eq 0) {
         Remove-Item -LiteralPath $Directory -Force -ErrorAction SilentlyContinue
     }
+    if (Test-Path -LiteralPath $Directory) { return }
+    $leaf = [IO.Path]::GetFileName($Directory.TrimEnd('\', '/'))
+    if ($leaf -ne '.vd-originals') { return }
+    $parent = Split-Path -Parent $Directory
+    if ($parent) { Remove-PlexIgnore -Directory $parent }
 }
 
 function Get-ReplacePlan {
@@ -1115,6 +1160,43 @@ function Invoke-EngineSelfTest {
     Assert-Engine $threw 'delete guard'
     Assert-Engine ((Get-Content -LiteralPath $guard -Raw) -eq 'keep') 'guard did not delete'
     Remove-Item -LiteralPath $guard -Force
+
+    $plexDir = Join-Path $env:TEMP ('vdh-plex-' + [guid]::NewGuid().ToString('n'))
+    New-Item -ItemType Directory -Force -Path $plexDir | Out-Null
+    try {
+        $plexHold = Join-Path $plexDir '.vd-originals'
+        New-Item -ItemType Directory -Force -Path $plexHold | Out-Null
+        $plexNew = Join-Path $plexDir 'clip.mkv'
+        $plexA = Join-Path $plexHold 'a.avi'
+        $plexB = Join-Path $plexHold 'b.avi'
+        [IO.File]::WriteAllText($plexNew, 'new')
+        [IO.File]::WriteAllText($plexA, 'a')
+        [IO.File]::WriteAllText($plexB, 'b')
+        Add-PlexIgnore -Directory $plexDir
+        $plexFile = Join-Path $plexDir '.plexignore'
+        Assert-Engine (Test-Path -LiteralPath $plexFile) 'plexignore was not written'
+        Assert-Engine (Remove-KeptOriginal -KeptPath $plexA -NewPath $plexNew) 'first original was not deleted'
+        Assert-Engine (Test-Path -LiteralPath $plexHold) 'holding folder was removed while another original remains'
+        Assert-Engine (Test-Path -LiteralPath $plexFile) 'plexignore was removed while another original remains'
+        Assert-Engine (Remove-KeptOriginal -KeptPath $plexB -NewPath $plexNew) 'last original was not deleted'
+        Assert-Engine (-not (Test-Path -LiteralPath $plexHold)) 'holding folder stayed after the last original'
+        Assert-Engine (-not (Test-Path -LiteralPath $plexFile)) 'plexignore stayed after the last original'
+
+        New-Item -ItemType Directory -Force -Path $plexHold | Out-Null
+        $plexC = Join-Path $plexHold 'c.avi'
+        [IO.File]::WriteAllText($plexC, 'c')
+        [IO.File]::WriteAllText($plexFile, "KeepMe`r`n.vd-originals`r`n.vd-originals/*`r`n")
+        Remove-Item -LiteralPath $plexC -Force
+        Remove-EmptyDirectory -Directory $plexHold
+        Assert-Engine (-not (Test-Path -LiteralPath $plexHold)) 'auto cleanup left the holding folder'
+        Assert-Engine (Test-Path -LiteralPath $plexFile) 'a plexignore with other lines was deleted'
+        $plexLeft = [IO.File]::ReadAllText($plexFile)
+        Assert-Engine ($plexLeft -match '(?m)^\s*KeepMe\s*$') 'other plexignore lines were dropped'
+        Assert-Engine ($plexLeft -notmatch '(?m)^\s*\.vd-originals(\/\*)?\s*$') 'holding-folder lines stayed in plexignore'
+    }
+    finally {
+        if (Test-Path -LiteralPath $plexDir) { Remove-Item -LiteralPath $plexDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 
     $undoDir = Join-Path $env:TEMP ('vdh-undo-' + [guid]::NewGuid().ToString('n'))
     New-Item -ItemType Directory -Force -Path $undoDir | Out-Null
