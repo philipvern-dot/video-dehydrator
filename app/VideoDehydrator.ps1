@@ -339,7 +339,7 @@ $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.4'
+$script:UpdateFallback = '1.0.4.1'
 $script:UpdateOffer = $null
 $script:UpdateClosing = $false
 
@@ -381,8 +381,20 @@ $script:ColorOverSlightBack = [Drawing.Color]::FromArgb(220, 252, 231)
 $script:ColorOverHeavyBack = [Drawing.Color]::FromArgb(254, 249, 195)
 $script:ColorOverHeavyFore = [Drawing.Color]::FromArgb(133, 77, 14)
 $script:ColorOverExtremeBack = [Drawing.Color]::FromArgb(254, 226, 226)
+$script:BudgetMark = @{
+    '2160' = @{ Mark = [Drawing.Color]::FromArgb(29, 78, 216); Back = [Drawing.Color]::FromArgb(219, 234, 254); Fore = [Drawing.Color]::FromArgb(30, 58, 138) }
+    '1080' = @{ Mark = [Drawing.Color]::FromArgb(15, 118, 110); Back = [Drawing.Color]::FromArgb(204, 251, 241); Fore = [Drawing.Color]::FromArgb(17, 94, 89) }
+    '720' = @{ Mark = [Drawing.Color]::FromArgb(109, 40, 217); Back = [Drawing.Color]::FromArgb(237, 233, 254); Fore = [Drawing.Color]::FromArgb(91, 33, 182) }
+    '480' = @{ Mark = [Drawing.Color]::FromArgb(194, 65, 12); Back = [Drawing.Color]::FromArgb(255, 237, 213); Fore = [Drawing.Color]::FromArgb(154, 52, 18) }
+}
 
 $script:Work = 'idle'
+$script:PulseMarks = @('|', '/', '-', '\')
+$script:PulseIndex = 0
+$script:PulseWanted = $false
+$script:PulseOn = $false
+$script:PulseSlot = -1
+$script:PulseStamp = [datetime]::MinValue
 $script:Cancel = $false
 $script:ToolsOk = $false
 $script:Loading = $false
@@ -539,9 +551,64 @@ function Test-LogPinned {
     return ($last.Y -le ($box.ClientSize.Height + 8))
 }
 
+function Remove-ActivityPulse {
+    if (-not $script:PulseOn) { return }
+    $box = $script:Log
+    if ($box -and -not $box.IsDisposed -and $script:PulseSlot -ge 0 -and $script:PulseSlot -le $box.TextLength) {
+        [VideoDehydrator.QuietLog]::SelectRange($box.Handle, $script:PulseSlot, $box.TextLength)
+        [VideoDehydrator.QuietLog]::Insert($box.Handle, '')
+    }
+    $script:PulseOn = $false
+    $script:PulseSlot = -1
+}
+
+function Add-ActivityPulse {
+    if (-not $script:PulseWanted) { return }
+    $box = $script:Log
+    if ($null -eq $box -or $box.IsDisposed) { return }
+    $mark = $script:PulseMarks[$script:PulseIndex]
+    $line = 'Working  ' + $mark + [Environment]::NewLine
+    $follow = Test-LogPinned
+    if ($script:PulseOn -and $script:PulseSlot -ge 0 -and $script:PulseSlot -le $box.TextLength) {
+        [VideoDehydrator.QuietLog]::SelectRange($box.Handle, $script:PulseSlot, $box.TextLength)
+    }
+    else {
+        $script:PulseSlot = $box.TextLength
+        [VideoDehydrator.QuietLog]::SelectRange($box.Handle, $box.TextLength, $box.TextLength)
+        $script:PulseOn = $true
+    }
+    $box.SelectionColor = $script:ColorLogMuted
+    [VideoDehydrator.QuietLog]::Insert($box.Handle, $line)
+    if ($follow) { [VideoDehydrator.QuietLog]::ScrollToEnd($box.Handle) }
+}
+
+function Start-ActivityPulse {
+    Stop-ActivityPulse
+    $script:PulseWanted = $true
+    $script:PulseIndex = 0
+    $script:PulseStamp = [datetime]::UtcNow
+    Add-ActivityPulse
+}
+
+function Stop-ActivityPulse {
+    $script:PulseWanted = $false
+    Remove-ActivityPulse
+}
+
+function Update-ActivityPulse {
+    if (-not $script:PulseWanted) { return }
+    $now = [datetime]::UtcNow
+    if ($script:PulseOn -and ($now - $script:PulseStamp).TotalMilliseconds -lt 320) { return }
+    $script:PulseStamp = $now
+    if ($script:PulseOn) { $script:PulseIndex = ($script:PulseIndex + 1) % 4 }
+    Add-ActivityPulse
+}
+
 function Write-Activity([string]$message, [string]$kind) {
     $box = $script:Log
     if ($null -eq $box -or $box.IsDisposed) { return }
+    $restorePulse = [bool]$script:PulseWanted
+    Remove-ActivityPulse
     $color = $script:ColorLogText
     if ($kind -eq 'ok') { $color = $script:ColorLogOk }
     elseif ($kind -eq 'warn') { $color = $script:ColorLogWarn }
@@ -557,6 +624,10 @@ function Write-Activity([string]$message, [string]$kind) {
     $box.SelectionColor = $color
     [VideoDehydrator.QuietLog]::Insert($box.Handle, ($message + [Environment]::NewLine))
     if ($follow) { [VideoDehydrator.QuietLog]::ScrollToEnd($box.Handle) }
+    if ($restorePulse) {
+        $script:PulseWanted = $true
+        Add-ActivityPulse
+    }
 }
 
 function Get-MissingTools {
@@ -589,6 +660,7 @@ function Load-Settings {
         Folder = ''
         IncludeSubfolders = $true
         AutoDelete = $false
+        AutoWarnAccepted = $false
         Detailed = $false
         Budgets = ''
         Shutdown = $false
@@ -599,6 +671,7 @@ function Load-Settings {
         if ($json.folder) { $defaults.Folder = [string]$json.folder }
         if ($null -ne $json.includeSubfolders) { $defaults.IncludeSubfolders = [bool]$json.includeSubfolders }
         if ($null -ne $json.autoDelete) { $defaults.AutoDelete = [bool]$json.autoDelete }
+        if ($null -ne $json.autoWarnAccepted) { $defaults.AutoWarnAccepted = [bool]$json.autoWarnAccepted }
         if ($null -ne $json.detailed) { $defaults.Detailed = [bool]$json.detailed }
         if ($json.budgets) { $defaults.Budgets = [string]$json.budgets }
         if ($null -ne $json.shutdown) { $defaults.Shutdown = [bool]$json.shutdown }
@@ -616,6 +689,7 @@ function Save-Settings {
         folder = $folder
         includeSubfolders = [bool]$script:SubfoldersCheck.Checked
         autoDelete = [bool]$script:AutoCheck.Checked
+        autoWarnAccepted = [bool]$script:AutoWarnAccepted
         detailed = [bool]$script:DetailedCheck.Checked
         budgets = (Get-SelectedBudgetPack)
         shutdown = [bool]$script:ShutdownCheck.Checked
@@ -769,7 +843,11 @@ function Get-RowText($tag, [int]$index) {
             return ''
         }
         8 {
-            if ($tag.EstimateBytes) { return (Format-ByteSize ([int64]$tag.EstimateBytes)) }
+            if ($tag.EstimateBytes) {
+                $text = Format-ByteSize ([int64]$tag.EstimateBytes)
+                if ($tag.EstimateRough) { return ('~' + $text) }
+                return $text
+            }
             return ''
         }
         default { return [string]$tag.Status }
@@ -798,6 +876,36 @@ function Get-RowOverBand($tag) {
     return (Get-OverBandId (Get-OverRatio $tag.GiBph $tag.BudgetGiBph))
 }
 
+function Get-BudgetMark([string]$Id) {
+    if (-not $Id -or -not $script:BudgetMark -or -not $script:BudgetMark.ContainsKey($Id)) { return $null }
+    return $script:BudgetMark[$Id]
+}
+
+function Get-RowBudgetAnchor($tag) {
+    if ($null -eq $tag) { return $null }
+    $width = 0
+    $height = 0
+    [void][int]::TryParse([string]$tag.Width, [ref]$width)
+    [void][int]::TryParse([string]$tag.Height, [ref]$height)
+    if ($width -le 0 -or $height -le 0) { return $null }
+    return (Get-NearestBudgetAnchor -Width $width -Height $height)
+}
+
+function Update-BudgetCell($item) {
+    if ($null -eq $item -or $item.SubItems.Count -le 1) { return }
+    $cell = $item.SubItems[1]
+    $mark = $null
+    $anchor = Get-RowBudgetAnchor $item.Tag
+    if ($anchor) { $mark = Get-BudgetMark ([string]$anchor.Id) }
+    if ($mark) {
+        $cell.BackColor = $mark.Back
+        $cell.ForeColor = $mark.Fore
+    } else {
+        $cell.ForeColor = $script:ColorInk
+        $cell.BackColor = [Drawing.Color]::White
+    }
+}
+
 function Update-OverCell($item) {
     if ($null -eq $item -or $item.SubItems.Count -le 6) { return }
     $cell = $item.SubItems[6]
@@ -823,6 +931,7 @@ function Update-ResultRow($item) {
     $item.Text = Get-RowText $tag 0
     for ($i = 1; $i -le 9; $i++) { $item.SubItems[$i].Text = Get-RowText $tag $i }
     Update-OverCell $item
+    Update-BudgetCell $item
     $tip = [string]$tag.Path
     if ($tag.Reason) { $tip = $tip + "`r`n" + [string]$tag.Reason }
     $bandId = Get-RowOverBand $tag
@@ -830,6 +939,9 @@ function Update-ResultRow($item) {
         $band = Get-OverBand $bandId
         $tip = $tip + "`r`n" + (Get-RowText $tag 6) + ' the budget (' + $band.Label + ').'
     }
+    $anchor = Get-RowBudgetAnchor $tag
+    if ($anchor) { $tip = $tip + "`r`n" + 'Follows the ' + $anchor.Name + ' budget.' }
+    if ($tag.EstimateRough) { $tip = $tip + "`r`n" + 'New size starts with ~ because the picture rate could not be read. That guess can run high.' }
     $item.ToolTipText = $tip
 }
 
@@ -885,6 +997,22 @@ function Add-PendingRows {
         }
         Add-ResultRow $tag | Out-Null
     }
+}
+
+function Test-ScanRows {
+    if (-not $script:Files) { return $false }
+    foreach ($item in @($script:Files.Items)) {
+        if ($item.Tag -and -not $item.Tag.PendingId) { return $true }
+    }
+    return $false
+}
+
+function Clear-ListedFiles {
+    if ($script:Work -ne 'idle') { return }
+    if (-not (Test-ScanRows)) { return }
+    Clear-ScanRows
+    Update-Buttons
+    Write-Activity 'Cleared the scanned files. Files still waiting in .vd-originals stay.' 'text'
 }
 
 function Clear-ScanRows {
@@ -1274,6 +1402,7 @@ function Update-Buttons {
     if ($script:BrowseButton) { $script:BrowseButton.Enabled = -not $busy }
     if ($script:SelectAllButton) { $script:SelectAllButton.Enabled = -not $busy }
     if ($script:SelectNoneButton) { $script:SelectNoneButton.Enabled = -not $busy }
+    if ($script:ClearButton) { $script:ClearButton.Enabled = ((-not $busy) -and (Test-ScanRows)) }
     $pickReady = (-not $busy) -and $script:FolderPick -and $script:FolderPick.Items.Count -gt 0
     if ($script:FolderPick) { $script:FolderPick.Enabled = [bool]$pickReady }
     if ($script:SelectFolderButton) {
@@ -1549,7 +1678,7 @@ function Ensure-CompareForm {
 
     $top = New-Object Windows.Forms.Panel
     $top.Dock = 'Top'
-    $top.Height = 64
+    $top.Height = 86
     $top.BackColor = $script:ColorHeader
     $script:CompareTitle = New-Object Windows.Forms.Label
     $script:CompareTitle.ForeColor = [Drawing.Color]::White
@@ -1557,7 +1686,8 @@ function Ensure-CompareForm {
     $script:CompareTitle.Font = $script:FontSection
     $script:CompareTitle.AutoEllipsis = $true
     $sides = New-Object Windows.Forms.Label
-    $sides.Text = 'Original on the left. New file on the right. Sound is the new file.'
+    $sides.Text = 'Original on the left. New file on the right. Sound is the new file, and it will not stay in sync with the picture. Go to the file on disk to confirm the audio.'
+    $sides.AutoEllipsis = $true
     $sides.ForeColor = $script:ColorHeaderMuted
     $sides.BackColor = $script:ColorHeader
     $sides.Font = $script:FontHint
@@ -1565,7 +1695,7 @@ function Ensure-CompareForm {
     $top.Controls.Add($sides)
     $top.Add_Resize({
         $script:CompareTitle.SetBounds(20, 8, ($this.ClientSize.Width - 40), 26)
-        $this.Controls[1].SetBounds(20, 34, ($this.ClientSize.Width - 40), 22)
+        $this.Controls[1].SetBounds(20, 36, ($this.ClientSize.Width - 40), 42)
     })
 
     $bottom = New-Object Windows.Forms.Panel
@@ -1739,6 +1869,7 @@ function Read-ScanQueue {
                 BudgetGiBph = [double]$msg.BudgetGiBph
                 TargetKbps = [int]$msg.TargetKbps
                 EstimateBytes = $estimate
+                EstimateRough = [bool]$msg.EstimateRough
                 VideoBitrate = $videoBits
                 Codec = [string]$msg.Codec
                 PendingId = ''
@@ -1816,6 +1947,7 @@ function Start-EncodeProcess {
         Write-Activity (ConvertTo-ArgumentLine (@($script:HandBrake) + $arguments)) 'dim'
     }
     [VideoDehydrator.LinePump]::Start($script:HandBrake, (ConvertTo-ArgumentLine $arguments))
+    Start-ActivityPulse
 }
 
 function Start-NextEncode {
@@ -1883,6 +2015,7 @@ function Start-NextEncode {
 
 function Fail-Active {
     param([string]$Reason)
+    Stop-ActivityPulse
     $item = $script:ActiveItem
     $plan = $script:ActivePlan
     if ($plan) { Remove-TempQuiet $plan.Temp }
@@ -1950,6 +2083,7 @@ function Complete-ActiveEncode {
     $item.Tag.Path = $swap.NewPath
     $item.Tag.Kept = $swap.KeptPath
     $name = [IO.Path]::GetFileName($swap.NewPath)
+    Stop-ActivityPulse
     if ($swap.Deleted) {
         $item.Tag.Status = 'Replaced'
         $item.Tag.Reason = 'Original deleted after the check.'
@@ -1984,6 +2118,12 @@ function Complete-ActiveEncode {
     Start-NextEncode
 }
 
+function Test-EncodeProgressLine([string]$Line) {
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
+    if ($null -ne (Get-HandBrakeFraction $Line)) { return $true }
+    return ($Line -match '(?i)^(Encoding|Muxing):.*\d+(?:\.\d+)?\s*%')
+}
+
 function Read-EncodeLines {
     $batch = @([VideoDehydrator.LinePump]::Drain())
     foreach ($line in $batch) {
@@ -1998,16 +2138,15 @@ function Read-EncodeLines {
             $number = $script:EncodeIndex
             $total = $script:EncodeItems.Count
             Set-Status ("File $number of $total - $name - " + ('{0:0}%' -f $fraction)) 'busy'
-            if ($script:DetailedCheck.Checked) { Write-Activity $line 'dim' }
         }
-        elseif ($script:DetailedCheck.Checked) {
-            Write-Activity $line 'dim'
-        }
+        if ((Test-EncodeProgressLine $line)) { continue }
+        if ($script:DetailedCheck.Checked) { Write-Activity $line 'dim' }
     }
 }
 
 function Finish-Batch {
     param([string]$How)
+    Stop-ActivityPulse
     $script:Work = 'idle'
     $script:Cancel = $false
     Disable-KeepAwake
@@ -2073,34 +2212,34 @@ function New-ShutdownForm {
     $form.Controls.Add($label)
     $form.Controls.Add($now)
     $form.Controls.Add($cancel)
-    $script:ShutdownChoice = 'cancel'
     $timer = New-Object Windows.Forms.Timer
     $timer.Interval = 1000
+    $state = [pscustomobject]@{ Timer = $timer; Choice = 'cancel'; Seconds = 60 }
+    $form.Tag = $state
     $timer.Add_Tick({
-        $script:ShutdownSeconds--
-        if ($script:ShutdownSeconds -le 0) {
+        $state.Seconds--
+        if ($state.Seconds -le 0) {
             $timer.Stop()
-            $script:ShutdownChoice = 'now'
+            $state.Choice = 'now'
             $form.Close()
             return
         }
-        $label.Text = "Convert finished. This computer will shut down in $($script:ShutdownSeconds) seconds.`r`n`r`nCancel if you want to keep working. Open programs will close."
+        $label.Text = "Convert finished. This computer will shut down in $($state.Seconds) seconds.`r`n`r`nCancel if you want to keep working. Open programs will close."
     }.GetNewClosure())
-    $form.Tag = $timer
     $now.Add_Click({
         $timer.Stop()
-        $script:ShutdownChoice = 'now'
+        $state.Choice = 'now'
         $form.Close()
     }.GetNewClosure())
     $cancel.Add_Click({
         $timer.Stop()
-        $script:ShutdownChoice = 'cancel'
+        $state.Choice = 'cancel'
         $form.Close()
     }.GetNewClosure())
     $form.Add_KeyDown({
         if ($_.KeyCode -eq [Windows.Forms.Keys]::Escape) {
             $timer.Stop()
-            $script:ShutdownChoice = 'cancel'
+            $state.Choice = 'cancel'
             $form.Close()
             $_.SuppressKeyPress = $true
         }
@@ -2122,23 +2261,25 @@ function Offer-Shutdown {
     }
     $dialog = New-ShutdownForm
     $choice = 'cancel'
+    $secondsLeft = 0
     try {
         [void]$dialog.ShowDialog()
-        $choice = [string]$script:ShutdownChoice
+        $choice = [string]$dialog.Tag.Choice
+        $secondsLeft = [int]$dialog.Tag.Seconds
     }
     catch {
         $choice = 'cancel'
         Write-Activity ("Could not show the shutdown countdown. " + $_.Exception.Message) 'err'
     }
     finally {
-        $timer = $dialog.Tag
+        $timer = $dialog.Tag.Timer
         if ($timer) { $timer.Stop(); $timer.Dispose() }
         $dialog.Dispose()
     }
     if ($choice -eq 'now') {
         Write-Activity 'Shutting down the computer.' 'text'
         Set-Status 'Shutting down...' 'busy'
-        if ($script:ShutdownSeconds -gt 0) {
+        if ($secondsLeft -gt 0) {
             if ($scheduled) { Invoke-ShutdownExe @('/a') | Out-Null }
             $again = Invoke-ShutdownExe @('/s', '/t', '5', '/c', 'Video Dehydrator finished converting.')
             if ($again -ne 0) {
@@ -2156,10 +2297,109 @@ function Offer-Shutdown {
     Set-Status 'Finished. Shutdown cancelled.' 'ok'
 }
 
+function Test-AutoWarnPending {
+    if ($script:AutoWarnAccepted) { return $false }
+    if ($script:AutoWarnShown) { return $false }
+    return $true
+}
+
+function Test-AutoWarnNeeded {
+    if ($script:SmokeTest) { return $false }
+    return (Test-AutoWarnPending)
+}
+
+function Apply-AutoWarnChoice([string]$Choice, [bool]$Hide) {
+    if ($Choice -ne 'on') { return $false }
+    $script:AutoWarnShown = $true
+    if ($Hide) { $script:AutoWarnAccepted = $true }
+    return $true
+}
+
+function New-AutoWarnForm {
+    $form = New-Object Windows.Forms.Form
+    $form.Text = 'Video Dehydrator'
+    $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.StartPosition = 'CenterParent'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $false
+    $form.KeyPreview = $true
+    $form.ClientSize = New-Object Drawing.Size(520, 292)
+    $form.Font = $script:FontUi
+    $form.BackColor = [Drawing.Color]::White
+    $icon = Get-AppIcon
+    if ($icon) { $form.Icon = $icon }
+    $label = New-Object Windows.Forms.Label
+    $label.Font = $script:FontUi
+    $label.ForeColor = $script:ColorInk
+    $label.BackColor = [Drawing.Color]::White
+    $label.SetBounds(24, 16, 472, 168)
+    $label.Text = "Delete originals automatically removes each original as soon as its new file checks out.`r`n`r`nThe check looks at size, length, picture size, audio, subtitles, and whether the start and end play. It does not judge how the picture looks.`r`n`r`nAfter the original is deleted, Compare and Undo cannot bring it back."
+    $hide = New-Check "Don't show this again"
+    $hide.SetBounds(24, 196, 280, 24)
+    $on = New-Button 'Turn auto on' 'primary' 140 34
+    $off = New-Button 'Leave it off' 'secondary' 130 34
+    $on.SetBounds(214, 236, 140, 34)
+    $off.SetBounds(364, 236, 130, 34)
+    $form.Controls.Add($label)
+    $form.Controls.Add($hide)
+    $form.Controls.Add($on)
+    $form.Controls.Add($off)
+    $state = [pscustomobject]@{ Choice = 'off'; Hide = $false }
+    $form.Tag = $state
+    $on.DialogResult = [Windows.Forms.DialogResult]::OK
+    $off.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $form.AcceptButton = $on
+    $form.CancelButton = $off
+    $on.Add_Click({
+        $state.Choice = 'on'
+        $state.Hide = [bool]$hide.Checked
+    }.GetNewClosure())
+    $off.Add_Click({
+        $state.Choice = 'off'
+        $state.Hide = $false
+    }.GetNewClosure())
+    return $form
+}
+
+function Show-AutoWarn {
+    if ($script:SmokeTest) { return 'on' }
+    $form = New-AutoWarnForm
+    $state = $form.Tag
+    try { [void]$form.ShowDialog($script:Form) }
+    finally { $form.Dispose() }
+    $hide = $false
+    if ($state.Choice -eq 'on') { $hide = [bool]$state.Hide }
+    if (Apply-AutoWarnChoice ([string]$state.Choice) $hide) { return 'on' }
+    return 'off'
+}
+
+function Set-AutoOff {
+    $script:AutoWarnBusy = $true
+    try { $script:AutoCheck.Checked = $false }
+    finally { $script:AutoWarnBusy = $false }
+}
+
+function Update-AutoChoice {
+    if ($script:Loading -or $script:AutoWarnBusy) { return }
+    if ($script:AutoCheck.Checked -and (Test-AutoWarnNeeded)) {
+        if ((Show-AutoWarn) -ne 'on') { Set-AutoOff }
+    }
+    Save-Settings
+}
+
 function Start-Convert {
     if ($script:Work -ne 'idle') { return }
     $items = @(Get-CheckedItems @('Bloated', 'Failed'))
     if ($items.Count -eq 0) { return }
+    if ($script:AutoCheck.Checked -and (Test-AutoWarnNeeded)) {
+        if ((Show-AutoWarn) -ne 'on') {
+            Set-AutoOff
+            Save-Settings
+            return
+        }
+        Save-Settings
+    }
     if ($script:AutoCheck.Checked) {
         $answer = [Windows.Forms.MessageBox]::Show($script:Form, "Auto is on.`r`n`r`nAfter each file checks out, its original is deleted. The new file stays in the original's place. There will be nothing left to compare.", 'Video Dehydrator', 'OKCancel', 'Warning')
         if ($answer -ne [Windows.Forms.DialogResult]::OK) { return }
@@ -2315,6 +2555,7 @@ function Invoke-UiTick {
         }
         elseif ($script:Work -eq 'encode') {
             Read-EncodeLines
+            Update-ActivityPulse
             if ([VideoDehydrator.LinePump]::Exited) {
                 Complete-ActiveEncode
             }
@@ -2354,7 +2595,7 @@ function Remove-VersionPrefix([string]$text) {
     $clean = $text.Trim()
     if (($clean.StartsWith('v') -or $clean.StartsWith('V')) -and $clean.Length -gt 1) {
         $rest = $clean.Substring(1)
-        if ($rest -match '^\d+\.\d+\.\d+$') { return $rest }
+        if ($rest -match '^\d+\.\d+\.\d+(\.\d+)?$') { return $rest }
     }
     return $clean
 }
@@ -2362,8 +2603,10 @@ function Remove-VersionPrefix([string]$text) {
 function ConvertTo-VersionNumbers([string]$text) {
     $clean = ''
     if ($null -ne $text) { $clean = $text.Trim() }
-    if ($clean -match '^(\d+)\.(\d+)\.(\d+)$') {
+    if ($clean -match '^(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$') {
         $numbers = @([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+        $fourth = [string]$Matches[4]
+        if ($fourth -match '^\d+$') { $numbers += [int]$fourth }
         return ,$numbers
     }
     return $null
@@ -2373,9 +2616,14 @@ function Compare-AppVersion([string]$left, [string]$right) {
     $a = ConvertTo-VersionNumbers (Remove-VersionPrefix $left)
     $b = ConvertTo-VersionNumbers (Remove-VersionPrefix $right)
     if ($null -eq $a -or $null -eq $b) { return $null }
-    for ($i = 0; $i -lt 3; $i++) {
-        if ($a[$i] -gt $b[$i]) { return 1 }
-        if ($a[$i] -lt $b[$i]) { return -1 }
+    $count = [Math]::Max($a.Count, $b.Count)
+    for ($i = 0; $i -lt $count; $i++) {
+        $leftNumber = 0
+        $rightNumber = 0
+        if ($i -lt $a.Count) { $leftNumber = $a[$i] }
+        if ($i -lt $b.Count) { $rightNumber = $b[$i] }
+        if ($leftNumber -gt $rightNumber) { return 1 }
+        if ($leftNumber -lt $rightNumber) { return -1 }
     }
     return 0
 }
@@ -2385,7 +2633,7 @@ function Get-AppVersion {
     if (Test-Path -LiteralPath $path) {
         $text = ''
         try { $text = [IO.File]::ReadAllText($path).Trim() } catch { $text = '' }
-        if ($text -match '^\d+\.\d+\.\d+$') { return $text }
+        if ($text -match '^\d+\.\d+\.\d+(\.\d+)?$') { return $text }
     }
     return [string]$script:UpdateFallback
 }
@@ -2462,6 +2710,13 @@ function Apply-UpdateOffer($offer) {
     Write-Activity $offer.Message $kind
 }
 
+function Show-UpdateReady($offer) {
+    if ($script:SmokeTest) { return }
+    if ($null -eq $offer -or -not $offer.Newer) { return }
+    $text = 'Version ' + $offer.Version + ' is available. Click Update to install it.'
+    [Windows.Forms.MessageBox]::Show($script:Form, $text, $script:UpdateProduct, 'OK', 'Information') | Out-Null
+}
+
 function Start-UpdateCheck {
     if (Test-UpdateBusy) {
         [Windows.Forms.MessageBox]::Show($script:Form, 'Finish or cancel the current job before checking for updates.', $script:UpdateProduct, 'OK', 'Information') | Out-Null
@@ -2477,6 +2732,7 @@ function Start-UpdateCheck {
         $headers = @{ 'User-Agent' = $script:UpdateProduct; 'Accept' = 'application/vnd.github+json' }
         $release = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
         Apply-UpdateOffer (Get-UpdateOffer $release)
+        Show-UpdateReady $script:UpdateOffer
     } catch {
         $script:UpdateOffer = $null
         Update-UpdateButtons
@@ -2641,7 +2897,7 @@ function Update-BudgetTips {
         }
         $numbers = Get-AnchorBudget -Anchor $anchor -PickId $pick
         $hevc = Format-BudgetGiB $numbers.HevcGiBph
-        $text = "$($anchor.Name) budget, $($box.Text). The new file is encoded at $($numbers.Kbps) kbps. HEVC and AV1 are left alone under $hevc. A nearby picture size follows this choice. The choice is remembered."
+        $text = "$($anchor.Name) budget, $($box.Text). Files with this color in Dimensions follow this choice. The new file is encoded at $($numbers.Kbps) kbps. HEVC and AV1 are left alone under $hevc. A nearby picture size follows this choice. The choice is remembered."
         Set-Tip $box $text
     }
 }
@@ -2679,6 +2935,7 @@ function Update-RowsForBudgets {
         $item.Tag.TargetKbps = $decision.TargetKbps
         $item.Tag.GiBph = $decision.GiBph
         if ($null -ne $decision.EstimateBytes) { $item.Tag.EstimateBytes = $decision.EstimateBytes }
+        $item.Tag.EstimateRough = [bool]$decision.EstimateRough
         if ($status -eq 'Bloated') { $item.Tag.Reason = $decision.Reason }
         Update-ResultRow $item
     }
@@ -2771,10 +3028,13 @@ function Layout-Options {
         $rowIndex = [int][math]::Floor($i / 2)
         $x = $split + ($colIndex * $col)
         $rowY = 36 + ($rowIndex * 36)
-        $label.SetBounds($x, ($rowY + 4), 52, 22)
-        $boxW = $col - 52 - 14
-        if ($boxW -lt 140) { $boxW = 140 }
-        $box.SetBounds(($x + 52), $rowY, $boxW, 28)
+        $swatch = $null
+        if ($script:BudgetSwatches -and $i -lt @($script:BudgetSwatches).Count) { $swatch = $script:BudgetSwatches[$i] }
+        if ($swatch) { $swatch.SetBounds($x, ($rowY + 8), 14, 14) }
+        $label.SetBounds(($x + 20), ($rowY + 4), 64, 22)
+        $boxW = $col - 84 - 14
+        if ($boxW -lt 120) { $boxW = 120 }
+        $box.SetBounds(($x + 88), $rowY, $boxW, 28)
     }
 }
 
@@ -2805,7 +3065,8 @@ function Layout-ListHeader {
     if ($null -eq $panel -or $panel.ClientSize.Width -lt 20) { return }
     if (-not $script:SelectOverButton -or -not $script:OverPick) { return }
     $script:ListLabel.Location = New-Object Drawing.Point(0, 6)
-    $script:SelectNoneButton.Location = New-Object Drawing.Point(($panel.ClientSize.Width - $script:SelectNoneButton.Width), 2)
+    $script:ClearButton.Location = New-Object Drawing.Point(($panel.ClientSize.Width - $script:ClearButton.Width), 2)
+    $script:SelectNoneButton.Location = New-Object Drawing.Point(($script:ClearButton.Left - 8 - $script:SelectNoneButton.Width), 2)
     $script:SelectAllButton.Location = New-Object Drawing.Point(($script:SelectNoneButton.Left - 8 - $script:SelectAllButton.Width), 2)
     $script:SelectOverButton.Location = New-Object Drawing.Point(($script:SelectAllButton.Left - 8 - $script:SelectOverButton.Width), 2)
     $overWidth = 176
@@ -2883,19 +3144,19 @@ function Get-HelpSections {
         },
         @{
             Title = 'The size rule'
-            Body = "A 1920x1080 video is too big when the whole file is 2 GiB per hour or more. HEVC and AV1 are left alone under 3 GiB per hour. The target for that 1080p picture is 3000 kbps of video. This is the same rule the media library uses.`r`n`r`nOther picture sizes multiply those numbers by how many pixels they have compared with 1920x1080. 3840x2160 has four times the pixels, so 4K is allowed 8 GiB per hour and is encoded at 12000 kbps. 1280x720 is encoded at 1333 kbps. 720x480 is encoded at 500 kbps. A very small picture stays at 200 kbps.`r`n`r`nThe Budgets row has a choice for 2160p, 1080p, 720p, and 480p. Each one starts on Recommended, which is the line above. Half, 1.5 times, and Double lower or raise that line, and the encode rate moves with it. A picture of some other size uses the closest of those four, then scales by its number of pixels. HEVC and AV1 stay at one and a half times the budget you picked. The choices are remembered.`r`n`r`nScan again after a change. A higher budget takes files that are no longer over the line off the list. A lower budget finds new files on the next scan.`r`n`r`nThe encode is software x265, two passes, medium speed. The frame rate stays as it was. The picture is not cropped or scaled. Audio is copied. Subtitles are copied and are not burned into the picture.`r`n`r`nA file whose picture is already at that target rate is left alone, even when the file is large because of the audio. Dolby Vision is left alone."
+            Body = "A 1920x1080 video is too big when the whole file is 2 GiB per hour or more. HEVC and AV1 are left alone under 3 GiB per hour. The target for that 1080p picture is 3000 kbps of video. This is the same rule the media library uses.`r`n`r`nOther picture sizes multiply those numbers by how many pixels they have compared with 1920x1080. 3840x2160 has four times the pixels, so 4K is allowed 8 GiB per hour and is encoded at 12000 kbps. 1280x720 is encoded at 1333 kbps. 720x480 is encoded at 500 kbps. A very small picture stays at 200 kbps.`r`n`r`nThe Budgets row has a choice for 2160p, 1080p, 720p, and 480p. Each choice has its own color, and Dimensions on a file uses that same color when the file follows that choice. 2160p is blue, 1080p is teal, 720p is purple, and 480p is orange. Each one starts on Recommended, which is the line above. Half, 1.5 times, and Double lower or raise that line, and the encode rate moves with it. A picture of some other size uses the closest of those four, then scales by its number of pixels. HEVC and AV1 stay at one and a half times the budget you picked. The choices are remembered.`r`n`r`nScan again after a change. A higher budget takes files that are no longer over the line off the list. A lower budget finds new files on the next scan.`r`n`r`nThe encode is software x265, two passes, medium speed. The frame rate stays as it was. The picture is not cropped or scaled. Audio is copied. Subtitles are copied and are not burned into the picture.`r`n`r`nA file whose picture is already at that target rate is left alone, even when the file is large because of the audio. Dolby Vision is left alone."
         },
         @{
             Title = 'Scanning'
-            Body = "Browse, or drop a folder onto the path, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows the bloated files, checked and ready to convert.`r`n`r`nSelect all checks every row. Deselect all clears every check. The folder list names each folder that has bloated files, and a show is listed along with the season folders inside it. Select folder checks only the bloated files in the folder you picked and clears the other checks, so Convert is that smaller job. Right-click a row for the same choices.`r`n`r`nGiB/h is the size of the whole file per hour of runtime. Budget is the line for that picture size. Over is how many times that budget the file uses. 2.0x is twice the line. Slight, shown in green, is under 1.5 times and barely over. Heavy, shown in yellow, is from 1.5 times up to 3 times. Extreme, shown in red, is 3 times the budget or more. Click a heading to sort. The first click on Over puts the worst files first.`r`n`r`nThe list beside Select folder offers Slight, Heavy, and Extreme. Select slight, Select heavy, or Select extreme checks only that group and clears the other checks, so Convert is that group. Right-click a row for the same choice.`r`n`r`nTarget is the video rate the new file will use. About is a rough guess of the new size. When the current picture rate can be read, the guess keeps the audio and other tracks. When that rate is missing, the guess uses the target picture rate for the length of the video, so it can run a little high. Estimated savings is the current size minus About, added up for the checked files. It changes as those checks change. A file with no About figure is left out of the total."
+            Body = "Browse, or drop a folder onto the path, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows the bloated files, checked and ready to convert.`r`n`r`nSelect all checks every row. Deselect all clears every check. Clear removes the scanned files from the list. Files still waiting in .vd-originals stay. The folder list names each folder that has bloated files, and a show is listed along with the season folders inside it. Select folder checks only the bloated files in the folder you picked and clears the other checks, so Convert is that smaller job. Right-click a row for the same choices.`r`n`r`nGiB/h is the size of the whole file per hour of runtime. Budget is the line for that picture size. Over is how many times that budget the file uses. 2.0x is twice the line. Slight, shown in green, is under 1.5 times and barely over. Heavy, shown in yellow, is from 1.5 times up to 3 times. Extreme, shown in red, is 3 times the budget or more. Click a heading to sort. The first click on Over puts the worst files first.`r`n`r`nThe list beside Select folder offers Slight, Heavy, and Extreme. Select slight, Select heavy, or Select extreme checks only that group and clears the other checks, so Convert is that group. Right-click a row for the same choice.`r`n`r`nTarget is the video rate the new file will use. New size is a rough guess of the new file. When the current picture rate can be read, the guess keeps the audio and other tracks. When that rate is missing, the guess uses the target picture rate for the length of the video, so it can run a little high. That New size starts with a tilde. Estimated savings is the current size minus New size, added up for the checked files. It changes as those checks change. A file with no New size figure is left out of the total."
         },
         @{
             Title = 'Converting'
-            Body = "Convert shrinks every checked file whose status is Bloated or Failed. One file is encoded at a time. The bar is that file. Cancel stops the file that is running. Files that already finished stay finished.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity adds the encoder's own messages.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
+            Body = "Convert shrinks every checked file whose status is Bloated or Failed. One file is encoded at a time. The bar is that file. Cancel stops the file that is running. Files that already finished stay finished.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
         },
         @{
             Title = 'Checking the picture'
-            Body = "Select a file marked Ready to delete and click Compare. The window plays both copies side by side at normal speed: original on the left, new file on the right. Sound is the new file, which carries the original audio. The slider moves through both together.`r`n`r`nThis preview is for review. It is a smaller picture than the files themselves, so you can see them next to each other."
+            Body = "Select a file marked Ready to delete and click Compare. The window plays both copies side by side: original on the left, new file on the right. Sound is the new file. It will not stay in sync with the picture. Go to the file on disk to confirm the audio. The slider moves through both pictures together.`r`n`r`nThis preview is for review. It is a smaller picture than the files themselves, so you can see them next to each other."
         },
         @{
             Title = 'Originals and deleting'
@@ -2903,11 +3164,11 @@ function Get-HelpSections {
         },
         @{
             Title = 'Auto'
-            Body = "Delete originals automatically does the deletion as soon as a file checks out. The program asks once before a convert with Auto turned on. With Auto off, every original stays until you press Delete originals."
+            Body = "Delete originals automatically does the deletion as soon as a file checks out. The check looks at size, length, picture size, audio, subtitles, and whether the start and end play. It does not judge how the picture looks. The first time Auto is turned on, the program explains that Compare and Undo cannot bring the original back. You can hide that explanation. The program still asks before every convert with Auto turned on. With Auto off, every original stays until you press Delete originals."
         },
         @{
             Title = 'Updates'
-            Body = "The bottom right corner shows this copy's version.`r`n`r`nCheck for updates looks on GitHub for a newer version of this program. When one is there, Update downloads it and opens the setup program. The setup replaces the installed copy and keeps your settings.`r`n`r`nFinish or cancel the current job before you update. The program closes while the setup runs, then you can open it again."
+            Body = "The bottom right corner shows this copy's version.`r`n`r`nThe program checks for updates when it opens. Check for updates looks again. When one is there, a window tells you, and the message stays on the status line. Update downloads it and opens the setup program. The setup replaces the installed copy and keeps your settings. The setup asks whether to create a Start menu shortcut and whether to create a desktop shortcut.`r`n`r`nFinish or cancel the current job before you update. The program closes while the setup runs, then you can open it again."
         },
         @{
             Title = 'What is in this folder'
@@ -3064,6 +3325,9 @@ $script:Tips.AutoPopDelay = 20000
 $script:Tips.ShowAlways = $true
 
 $settings = Load-Settings
+$script:AutoWarnAccepted = [bool]$settings.AutoWarnAccepted
+$script:AutoWarnShown = $false
+$script:AutoWarnBusy = $false
 Set-BudgetPicks ([string]$settings.Budgets)
 $script:Loading = $true
 
@@ -3256,10 +3520,12 @@ $script:OverPick.DropDownWidth = 240
 $script:SelectOverButton = New-Button 'Select slight' 'secondary' 136 28
 $script:SelectAllButton = New-Button 'Select all' 'secondary' 104 28
 $script:SelectNoneButton = New-Button 'Deselect all' 'secondary' 120 28
+$script:ClearButton = New-Button 'Clear' 'secondary' 80 28
 $script:SelectFolderButton.Margin = New-Object Windows.Forms.Padding(0)
 $script:SelectOverButton.Margin = New-Object Windows.Forms.Padding(0)
 $script:SelectAllButton.Margin = New-Object Windows.Forms.Padding(0)
 $script:SelectNoneButton.Margin = New-Object Windows.Forms.Padding(0)
+$script:ClearButton.Margin = New-Object Windows.Forms.Padding(0)
 $script:ListHeader.Controls.Add($script:ListLabel)
 $script:ListHeader.Controls.Add($script:FolderPick)
 $script:ListHeader.Controls.Add($script:SelectFolderButton)
@@ -3267,6 +3533,7 @@ $script:ListHeader.Controls.Add($script:OverPick)
 $script:ListHeader.Controls.Add($script:SelectOverButton)
 $script:ListHeader.Controls.Add($script:SelectAllButton)
 $script:ListHeader.Controls.Add($script:SelectNoneButton)
+$script:ListHeader.Controls.Add($script:ClearButton)
 $script:SelectFolderButton.Add_Click({ Select-ChosenFolder })
 $script:SelectOverButton.Add_Click({ Select-OverBand (Get-SelectedOverId) })
 $script:OverPick.Add_SelectedIndexChanged({
@@ -3276,6 +3543,7 @@ $script:OverPick.Add_SelectedIndexChanged({
 })
 $script:SelectAllButton.Add_Click({ Set-AllChecks $true })
 $script:SelectNoneButton.Add_Click({ Set-AllChecks $false })
+$script:ClearButton.Add_Click({ Clear-ListedFiles })
 Update-OverChoices
 
 $script:Files = New-Object Windows.Forms.ListView
@@ -3292,18 +3560,18 @@ $script:Files.ForeColor = $script:ColorInk
 $script:Files.BorderStyle = 'FixedSingle'
 $script:Files.ShowItemToolTips = $true
 $script:Files.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 4)
-$script:ColumnTitles = @('File', 'Picture', 'Length', 'Size', 'GiB/h', 'Budget', 'Over', 'Target', 'About', 'Status')
+$script:ColumnTitles = @('File', 'Dimensions', 'Length', 'Size', 'GiB/h', 'Budget', 'Over', 'Target', 'New size', 'Status')
 $script:SortColumn = -1
 $script:SortAscending = $true
 [void]$script:Files.Columns.Add('File', 280)
-[void]$script:Files.Columns.Add('Picture', 110)
+[void]$script:Files.Columns.Add('Dimensions', 120)
 [void]$script:Files.Columns.Add('Length', 80)
 [void]$script:Files.Columns.Add('Size', 170)
 [void]$script:Files.Columns.Add('GiB/h', 70)
 [void]$script:Files.Columns.Add('Budget', 70)
 [void]$script:Files.Columns.Add('Over', 78)
 [void]$script:Files.Columns.Add('Target', 100)
-[void]$script:Files.Columns.Add('About', 90)
+[void]$script:Files.Columns.Add('New size', 110)
 [void]$script:Files.Columns.Add('Status', 150)
 $script:Files.Add_ColumnClick({ Sort-FileList $_.Column })
 $script:Files.Add_ItemChecked({ if (-not $script:BulkCheck) { Update-Buttons } })
@@ -3314,6 +3582,7 @@ $script:FileMenu.Font = $script:FontUi
 [void]$script:FileMenu.Items.Add('Deselect all')
 [void]$script:FileMenu.Items.Add('Select files in this folder')
 [void]$script:FileMenu.Items.Add('Select this overage')
+[void]$script:FileMenu.Items.Add('Clear')
 $script:FileMenu.Items[0].Add_Click({ Set-AllChecks $true })
 $script:FileMenu.Items[1].Add_Click({ Set-AllChecks $false })
 $script:FileMenu.Items[2].Add_Click({ Select-FolderOfSelectedFile })
@@ -3322,6 +3591,7 @@ $script:FileMenu.Items[3].Add_Click({
     $bandId = Get-RowOverBand $script:Files.SelectedItems[0].Tag
     if ($bandId) { Select-OverBand $bandId }
 })
+$script:FileMenu.Items[4].Add_Click({ Clear-ListedFiles })
 $script:FileMenu.Add_Opening({
     $busy = ($script:Work -ne 'idle')
     $hasRow = ($script:Files.SelectedItems.Count -eq 1)
@@ -3334,6 +3604,7 @@ $script:FileMenu.Add_Opening({
     $script:FileMenu.Items[1].Enabled = -not $busy
     $script:FileMenu.Items[2].Enabled = ((-not $busy) -and $hasRow)
     $script:FileMenu.Items[3].Enabled = ((-not $busy) -and $null -ne $band)
+    $script:FileMenu.Items[4].Enabled = ((-not $busy) -and (Test-ScanRows))
 })
 $script:Files.ContextMenuStrip = $script:FileMenu
 $script:Files.Add_MouseDown({
@@ -3357,6 +3628,7 @@ $script:OptionsTitle.ForeColor = $script:ColorInk
 $script:OptionsTitle.BackColor = [Drawing.Color]::White
 $script:SubfoldersCheck = New-Check 'Include subfolders'
 $script:AutoCheck = New-Check 'Delete originals automatically'
+$script:AutoCheck.AutoCheck = $false
 $script:DetailedCheck = New-Check 'Show detailed activity'
 $script:ShutdownCheck = New-Check 'Shutdown computer upon completion'
 $script:SubfoldersCheck.Checked = [bool]$settings.IncludeSubfolders
@@ -3375,18 +3647,27 @@ $script:BudgetTitle.ForeColor = $script:ColorInk
 $script:BudgetTitle.BackColor = [Drawing.Color]::White
 $script:BudgetLabels = @()
 $script:BudgetBoxes = @()
+$script:BudgetSwatches = @()
 foreach ($anchor in (Get-BudgetAnchors)) {
+    $mark = Get-BudgetMark ([string]$anchor.Id)
+    $swatch = New-Object Windows.Forms.Panel
+    $swatch.BackColor = $(if ($mark) { $mark.Mark } else { $script:ColorLine })
     $name = New-Object Windows.Forms.Label
     $name.Text = [string]$anchor.Name
     $name.Font = $script:FontUi
-    $name.ForeColor = $script:ColorInk
+    $name.ForeColor = $(if ($mark) { $mark.Fore } else { $script:ColorInk })
     $name.BackColor = [Drawing.Color]::White
     $name.AutoEllipsis = $true
     $box = New-Object Windows.Forms.ComboBox
     $box.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+    $box.FlatStyle = [Windows.Forms.FlatStyle]::Flat
     $box.Font = $script:FontUi
     $box.Tag = [string]$anchor.Id
     $box.DropDownWidth = 280
+    if ($mark) {
+        $box.BackColor = $mark.Back
+        $box.ForeColor = $mark.Fore
+    }
     $pick = 'recommended'
     if ($script:BudgetPicks.ContainsKey([string]$anchor.Id)) { $pick = [string]$script:BudgetPicks[[string]$anchor.Id] }
     $selected = 0
@@ -3398,11 +3679,14 @@ foreach ($anchor in (Get-BudgetAnchors)) {
     }
     $box.SelectedIndex = $selected
     $box.Add_SelectedIndexChanged({ Update-BudgetChoice })
+    $script:OptionsCard.Controls.Add($swatch)
     $script:OptionsCard.Controls.Add($name)
     $script:OptionsCard.Controls.Add($box)
+    $script:BudgetSwatches += $swatch
     $script:BudgetLabels += $name
     $script:BudgetBoxes += $box
 }
+$script:BudgetSwatches = @($script:BudgetSwatches)
 $script:BudgetLabels = @($script:BudgetLabels)
 $script:BudgetBoxes = @($script:BudgetBoxes)
 $script:OptionsCard.Controls.Add($script:BudgetTitle)
@@ -3411,9 +3695,14 @@ $script:OptionsCard.Add_Paint({
     $_.Graphics.DrawRectangle($pen, 0, 0, ($script:OptionsCard.Width - 1), ($script:OptionsCard.Height - 1))
     $pen.Dispose()
 })
-foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
+foreach ($chk in @($script:SubfoldersCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
     $chk.Add_CheckedChanged({ if (-not $script:Loading) { Save-Settings } })
 }
+$script:AutoCheck.Add_Click({
+    if ($script:Loading -or $script:AutoWarnBusy) { return }
+    $script:AutoCheck.Checked = -not $script:AutoCheck.Checked
+    Update-AutoChoice
+})
 
 $script:ActionPanel = New-Object Windows.Forms.Panel
 $script:ActionPanel.Dock = 'Fill'
@@ -3490,22 +3779,22 @@ $script:Form.Controls.Add($script:StatusPanel)
 $script:Form.Controls.Add($script:Header)
 
 Set-Tip $script:FolderBox 'The folder Scan will look through. Drop a folder here, or click Browse. The choice is remembered.'
-Set-Tip $script:SavingsLabel 'Current size minus the About column, for the checked files Convert will shrink. A missing picture rate uses the target size alone. It changes as you check and uncheck rows.'
+Set-Tip $script:SavingsLabel 'Current size minus the New size column, for the checked files Convert will shrink. A New size that starts with ~ had no picture rate, so that guess can run high. It changes as you check and uncheck rows.'
 Set-Tip $script:BrowseButton 'Choose the folder to scan.'
 Set-Tip $script:SubfoldersCheck 'Look inside folders within the chosen folder. Turn this off to scan only the files sitting directly in that folder.'
-Set-Tip $script:AutoCheck 'After a new file checks out, delete the original. Leave this off to compare first and delete with the Delete originals button.'
-Set-Tip $script:DetailedCheck "Show the encoder's own technical messages in the activity box."
+Set-Tip $script:AutoCheck 'After a new file checks out, delete the original. The first time, the program explains what you give up. Leave this off to compare first and delete with the Delete originals button.'
+Set-Tip $script:DetailedCheck 'List each encode step in the activity box. The running percent stays on the bar, not as a new line.'
 Set-Tip $script:ShutdownCheck 'After Convert finishes, turn the computer off. A one-minute countdown lets you cancel. The computer stays on if you stop the convert. A scan does not turn it off.'
 Set-Tip $script:BudgetTitle 'The size line for each picture. Recommended is where the program starts. Scan again after you change one.'
 Update-BudgetTips
 Set-Tip $script:ScanButton 'Read the videos in the folder and list the ones that are too big for their picture size.'
 Set-Tip $script:ConvertButton 'Shrink every checked video that is bloated or failed earlier. The new file takes the original place.'
 Set-Tip $script:CancelButton 'Stop the scan or the file that is converting. Esc does this too.'
-Set-Tip $script:CompareButton 'Play the original and the new file side by side.'
+Set-Tip $script:CompareButton 'Play the original and the new file side by side. The sound will not stay in sync with the picture. Go to the file on disk to confirm the audio.'
 Set-Tip $script:UndoButton 'Put the originals from the last conversion back, and delete the new files. The program asks first.'
 Set-Tip $script:DeleteButton 'Delete the checked originals that are waiting in .vd-originals. The new files stay.'
 Set-Tip $script:HelpButton 'Open a short guide to the size rule, comparing, and what each part of this folder is for.'
-Set-Tip $script:CheckUpdateButton 'Look on GitHub for a newer version of Video Dehydrator.'
+Set-Tip $script:CheckUpdateButton 'Look on GitHub for a newer version of Video Dehydrator. A window opens when a newer version is found.'
 Set-Tip $script:UpdateButton 'Download the newer version and open its setup program. This window closes while that setup runs.'
 Set-Tip $script:FolderPick 'Folders that have bloated files. A show is listed with the folders inside it. Pick one to make a smaller convert job.'
 Set-Tip $script:SelectFolderButton 'Check the bloated files in the folder shown here, and clear the other checks.'
@@ -3513,6 +3802,7 @@ Set-Tip $script:OverPick 'How far each file is over its budget. Slight is under 
 Set-Tip $script:SelectOverButton 'Check the files in the group shown here, and clear the other checks. Convert then shrinks that group.'
 Set-Tip $script:SelectAllButton 'Check every row.'
 Set-Tip $script:SelectNoneButton 'Clear every check.'
+Set-Tip $script:ClearButton 'Remove the scanned files from the list. Files still waiting in .vd-originals stay.'
 Set-Tip $script:Files 'Bloated videos are checked. Over shows how many times the budget each file uses. Click a heading to sort. Right-click a row to select that folder or that overage. Double-click a file that is ready to delete to compare it.'
 Set-Tip $script:Log 'Saved space, skipped videos, and problems are listed here.'
 Set-Tip $script:ProgressTrack 'How far the current file has been encoded.'
@@ -3573,6 +3863,7 @@ $script:Form.Add_Shown({
             [void][VideoDehydrator.Native]::SetForegroundWindow($script:Form.Handle)
         } catch {
         }
+        Start-UpdateCheck
     }
 })
 $script:Form.Add_DragEnter({
@@ -3693,6 +3984,11 @@ function Invoke-OverCheck {
     Assert-True ($slight.SubItems[6].Text -eq '1.2x') ("Slight over was $($slight.SubItems[6].Text)")
     Assert-True ($heavy.SubItems[6].Text -eq '2.0x') ("Heavy over was $($heavy.SubItems[6].Text)")
     Assert-True ($extreme.SubItems[6].Text -eq '5.0x') ("Extreme over was $($extreme.SubItems[6].Text)")
+    Assert-True ($script:Files.Columns[1].Text -eq 'Dimensions') 'Dimensions heading was missing'
+    Assert-True ($script:Files.Columns[8].Text -eq 'New size') 'New size heading was missing'
+    Assert-True ($slight.SubItems[1].BackColor.ToArgb() -eq (Get-BudgetMark '1080').Back.ToArgb()) '1080p file did not match its budget color'
+    Assert-True ($script:BudgetBoxes[1].BackColor.ToArgb() -eq (Get-BudgetMark '1080').Back.ToArgb()) '1080p budget did not use its color'
+    Assert-True ($script:BudgetSwatches[0].BackColor.ToArgb() -eq (Get-BudgetMark '2160').Mark.ToArgb()) '2160p mark was missing'
     Assert-True ($slight.SubItems[6].BackColor.ToArgb() -eq $script:ColorOverSlightBack.ToArgb()) 'Slight was not green'
     Assert-True ($heavy.SubItems[6].BackColor.ToArgb() -eq $script:ColorOverHeavyBack.ToArgb()) 'Heavy was not yellow'
     Assert-True ($extreme.SubItems[6].BackColor.ToArgb() -eq $script:ColorOverExtremeBack.ToArgb()) 'Extreme was not red'
@@ -3845,6 +4141,88 @@ function Invoke-BudgetCheck {
     Update-BloatFolders
 }
 
+function Invoke-ClearCheck {
+    $script:Files.Items.Clear()
+    $rough = @{
+        Status = 'Bloated'
+        Path = 'C:\Library\rough.mkv'
+        Kept = ''
+        New = ''
+        Source = 'C:\Library\rough.mkv'
+        Width = 1920
+        Height = 1080
+        DurationSec = 3600
+        SizeBytes = 3000000000
+        OldBytes = $null
+        GiBph = 3
+        BudgetGiBph = 2
+        TargetKbps = 3000
+        EstimateBytes = 1350000000
+        EstimateRough = $true
+        VideoBitrate = [int64]0
+        Codec = 'h264'
+        PendingId = ''
+        Reason = 'smoke rough'
+    }
+    $exact = @{
+        Status = 'Bloated'
+        Path = 'C:\Library\exact.mkv'
+        Kept = ''
+        New = ''
+        Source = 'C:\Library\exact.mkv'
+        Width = 1920
+        Height = 1080
+        DurationSec = 3600
+        SizeBytes = 3000000000
+        OldBytes = $null
+        GiBph = 3
+        BudgetGiBph = 2
+        TargetKbps = 3000
+        EstimateBytes = 1400000000
+        EstimateRough = $false
+        VideoBitrate = [int64]8000000
+        Codec = 'h264'
+        PendingId = ''
+        Reason = 'smoke exact'
+    }
+    $pending = @{
+        Status = 'Ready to delete'
+        Path = 'C:\Library\new.mkv'
+        Kept = 'C:\Library\.vd-originals\old.mkv'
+        New = 'C:\Library\new.mkv'
+        Source = 'C:\Library\old.mkv'
+        Width = 1920
+        Height = 1080
+        DurationSec = 0
+        SizeBytes = 1000
+        OldBytes = 2000
+        GiBph = $null
+        BudgetGiBph = $null
+        TargetKbps = 3000
+        EstimateBytes = $null
+        EstimateRough = $false
+        Codec = ''
+        PendingId = 'keep-me'
+        Reason = 'smoke pending'
+    }
+    Add-ResultRow $rough | Out-Null
+    Add-ResultRow $exact | Out-Null
+    Add-ResultRow $pending | Out-Null
+    Update-Buttons
+    $byPath = @{}
+    foreach ($item in @($script:Files.Items)) { $byPath[[string]$item.Tag.Path] = $item }
+    Assert-True ($byPath['C:\Library\rough.mkv'].SubItems[8].Text.StartsWith('~')) 'A missing picture rate did not show a tilde'
+    Assert-True (-not $byPath['C:\Library\exact.mkv'].SubItems[8].Text.StartsWith('~')) 'A known picture rate showed a tilde'
+    Assert-True ($script:ClearButton.Enabled) 'Clear stayed disabled with scanned files'
+    Clear-ListedFiles
+    Assert-True ($script:Files.Items.Count -eq 1) 'Clear removed a held original'
+    Assert-True ([string]$script:Files.Items[0].Tag.PendingId -eq 'keep-me') 'Clear kept the wrong row'
+    Assert-True (-not $script:ClearButton.Enabled) 'Clear stayed enabled after the scan list was empty'
+    $script:Files.Items.Clear()
+    Update-BloatFolders
+    Update-Buttons
+}
+
 function Invoke-SmokeTest {
     $missing = @(Get-MissingTools)
     Assert-True ($missing.Count -eq 0) ("Missing tools: " + ($missing -join ', '))
@@ -3859,6 +4237,7 @@ function Invoke-SmokeTest {
     Invoke-FolderSelectCheck
     Invoke-OverCheck
     Invoke-BudgetCheck
+    Invoke-ClearCheck
     Save-FormImage $script:Form (Join-Path $env:TEMP 'vdh-main.png')
     Show-Help
     [Windows.Forms.Application]::DoEvents()
@@ -3875,11 +4254,42 @@ function Invoke-SmokeTest {
     Assert-True ($script:HelpBox.Text -match '\.plexignore file is removed') 'The guide was missing plexignore cleanup'
     Assert-True ($script:UndoButton.Text -eq 'Undo') 'Undo button was missing'
     Assert-True ($script:HelpBox.Text -match 'Check for updates') 'The guide was missing updates'
+    Assert-True ($script:HelpBox.Text -match 'a window tells you') 'The guide was missing the update window'
+    Assert-True ($script:HelpBox.Text -match 'Clear removes the scanned files') 'The guide was missing Clear'
+    Assert-True ($script:HelpBox.Text -match 'starts with a tilde') 'The guide was missing the rough new size'
+    Assert-True ($script:HelpBox.Text -match 'does not judge how the picture looks') 'The guide was missing the auto warning'
+    Assert-True ($script:HelpBox.Text -match 'asks before every convert') 'The guide was missing the convert warning'
+    Assert-True ($script:HelpBox.Text -match 'does not add a line for each percent') 'The guide was missing the activity percent note'
+    Assert-True ($script:HelpBox.Text -match 'will not stay in sync with the picture') 'The guide was missing the compare sync note'
+    Assert-True ($script:HelpBox.Text -match 'Go to the file on disk to confirm the audio') 'The guide was missing the disk audio note'
+    Assert-True ($script:HelpBox.Text -match 'checks for updates when it opens') 'The guide was missing the startup update check'
+    Assert-True (Test-EncodeProgressLine 'Encoding: task 1 of 2, 50.00 % (12.00 fps, avg 10.00 fps, ETA 00h00m10s)') 'An encode percent was treated as a step'
+    Assert-True (Test-EncodeProgressLine 'Muxing: 40 %') 'A mux percent was treated as a step'
+    Assert-True (-not (Test-EncodeProgressLine '[00:00:01] hb_init: starting libhb thread')) 'A real encode step was hidden'
+    Write-Activity 'TASK-START smoke' 'text'
+    Start-ActivityPulse
+    $lastPulse = @($script:Log.Text -split '\r?\n' | Where-Object { $_ -ne '' })[-1]
+    Assert-True ($lastPulse -eq 'Working  |') 'The working mark did not appear'
+    $lines = @($script:Log.Text -split '\r?\n')
+    $script:PulseStamp = [datetime]::MinValue
+    Update-ActivityPulse
+    $turned = @($script:Log.Text -split '\r?\n')
+    $lastTurn = @($turned | Where-Object { $_ -ne '' })[-1]
+    Assert-True ($turned.Count -eq $lines.Count) 'The working mark added a line'
+    Assert-True ($lastTurn -eq 'Working  /') 'The working mark did not turn'
+    Write-Activity 'TASK-STEP smoke' 'dim'
+    $afterStep = @($script:Log.Text -split '\r?\n' | Where-Object { $_ -ne '' })
+    Assert-True ($afterStep -contains 'TASK-STEP smoke') 'A step was dropped while the mark was showing'
+    Assert-True ($afterStep[-1] -eq 'Working  /') 'The working mark did not stay on the last line'
+    Assert-True ($afterStep[-2] -eq 'TASK-STEP smoke') 'The step did not stay above the working mark'
+    Stop-ActivityPulse
+    $afterStop = @($script:Log.Text -split '\r?\n' | Where-Object { $_ -ne '' })[-1]
+    Assert-True ($afterStop -eq 'TASK-STEP smoke') 'The working mark stayed after the job'
     Assert-True ($script:HelpBox.Text -match 'bottom right corner shows this copy') 'The guide was missing the version corner'
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.4') 'Version file was not 1.0.4'
+    Assert-True ((Get-AppVersion) -eq '1.0.4.1') 'Version file was not 1.0.4.1'
     Assert-True ($script:VersionLabel.Text -eq (Get-AppVersion)) 'Version label did not show the version'
     Assert-True ($script:VersionLabel.Parent -eq $script:StatusPanel) 'Version is not in the status bar'
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.0') -eq 1) 'A newer version compared as older'
@@ -3887,9 +4297,11 @@ function Invoke-SmokeTest {
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.2') -eq -1) 'An older version compared as newer'
     Assert-True ($null -eq (Compare-AppVersion 'not-a-version' '1.0.1')) 'A name was treated as a version'
     Assert-True ((Compare-AppVersion 'v1.2.0' '1.1.9') -eq 1) 'A v prefix was not read'
+    Assert-True ((Compare-AppVersion '1.0.4.1' '1.0.4') -eq 1) 'A fourth version number was ignored'
+    Assert-True ((Compare-AppVersion '1.0.4' '1.0.4.0') -eq 0) 'A missing fourth number did not match zero'
     $sameOffer = Get-UpdateOffer ([pscustomobject]@{
-        tag_name = 'v1.0.4'
-        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.4/video_dehydrator.exe'; size = 12 })
+        tag_name = 'v1.0.4.1'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.4.1/video_dehydrator.exe'; size = 12 })
     })
     Assert-True (-not $sameOffer.Newer) 'The current version was offered as an update'
     $bareOffer = Get-UpdateOffer ([pscustomobject]@{ tag_name = 'v9.9.9'; assets = @() })
@@ -3918,7 +4330,9 @@ function Invoke-SmokeTest {
     Assert-True ($script:FolderPick.Right -le ($script:SelectFolderButton.Left + 1)) 'Folder list overlaps Select folder'
     Assert-True ($script:SelectFolderButton.Right -le ($script:OverPick.Left + 1)) 'Select folder overlaps the overage list'
     Assert-True ($script:OverPick.Right -le ($script:SelectOverButton.Left + 1)) 'Overage list overlaps its button'
-    Assert-True ($script:SelectNoneButton.Right -le ($script:ListHeader.ClientSize.Width + 1)) 'Deselect all sits outside the list header'
+    Assert-True ($script:ClearButton.Text -eq 'Clear') 'Clear was missing'
+    Assert-True ($script:ClearButton.Right -le ($script:ListHeader.ClientSize.Width + 1)) 'Clear sits outside the list header'
+    Assert-True ($script:SelectNoneButton.Right -le ($script:ClearButton.Left + 1)) 'Deselect all overlaps Clear'
     $script:Form.ClientSize = New-Object Drawing.Size($keptWidth, $script:Form.ClientSize.Height)
     Update-ChromeLayout
     $nestedPending = ,@(
@@ -3934,6 +4348,36 @@ function Invoke-SmokeTest {
     Assert-True ($readBack.Count -eq 2 -and $readBack[1].id -eq 'b') 'Saved pending did not read back as two rows'
     Update-Buttons
     Assert-True ($script:UndoButton.Enabled -eq (@(Get-UndoBatch).Count -gt 0)) 'Undo button did not follow the held originals'
+    $keptWarn = [bool]$script:AutoWarnAccepted
+    $keptShown = [bool]$script:AutoWarnShown
+    $script:AutoWarnAccepted = $false
+    $script:AutoWarnShown = $false
+    Assert-True (Test-AutoWarnPending) 'Auto warning was hidden before a choice'
+    Assert-True (-not (Apply-AutoWarnChoice 'off' $true)) 'Leaving auto off was accepted'
+    Assert-True (-not $script:AutoWarnAccepted) 'Leaving auto off hid the warning'
+    Assert-True (Test-AutoWarnPending) 'The warning stayed after leaving auto off'
+    Assert-True (Apply-AutoWarnChoice 'on' $false) 'Turning auto on was refused'
+    Assert-True (-not $script:AutoWarnAccepted) 'Turning auto on without the box hid the warning'
+    Assert-True (-not (Test-AutoWarnPending)) 'The warning repeated in the same session'
+    $script:AutoWarnShown = $false
+    Assert-True (Test-AutoWarnPending) 'The warning did not return on a later open'
+    Assert-True (Apply-AutoWarnChoice 'on' $true) 'Turning auto on with the box was refused'
+    Assert-True ($script:AutoWarnAccepted) 'The warning was not remembered'
+    Assert-True (-not (Test-AutoWarnPending)) 'A remembered warning was still due'
+    $script:AutoWarnAccepted = $keptWarn
+    $script:AutoWarnShown = $keptShown
+    Assert-True (-not $script:AutoCheck.AutoCheck) 'Auto would turn itself off after the warning'
+    $warnForm = New-AutoWarnForm
+    try {
+        $warnForm.StartPosition = 'Manual'
+        $warnForm.Location = New-Object Drawing.Point(-32000, -32000)
+        $warnForm.Show()
+        $turnOn = @($warnForm.Controls) | Where-Object { $_.Text -eq 'Turn auto on' } | Select-Object -First 1
+        $turnOn.PerformClick()
+        Assert-True ($warnForm.Tag.Choice -eq 'on') 'Turn auto on was recorded as off'
+        if (-not $warnForm.IsDisposed) { $warnForm.Close() }
+    }
+    finally { if (-not $warnForm.IsDisposed) { $warnForm.Dispose() } }
     Assert-True (-not $script:ShutdownCheck.Checked) 'Shutdown started checked'
     Assert-True ($script:ShutdownCheck.Text -eq 'Shutdown computer upon completion') 'Shutdown label'
     $script:ShutdownRequested = $false

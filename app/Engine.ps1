@@ -504,6 +504,7 @@ function Get-BloatDecision {
         TargetKbps    = $target
         GiBph         = $gibph
         EstimateBytes = $estimate
+        EstimateRough = [bool]($null -ne $estimate -and $estimate -gt 0 -and $Probe.VideoBitrate -le 0)
     }
 }
 
@@ -564,6 +565,20 @@ function Get-HandBrakeArguments {
     return $arguments
 }
 
+function Test-HarmlessDecodeNote([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $true }
+    $lines = @($Text -split '\s+\|\s+|\r?\n' | Where-Object { $_ -and $_.Trim() })
+    if ($lines.Count -eq 0) { return $true }
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ($trimmed -notmatch '^(?:\[[^\]]+\]\s*)?Application provided invalid, non monotonically increasing dts to muxer in stream \d+:\s*(\d+)\s*>=\s*(\d+)\s*$') {
+            return $false
+        }
+        if ($Matches[1] -ne $Matches[2]) { return $false }
+    }
+    return $true
+}
+
 function Test-DecodeWindow {
     param(
         [Parameter(Mandatory)][string]$Ffmpeg,
@@ -585,7 +600,7 @@ function Test-DecodeWindow {
     $ffArgs += @('-t', "$seconds", '-i', $File, '-f', 'null', '-')
     $run = Invoke-CapturedProcess -File $Ffmpeg -Arguments $ffArgs
     $err = (($run.StdOut + "`n" + $run.StdErr) -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '^\s*$' }) -join ' | '
-    if ($run.ExitCode -ne 0 -or $err) {
+    if ($run.ExitCode -ne 0 -or -not (Test-HarmlessDecodeNote $err)) {
         return [pscustomobject]@{ Ok = $false; Detail = "decode $Window exit=$($run.ExitCode) $err" }
     }
     return [pscustomobject]@{ Ok = $true; Detail = '' }
@@ -988,6 +1003,7 @@ function Add-ScanDirectory {
                     BudgetGiBph   = $decision.BudgetGiBph
                     TargetKbps    = $decision.TargetKbps
                     EstimateBytes = $decision.EstimateBytes
+                    EstimateRough = [bool]$decision.EstimateRough
                     VideoBitrate  = $probe.VideoBitrate
                     Reason        = $decision.Reason
                 }
@@ -1149,11 +1165,13 @@ function Invoke-EngineSelfTest {
     $missingRate = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]3GB) -DurationSec $hour)
     Assert-Engine ($missingRate.Decision -eq 'bloated') 'a missing picture rate is still bloated'
     Assert-Engine ($missingRate.EstimateBytes -eq $targetOnly) 'a missing picture rate uses the target size'
+    Assert-Engine ([bool]$missingRate.EstimateRough) 'a missing picture rate is not marked rough'
     $audioBytes = [int64](192000 * $hour / 8.0)
     $videoBytes = [int64](8000000 * $hour / 8.0)
     $withAudio = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ($videoBytes + $audioBytes) -DurationSec $hour -VideoBitrate 8000000)
     $keptAudio = [int64][math]::Round(((3000 * 1000.0) + 192000) * $hour / 8.0)
     Assert-Engine ($withAudio.EstimateBytes -eq $keptAudio) 'a known picture rate keeps the other tracks'
+    Assert-Engine (-not [bool]$withAudio.EstimateRough) 'a known picture rate was marked rough'
     $headerRate = [pscustomobject]@{ bit_rate = '8000000'; tags = [pscustomobject]@{ BPS = '1000' } }
     Assert-Engine ((Get-StreamBitrate $headerRate $hour) -eq 8000000) 'header bitrate wins'
     $tagRate = [pscustomobject]@{ bit_rate = ''; tags = [pscustomobject]@{ BPS = '4500000' } }
@@ -1165,6 +1183,12 @@ function Invoke-EngineSelfTest {
 
     $dv = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]8GB) -DurationSec $hour -Dolby $true)
     Assert-Engine ($dv.Decision -eq 'dv') 'Dolby Vision is left alone'
+
+    $sameStamp = '[null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 10 | [null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 18 >= 18'
+    Assert-Engine (Test-HarmlessDecodeNote $sameStamp) 'equal timestamp notes are harmless'
+    Assert-Engine (Test-HarmlessDecodeNote '') 'an empty decode note is harmless'
+    Assert-Engine (-not (Test-HarmlessDecodeNote '[null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 4')) 'a backwards timestamp is not harmless'
+    Assert-Engine (-not (Test-HarmlessDecodeNote ($sameStamp + ' | Error while decoding stream'))) 'another decode message is not harmless'
 
     $fraction = Get-HandBrakeFraction 'Encoding: task 1 of 2, 50.00 % (12.00 fps, avg 10.00 fps, ETA 00h00m10s)'
     Assert-Engine ([math]::Abs($fraction - 25) -lt 0.01) 'pass 1 progress'

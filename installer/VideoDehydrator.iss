@@ -3,7 +3,7 @@
 ; Compile with Inno Setup 6:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" VideoDehydrator.iss
 
-#define AppVersion "1.0.4"
+#define AppVersion "1.0.4.1"
 #define Repo ".."
 #define ToolExe "E:\Programming\video_dehydrator\tools"
 
@@ -28,7 +28,7 @@ WizardStyle=modern
 Uninstallable=yes
 UninstallDisplayName=Video Dehydrator
 UninstallDisplayIcon={sys}\imageres.dll
-VersionInfoVersion=1.0.4.0
+VersionInfoVersion=1.0.4.1
 VersionInfoProductName=Video Dehydrator
 VersionInfoCompany=Video Dehydrator
 VersionInfoDescription=Installs Video Dehydrator and the tools it needs
@@ -48,8 +48,17 @@ Source: "{#ToolExe}\ffprobe.exe"; DestDir: "{app}\tools"
 Source: "{#ToolExe}\ffplay.exe"; DestDir: "{app}\tools"
 Source: "{#ToolExe}\HandBrakeCLI.exe"; DestDir: "{app}\tools"
 
+[Tasks]
+Name: startmenuicon; Description: "Create a Start menu shortcut"; GroupDescription: "Shortcuts:"; Flags: checkedonce
+Name: desktopicon; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+
 [Icons]
-Name: "{autoprograms}\Video Dehydrator"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; IconFilename: "{sys}\imageres.dll"; IconIndex: 189; Comment: "Shrink videos that are too big for their picture size"
+Name: "{autoprograms}\Video Dehydrator"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; IconFilename: "{sys}\imageres.dll"; IconIndex: 189; Comment: "Shrink videos that are too big for their picture size"; Tasks: startmenuicon
+Name: "{autodesktop}\Video Dehydrator"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; IconFilename: "{sys}\imageres.dll"; IconIndex: 189; Comment: "Shrink videos that are too big for their picture size"; Tasks: desktopicon
+
+[InstallDelete]
+Type: files; Name: "{autoprograms}\Video Dehydrator.lnk"
+Type: files; Name: "{autodesktop}\Video Dehydrator.lnk"
 
 [Run]
 Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; Description: "Open Video Dehydrator"; Flags: postinstall nowait skipifsilent

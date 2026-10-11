@@ -1,6 +1,18 @@
+These programs are separate from Video Dehydrator. Video Dehydrator runs them as their own programs. They keep their own licenses. The license texts are in this folder.
+
 HandBrakeCLI.exe
-  HandBrake, GPL-2.0. https://handbrake.fr/
-  The license text is HandBrake-LICENSE.txt.
+  HandBrake 1.11.2
+  License: GPL-2.0. The license text is HandBrake-LICENSE.txt.
+  https://handbrake.fr/
+  Source for this release: https://github.com/HandBrake/HandBrake/archive/refs/tags/1.11.2.tar.gz
+  Release page: https://github.com/HandBrake/HandBrake/releases/tag/1.11.2
 
 ffmpeg.exe, ffprobe.exe, ffplay.exe
-  FFmpeg, GPL-3.0. See FFmpeg-LICENSE.txt.
+  FFmpeg 9.0.2 essentials build, from gyan.dev.
+  ffmpeg -version reports: 9.0.2-essentials_build-www.gyan.dev
+  The build uses --enable-gpl --enable-version3, so this copy is GPL-3.0.
+  The license text is FFmpeg-LICENSE.txt.
+  Build page: https://www.gyan.dev/ffmpeg/builds/
+  This build's release: https://github.com/GyanD/codexffmpeg/releases/tag/9.0.2
+  FFmpeg source for this build: https://github.com/FFmpeg/FFmpeg/commit/946fcce07b
+  This build is static. The .exe files also include other programs, including libx264 and libx265. The FFmpeg commit is not the whole source of those files. gyan.dev lists the libraries in the essentials build on the build page above.
