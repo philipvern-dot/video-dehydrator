@@ -367,9 +367,7 @@ function Get-MediaProbe {
     [void][int]::TryParse([string](Get-NoteProperty $video 'height'), [ref]$height)
     $width = 0
     [void][int]::TryParse([string](Get-NoteProperty $video 'width'), [ref]$width)
-    $videoBitrate = [int64]0
-    $bitrateRaw = Get-NoteProperty $video 'bit_rate'
-    if ($bitrateRaw) { [void][int64]::TryParse([string]$bitrateRaw, [ref]$videoBitrate) }
+    $videoBitrate = Get-StreamBitrate $video $duration
 
     return [pscustomobject]@{
         DurationSec      = $duration
@@ -397,14 +395,54 @@ function Get-MediaProbe {
     }
 }
 
+function ConvertTo-PositiveInt64([string]$Text) {
+    $value = [int64]0
+    if ([string]::IsNullOrWhiteSpace($Text)) { return [int64]0 }
+    if (-not [int64]::TryParse($Text.Trim(), [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
+        return [int64]0
+    }
+    if ($value -le 0) { return [int64]0 }
+    return $value
+}
+
+function Get-TaggedText($tags, [string]$Name) {
+    if ($null -eq $tags -or -not $Name) { return '' }
+    $direct = Get-NoteProperty $tags $Name
+    if ($null -ne $direct -and [string]$direct -ne '') { return [string]$direct }
+    $prefix = $Name + '-'
+    foreach ($property in @($tags.PSObject.Properties)) {
+        $propertyName = [string]$property.Name
+        if (-not $propertyName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($null -ne $property.Value -and [string]$property.Value -ne '') { return [string]$property.Value }
+    }
+    return ''
+}
+
+function Get-StreamBitrate($stream, [double]$DurationSec) {
+    if ($null -eq $stream) { return [int64]0 }
+    $bits = ConvertTo-PositiveInt64 ([string](Get-NoteProperty $stream 'bit_rate'))
+    if ($bits -gt 0) { return $bits }
+    $tags = Get-NoteProperty $stream 'tags'
+    $tagged = ConvertTo-PositiveInt64 (Get-TaggedText $tags 'BPS')
+    if ($tagged -gt 0) { return $tagged }
+    if ($DurationSec -gt 0) {
+        $bytes = ConvertTo-PositiveInt64 (Get-TaggedText $tags 'NUMBER_OF_BYTES')
+        if ($bytes -gt 0) { return [int64][math]::Round(($bytes * 8.0) / $DurationSec) }
+    }
+    return [int64]0
+}
+
 function Get-EstimatedBytes {
     param($Probe, [int]$TargetKbps)
     if ($null -eq $Probe) { return $null }
     if ($Probe.DurationSec -le 0) { return $null }
-    if ($Probe.VideoBitrate -le 0) { return $null }
-    $fileBps = ($Probe.SizeBytes * 8.0) / $Probe.DurationSec
-    $other = $fileBps - $Probe.VideoBitrate
-    if ($other -lt 0) { $other = 0 }
+    if ($TargetKbps -le 0) { return $null }
+    $other = 0.0
+    if ($Probe.VideoBitrate -gt 0 -and $Probe.SizeBytes -gt 0) {
+        $fileBps = ($Probe.SizeBytes * 8.0) / $Probe.DurationSec
+        $other = $fileBps - $Probe.VideoBitrate
+        if ($other -lt 0) { $other = 0 }
+    }
     $estimate = (($TargetKbps * 1000.0) + $other) * $Probe.DurationSec / 8.0
     if ($estimate -lt 0) { return $null }
     return [int64][math]::Round($estimate)
@@ -1106,6 +1144,24 @@ function Invoke-EngineSelfTest {
 
     $bogus = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]6GB) -DurationSec $hour -VideoBitrate 100000)
     Assert-Engine ($bogus.Decision -eq 'bloated') 'a tiny reported bitrate does not hide a huge file'
+
+    $targetOnly = [int64][math]::Round((3000 * 1000.0 * $hour) / 8.0)
+    $missingRate = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]3GB) -DurationSec $hour)
+    Assert-Engine ($missingRate.Decision -eq 'bloated') 'a missing picture rate is still bloated'
+    Assert-Engine ($missingRate.EstimateBytes -eq $targetOnly) 'a missing picture rate uses the target size'
+    $audioBytes = [int64](192000 * $hour / 8.0)
+    $videoBytes = [int64](8000000 * $hour / 8.0)
+    $withAudio = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ($videoBytes + $audioBytes) -DurationSec $hour -VideoBitrate 8000000)
+    $keptAudio = [int64][math]::Round(((3000 * 1000.0) + 192000) * $hour / 8.0)
+    Assert-Engine ($withAudio.EstimateBytes -eq $keptAudio) 'a known picture rate keeps the other tracks'
+    $headerRate = [pscustomobject]@{ bit_rate = '8000000'; tags = [pscustomobject]@{ BPS = '1000' } }
+    Assert-Engine ((Get-StreamBitrate $headerRate $hour) -eq 8000000) 'header bitrate wins'
+    $tagRate = [pscustomobject]@{ bit_rate = ''; tags = [pscustomobject]@{ BPS = '4500000' } }
+    Assert-Engine ((Get-StreamBitrate $tagRate $hour) -eq 4500000) 'BPS tag fills a missing bitrate'
+    $byteTags = New-Object psobject
+    $byteTags | Add-Member -NotePropertyName 'NUMBER_OF_BYTES-eng' -NotePropertyValue '1800000000'
+    Assert-Engine ((Get-StreamBitrate ([pscustomobject]@{ tags = $byteTags }) $hour) -eq 4000000) 'byte-count tag fills a missing bitrate'
+    Assert-Engine ((Get-StreamBitrate ([pscustomobject]@{}) $hour) -eq 0) 'no bitrate stays unknown'
 
     $dv = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]8GB) -DurationSec $hour -Dolby $true)
     Assert-Engine ($dv.Decision -eq 'dv') 'Dolby Vision is left alone'

@@ -339,7 +339,7 @@ $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.3'
+$script:UpdateFallback = '1.0.4'
 $script:UpdateOffer = $null
 $script:UpdateClosing = $false
 
@@ -2887,7 +2887,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Scanning'
-            Body = "Browse, or drop a folder onto the path, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows the bloated files, checked and ready to convert.`r`n`r`nSelect all checks every row. Deselect all clears every check. The folder list names each folder that has bloated files, and a show is listed along with the season folders inside it. Select folder checks only the bloated files in the folder you picked and clears the other checks, so Convert is that smaller job. Right-click a row for the same choices.`r`n`r`nGiB/h is the size of the whole file per hour of runtime. Budget is the line for that picture size. Over is how many times that budget the file uses. 2.0x is twice the line. Slight, shown in green, is under 1.5 times and barely over. Heavy, shown in yellow, is from 1.5 times up to 3 times. Extreme, shown in red, is 3 times the budget or more. Click a heading to sort. The first click on Over puts the worst files first.`r`n`r`nThe list beside Select folder offers Slight, Heavy, and Extreme. Select slight, Select heavy, or Select extreme checks only that group and clears the other checks, so Convert is that group. Right-click a row for the same choice.`r`n`r`nTarget is the video rate the new file will use. About is a rough guess of the new size when the current video rate can be read. Estimated savings is the current size minus About, added up for the checked files. It changes as those checks change. A file with no About figure is left out of the total."
+            Body = "Browse, or drop a folder onto the path, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows the bloated files, checked and ready to convert.`r`n`r`nSelect all checks every row. Deselect all clears every check. The folder list names each folder that has bloated files, and a show is listed along with the season folders inside it. Select folder checks only the bloated files in the folder you picked and clears the other checks, so Convert is that smaller job. Right-click a row for the same choices.`r`n`r`nGiB/h is the size of the whole file per hour of runtime. Budget is the line for that picture size. Over is how many times that budget the file uses. 2.0x is twice the line. Slight, shown in green, is under 1.5 times and barely over. Heavy, shown in yellow, is from 1.5 times up to 3 times. Extreme, shown in red, is 3 times the budget or more. Click a heading to sort. The first click on Over puts the worst files first.`r`n`r`nThe list beside Select folder offers Slight, Heavy, and Extreme. Select slight, Select heavy, or Select extreme checks only that group and clears the other checks, so Convert is that group. Right-click a row for the same choice.`r`n`r`nTarget is the video rate the new file will use. About is a rough guess of the new size. When the current picture rate can be read, the guess keeps the audio and other tracks. When that rate is missing, the guess uses the target picture rate for the length of the video, so it can run a little high. Estimated savings is the current size minus About, added up for the checked files. It changes as those checks change. A file with no About figure is left out of the total."
         },
         @{
             Title = 'Converting'
@@ -3490,7 +3490,7 @@ $script:Form.Controls.Add($script:StatusPanel)
 $script:Form.Controls.Add($script:Header)
 
 Set-Tip $script:FolderBox 'The folder Scan will look through. Drop a folder here, or click Browse. The choice is remembered.'
-Set-Tip $script:SavingsLabel 'Current size minus the About column, for the checked files Convert will shrink. It changes as you check and uncheck rows.'
+Set-Tip $script:SavingsLabel 'Current size minus the About column, for the checked files Convert will shrink. A missing picture rate uses the target size alone. It changes as you check and uncheck rows.'
 Set-Tip $script:BrowseButton 'Choose the folder to scan.'
 Set-Tip $script:SubfoldersCheck 'Look inside folders within the chosen folder. Turn this off to scan only the files sitting directly in that folder.'
 Set-Tip $script:AutoCheck 'After a new file checks out, delete the original. Leave this off to compare first and delete with the Delete originals button.'
@@ -3879,7 +3879,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.3') 'Version file was not 1.0.3'
+    Assert-True ((Get-AppVersion) -eq '1.0.4') 'Version file was not 1.0.4'
     Assert-True ($script:VersionLabel.Text -eq (Get-AppVersion)) 'Version label did not show the version'
     Assert-True ($script:VersionLabel.Parent -eq $script:StatusPanel) 'Version is not in the status bar'
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.0') -eq 1) 'A newer version compared as older'
@@ -3888,8 +3888,8 @@ function Invoke-SmokeTest {
     Assert-True ($null -eq (Compare-AppVersion 'not-a-version' '1.0.1')) 'A name was treated as a version'
     Assert-True ((Compare-AppVersion 'v1.2.0' '1.1.9') -eq 1) 'A v prefix was not read'
     $sameOffer = Get-UpdateOffer ([pscustomobject]@{
-        tag_name = 'v1.0.3'
-        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.3/video_dehydrator.exe'; size = 12 })
+        tag_name = 'v1.0.4'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.4/video_dehydrator.exe'; size = 12 })
     })
     Assert-True (-not $sameOffer.Newer) 'The current version was offered as an update'
     $bareOffer = Get-UpdateOffer ([pscustomobject]@{ tag_name = 'v9.9.9'; assets = @() })
