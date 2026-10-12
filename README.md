@@ -1,6 +1,6 @@
 # Video Dehydrator
 
-Version 1.0.5
+Version 1.0.5.1
 
 A Windows program that finds videos that are too big for their picture size, encodes a smaller copy, and puts that copy where the original was.
 
@@ -9,6 +9,10 @@ Double-click **Video Dehydrator** in this folder. If that shortcut does nothing,
 Choose a folder and click Scan. Checked rows are the ones Convert will shrink. Estimated savings uses the New size column. If the picture rate is missing, New size starts with ~ and uses the target rate times the length. Over shows how many times the budget a file uses. Slight, Heavy, and Extreme can be checked as one group. The original is kept in `.vd-originals` until you delete it. Compare plays the new file. Undo puts the last conversion back.
 
 The bottom right corner shows this copy's version. The program checks for updates when it opens. Check for updates looks again. When a newer version is found, a window tells you once. After you close it, it stays closed until a later version is published. The status line keeps saying that version is available. Update downloads that version and opens the setup program. The setup replaces the installed copy and keeps your settings. Donate opens a tip page. The program stays free. Report a bug opens a GitHub page with this version and the Windows version filled in. Include latest activity is optional. Leave it unchecked and nothing else is added.
+
+## What's new in 1.0.5.1
+
+The window, taskbar, Start menu shortcut, desktop shortcut, setup program, and uninstall entry use the Video Dehydrator icon.
 
 ## What's new in 1.0.5
 

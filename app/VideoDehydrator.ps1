@@ -341,7 +341,7 @@ $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.5'
+$script:UpdateFallback = '1.0.5.1'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -423,34 +423,17 @@ function Enable-DoubleBuffer($control) {
     if ($prop) { $prop.SetValue($control, $true, $null) }
 }
 
+function Get-AppIconPath {
+    $path = Join-Path $script:Root 'vd-icon.ico'
+    if (Test-Path -LiteralPath $path) { return $path }
+    return $null
+}
+
 function Get-AppIcon {
     try {
-        if (-not ('VideoDehydrator.ShellIcon' -as [type])) {
-            Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
-using System;
-using System.Drawing;
-using System.Runtime.InteropServices;
-namespace VideoDehydrator {
-  public static class ShellIcon {
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-    public static extern int ExtractIconEx(string file, int index, out IntPtr large, out IntPtr small, int count);
-    [DllImport("user32.dll")]
-    public static extern bool DestroyIcon(IntPtr hIcon);
-    public static Icon Load(string file, int index) {
-      IntPtr large, small;
-      ExtractIconEx(file, index, out large, out small, 1);
-      if (large == IntPtr.Zero) return null;
-      Icon icon = (Icon)Icon.FromHandle(large).Clone();
-      DestroyIcon(large);
-      if (small != IntPtr.Zero) DestroyIcon(small);
-      return icon;
-    }
-  }
-}
-'@
-        }
-        $dll = Join-Path $env:SystemRoot 'System32\imageres.dll'
-        return [VideoDehydrator.ShellIcon]::Load($dll, 189)
+        $path = Get-AppIconPath
+        if (-not $path) { return $null }
+        return New-Object Drawing.Icon $path
     } catch {
         return $null
     }
@@ -677,7 +660,8 @@ function Update-Shortcut {
         $lnk.WorkingDirectory = $script:Root
         $lnk.WindowStyle = 1
         $lnk.Description = 'Shrink videos that are too big for their picture size'
-        $lnk.IconLocation = (Join-Path $env:SystemRoot 'System32\imageres.dll') + ',189'
+        $iconPath = Get-AppIconPath
+        if ($iconPath) { $lnk.IconLocation = $iconPath + ',0' }
         $lnk.Save()
     } catch {
     }
@@ -4618,7 +4602,10 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.5') 'Version file was not 1.0.5'
+    Assert-True ((Get-AppVersion) -eq '1.0.5.1') 'Version file was not 1.0.5.1'
+    Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
+    $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
+    Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
     Assert-True ($script:DonateButton.Text -eq 'Donate') 'Donate was missing'
     Assert-True ($script:ReportBugButton.Text -eq 'Report a bug') 'Report a bug was missing'
     Assert-True ($script:DonateButton.Parent -eq $script:Header) 'Donate is not in the header'
@@ -4626,7 +4613,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.0\.5') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.0\.5\.1') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'
@@ -4696,8 +4683,8 @@ function Invoke-SmokeTest {
     Assert-True ((Compare-AppVersion '1.0.4.1' '1.0.4') -eq 1) 'A fourth version number was ignored'
     Assert-True ((Compare-AppVersion '1.0.4' '1.0.4.0') -eq 0) 'A missing fourth number did not match zero'
     $sameOffer = Get-UpdateOffer ([pscustomobject]@{
-        tag_name = 'v1.0.5'
-        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.5/video_dehydrator.exe'; size = 12 })
+        tag_name = 'v1.0.5.1'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.5.1/video_dehydrator.exe'; size = 12 })
     })
     Assert-True (-not $sameOffer.Newer) 'The current version was offered as an update'
     $bareOffer = Get-UpdateOffer ([pscustomobject]@{ tag_name = 'v9.9.9'; assets = @() })

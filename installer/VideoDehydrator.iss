@@ -3,7 +3,7 @@
 ; Compile with Inno Setup 6:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" VideoDehydrator.iss
 
-#define AppVersion "1.0.5"
+#define AppVersion "1.0.5.1"
 #define Repo ".."
 #define ToolExe "E:\Programming\video_dehydrator\tools"
 
@@ -27,8 +27,9 @@ LZMAUseSeparateProcess=yes
 WizardStyle=modern
 Uninstallable=yes
 UninstallDisplayName=Video Dehydrator
-UninstallDisplayIcon={sys}\imageres.dll
-VersionInfoVersion=1.0.5
+SetupIconFile={#Repo}\vd-icon.ico
+UninstallDisplayIcon={app}\vd-icon.ico
+VersionInfoVersion=1.0.5.1
 VersionInfoProductName=Video Dehydrator
 VersionInfoCompany=Video Dehydrator
 VersionInfoDescription=Installs Video Dehydrator and the tools it needs
@@ -40,6 +41,7 @@ Source: "{#Repo}\app\Engine.ps1"; DestDir: "{app}\app"
 Source: "{#Repo}\app\launch.vbs"; DestDir: "{app}\app"
 Source: "{#Repo}\app\version.txt"; DestDir: "{app}\app"
 Source: "{#Repo}\LICENSE"; DestDir: "{app}"
+Source: "{#Repo}\vd-icon.ico"; DestDir: "{app}"
 Source: "{#Repo}\tools\FFmpeg-LICENSE.txt"; DestDir: "{app}\tools"
 Source: "{#Repo}\tools\HandBrake-LICENSE.txt"; DestDir: "{app}\tools"
 Source: "{#Repo}\tools\SOURCES.txt"; DestDir: "{app}\tools"
@@ -53,8 +55,8 @@ Name: startmenuicon; Description: "Create a Start menu shortcut"; GroupDescripti
 Name: desktopicon; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Icons]
-Name: "{autoprograms}\Video Dehydrator"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; IconFilename: "{sys}\imageres.dll"; IconIndex: 189; Comment: "Shrink videos that are too big for their picture size"; Tasks: startmenuicon
-Name: "{autodesktop}\Video Dehydrator"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; IconFilename: "{sys}\imageres.dll"; IconIndex: 189; Comment: "Shrink videos that are too big for their picture size"; Tasks: desktopicon
+Name: "{autoprograms}\Video Dehydrator"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\vd-icon.ico"; Comment: "Shrink videos that are too big for their picture size"; Tasks: startmenuicon
+Name: "{autodesktop}\Video Dehydrator"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\app\launch.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\vd-icon.ico"; Comment: "Shrink videos that are too big for their picture size"; Tasks: desktopicon
 
 [InstallDelete]
 Type: files; Name: "{autoprograms}\Video Dehydrator.lnk"
