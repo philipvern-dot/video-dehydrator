@@ -1,14 +1,30 @@
 # Video Dehydrator
 
-Version 1.0.4.1
+Version 1.0.5
 
 A Windows program that finds videos that are too big for their picture size, encodes a smaller copy, and puts that copy where the original was.
 
 Double-click **Video Dehydrator** in this folder. If that shortcut does nothing, open `app\launch.vbs` once. That starts the program and repairs the shortcut.
 
-Choose a folder and click Scan. Checked rows are the ones Convert will shrink. Estimated savings uses the About column. If the picture rate is missing, About uses the target rate times the length. Over shows how many times the budget a file uses. Slight, Heavy, and Extreme can be checked as one group. The original is kept in `.vd-originals` until you delete it. Compare plays the new file. Undo puts the last conversion back.
+Choose a folder and click Scan. Checked rows are the ones Convert will shrink. Estimated savings uses the New size column. If the picture rate is missing, New size starts with ~ and uses the target rate times the length. Over shows how many times the budget a file uses. Slight, Heavy, and Extreme can be checked as one group. The original is kept in `.vd-originals` until you delete it. Compare plays the new file. Undo puts the last conversion back.
 
-The bottom right corner shows this copy's version. Check for updates looks for a newer version on GitHub. When one is there, a window tells you. Update downloads that version and opens the setup program. The setup replaces the installed copy and keeps your settings.
+The bottom right corner shows this copy's version. The program checks for updates when it opens. Check for updates looks again. When a newer version is found, a window tells you once. After you close it, it stays closed until a later version is published. The status line keeps saying that version is available. Update downloads that version and opens the setup program. The setup replaces the installed copy and keeps your settings. Donate opens a tip page. The program stays free. Report a bug opens a GitHub page with this version and the Windows version filled in. Include latest activity is optional. Leave it unchecked and nothing else is added.
+
+## What's new in 1.0.5
+
+This is the first published update since 1.0.4.
+
+- Donate and Report a bug are in the header. Donate opens a tip page. The program stays free. A tip of $5 or more can include a feature suggestion. Report a bug opens a GitHub page with this version and the Windows version filled in. Include latest activity is a choice. Leave it unchecked and nothing else is added. Those lines can include folder paths. The program does not send the report. You submit it on the GitHub page.
+- Re-encode audio that cannot be copied is a new option. Some audio, such as Windows Media Audio, cannot be copied into the new file. With the option on, that audio is re-encoded to AAC and the convert can finish. With it off, the convert stops and the original stays. Audio that can be copied is still copied either way.
+- When the new file is not smaller, the row says Skipped and the activity box says why. The larger file is discarded. Later scans leave that file off the list while it stays the same size and the budget is the same or higher. A smaller budget lists it again. Clear skips forgets those marks.
+- Picture is now Dimensions, and About is now New size. A New size that starts with ~ had no picture rate, so that guess uses the target rate times the length. Each budget has a color, and Dimensions uses that same color.
+- Clear removes the scanned files from the list. Files still waiting in .vd-originals stay.
+- The activity box lists each step, and a moving Working mark shows that a job is still running. The running percent stays on the bar.
+- Compare says the sound will not stay in sync with the picture. Open the file on disk to confirm the audio.
+- The program checks for updates when it opens. A window opens the first time a newer version is found. Closing it keeps it from opening again until a later version is published. The status line keeps saying that version is available.
+- The first time Delete originals automatically is turned on, the program explains what you give up. You can choose not to see that warning again.
+- A convert can finish when the only check note is a harmless timing message. Any other problem still leaves the original in place.
+- Setup asks separately for a Start menu shortcut and a desktop shortcut.
 
 ## Tools
 

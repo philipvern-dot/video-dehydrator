@@ -335,12 +335,15 @@ $script:Ffplay = $bundled.Ffplay
 $script:HandBrake = $bundled.HandBrake
 $script:SettingsPath = Join-Path $script:AppDir 'settings.json'
 $script:PendingPath = Join-Path $script:AppDir 'pending.json'
+$script:SkipPath = Join-Path $script:AppDir 'skipped.json'
+$script:SkipRows = @()
 $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.4.1'
+$script:UpdateFallback = '1.0.5'
 $script:UpdateOffer = $null
+$script:UpdatePrompt = ''
 $script:UpdateClosing = $false
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -519,8 +522,33 @@ function Set-Tip($control, [string]$text) {
     $script:Tips.SetToolTip($control, $text)
 }
 
+function Get-UpdateNotice {
+    if ($script:UpdateOffer -and $script:UpdateOffer.Newer -and $script:UpdateOffer.Message) {
+        return [string]$script:UpdateOffer.Message
+    }
+    $prompt = [string]$script:UpdatePrompt
+    if ([string]::IsNullOrWhiteSpace($prompt)) { return '' }
+    $cmp = Compare-AppVersion $prompt (Get-AppVersion)
+    if ($null -eq $cmp -or $cmp -le 0) { return '' }
+    return ('Version ' + $prompt + ' is available.')
+}
+
 function Set-Status([string]$text, [string]$kind) {
     if ($null -eq $script:StatusLabel) { return }
+    if ($kind -ne 'busy') {
+        $notice = Get-UpdateNotice
+        if ($notice) {
+            if ($text -eq 'Ready' -or $text -eq $notice) {
+                $text = $notice
+                if ($kind -eq 'idle') { $kind = 'ok' }
+            }
+            elseif ($text -notmatch [regex]::Escape($notice)) {
+                $trimmed = $text.Trim()
+                if ($trimmed.EndsWith('.')) { $text = $trimmed + ' ' + $notice }
+                else { $text = $trimmed + '. ' + $notice }
+            }
+        }
+    }
     if ($script:StatusLabel.Text -eq $text -and $script:StatusKind -eq $kind) { return }
     $script:StatusKind = $kind
     $script:StatusLabel.Text = $text
@@ -661,9 +689,11 @@ function Load-Settings {
         IncludeSubfolders = $true
         AutoDelete = $false
         AutoWarnAccepted = $false
+        ReencodeAudio = $false
         Detailed = $false
         Budgets = ''
         Shutdown = $false
+        UpdatePrompt = ''
     }
     if (-not (Test-Path -LiteralPath $script:SettingsPath)) { return $defaults }
     try {
@@ -672,9 +702,11 @@ function Load-Settings {
         if ($null -ne $json.includeSubfolders) { $defaults.IncludeSubfolders = [bool]$json.includeSubfolders }
         if ($null -ne $json.autoDelete) { $defaults.AutoDelete = [bool]$json.autoDelete }
         if ($null -ne $json.autoWarnAccepted) { $defaults.AutoWarnAccepted = [bool]$json.autoWarnAccepted }
+        if ($null -ne $json.reencodeAudio) { $defaults.ReencodeAudio = [bool]$json.reencodeAudio }
         if ($null -ne $json.detailed) { $defaults.Detailed = [bool]$json.detailed }
         if ($json.budgets) { $defaults.Budgets = [string]$json.budgets }
         if ($null -ne $json.shutdown) { $defaults.Shutdown = [bool]$json.shutdown }
+        if ($json.updatePrompt) { $defaults.UpdatePrompt = [string]$json.updatePrompt }
     } catch {
     }
     return $defaults
@@ -690,9 +722,11 @@ function Save-Settings {
         includeSubfolders = [bool]$script:SubfoldersCheck.Checked
         autoDelete = [bool]$script:AutoCheck.Checked
         autoWarnAccepted = [bool]$script:AutoWarnAccepted
+        reencodeAudio = [bool]$script:ReencodeCheck.Checked
         detailed = [bool]$script:DetailedCheck.Checked
         budgets = (Get-SelectedBudgetPack)
         shutdown = [bool]$script:ShutdownCheck.Checked
+        updatePrompt = [string]$script:UpdatePrompt
     }
     $json = $obj | ConvertTo-Json
     $utf8 = New-Object System.Text.UTF8Encoding $true
@@ -752,6 +786,54 @@ function Write-Pending {
         return
     }
     [IO.File]::WriteAllText($script:PendingPath, $json, $utf8)
+}
+
+function Read-SkipFile {
+    if (-not (Test-Path -LiteralPath $script:SkipPath)) { return @() }
+    try { return @(Convert-SkipRows ([IO.File]::ReadAllText($script:SkipPath))) } catch { return @() }
+}
+
+function Write-SkipFile {
+    $json = Format-SkipJson $script:SkipRows
+    if (-not $json) {
+        if (Test-Path -LiteralPath $script:SkipPath) { Remove-Item -LiteralPath $script:SkipPath -Force }
+        return
+    }
+    $utf8 = New-Object System.Text.UTF8Encoding $true
+    [IO.File]::WriteAllText($script:SkipPath, $json, $utf8)
+}
+
+function Remember-SizeSkip {
+    param(
+        [string]$Path,
+        [int64]$SizeBytes,
+        [int]$TargetKbps
+    )
+    if (-not $Path -or $SizeBytes -le 0 -or $TargetKbps -le 0) { return }
+    $script:SkipRows = @(Merge-SkipRow -Rows $script:SkipRows -Path $Path -SizeBytes $SizeBytes -TargetKbps $TargetKbps)
+    Write-SkipFile
+    Update-Buttons
+}
+
+function Forget-SizeSkipPath([string]$Path) {
+    if (-not $Path) { return }
+    $before = Format-SkipJson $script:SkipRows
+    $script:SkipRows = @(Remove-SkipRow -Rows $script:SkipRows -Path $Path)
+    if ((Format-SkipJson $script:SkipRows) -ne $before) { Write-SkipFile }
+}
+
+function Clear-RememberedSkips {
+    if ($script:Work -ne 'idle') { return }
+    $count = @($script:SkipRows | Where-Object { $_ }).Count
+    if ($count -lt 1) { return }
+    $word = if ($count -eq 1) { 'file' } else { 'files' }
+    $answer = [Windows.Forms.MessageBox]::Show($script:Form, "Forget $count $word that were skipped because the new copy was larger?`r`n`r`nThe next scan can list them again.", 'Video Dehydrator', 'OKCancel', 'Question')
+    if ($answer -ne [Windows.Forms.DialogResult]::OK) { return }
+    $script:SkipRows = @()
+    Write-SkipFile
+    $word = if ($count -eq 1) { 'file' } else { 'files' }
+    Write-Activity "Forgot $count skipped $word. Scan again to list them." 'text'
+    Update-Buttons
 }
 
 function Add-RunLog {
@@ -1385,7 +1467,7 @@ function Update-Buttons {
     $busy = ($script:Work -ne 'idle')
     $folderOk = $false
     if ($script:FolderBox -and -not [string]::IsNullOrWhiteSpace($script:FolderBox.Text)) { $folderOk = $true }
-    $convertible = @(Get-CheckedItems @('Bloated', 'Failed'))
+    $convertible = @(Get-CheckedItems @('Bloated', 'Failed', 'Skipped'))
     $deletable = @(Get-CheckedItems @('Ready to delete'))
     $compareOk = $false
     if ($script:Files -and $script:Files.SelectedItems.Count -eq 1) {
@@ -1413,11 +1495,15 @@ function Update-Buttons {
     if ($script:OverBandCounts -and $script:OverBandCounts.ContainsKey($overId)) { $overCount = [int]$script:OverBandCounts[$overId] }
     if ($script:OverPick) { $script:OverPick.Enabled = -not $busy }
     if ($script:SelectOverButton) { $script:SelectOverButton.Enabled = ((-not $busy) -and $overCount -gt 0) }
-    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
+    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
         if ($chk) { $chk.Enabled = -not $busy }
     }
     foreach ($box in @($script:BudgetBoxes)) {
         if ($box) { $box.Enabled = -not $busy }
+    }
+    if ($script:ClearSkipsButton) {
+        $skipCount = @($script:SkipRows | Where-Object { $_ }).Count
+        $script:ClearSkipsButton.Enabled = ((-not $busy) -and $skipCount -gt 0)
     }
     Update-UpdateButtons
     Update-Savings
@@ -1431,7 +1517,7 @@ function Update-Savings {
     foreach ($item in @($script:Files.Items)) {
         if (-not $item.Checked) { continue }
         $status = [string]$item.Tag.Status
-        if ($status -ne 'Bloated' -and $status -ne 'Failed') { continue }
+        if ($status -ne 'Bloated' -and $status -ne 'Failed' -and $status -ne 'Skipped') { continue }
         $files++
         $size = [int64]0
         if ($item.Tag.SizeBytes) { $size = [int64]$item.Tag.SizeBytes }
@@ -1828,11 +1914,11 @@ function Start-Scan {
     $script:ScanRunspace = $rs
     $script:ScanPower = $ps
     $null = $ps.AddScript({
-        param($EnginePath, $Root, $Recurse, $Ffprobe, $Queue, $Cancel, $Budgets)
+        param($EnginePath, $Root, $Recurse, $Ffprobe, $Queue, $Cancel, $Budgets, $SkipJson)
         . $EnginePath
         Set-BudgetPicks $Budgets
-        Invoke-ScanFolder -Root $Root -Recurse $Recurse -Ffprobe $Ffprobe -Queue $Queue -Cancel $Cancel
-    }).AddArgument($script:EnginePath).AddArgument($folder).AddArgument([bool]$script:SubfoldersCheck.Checked).AddArgument($script:Ffprobe).AddArgument($script:ScanQueue).AddArgument($script:ScanCancel).AddArgument((Get-SelectedBudgetPack))
+        Invoke-ScanFolder -Root $Root -Recurse $Recurse -Ffprobe $Ffprobe -Queue $Queue -Cancel $Cancel -Skips @(Convert-SkipRows $SkipJson)
+    }).AddArgument($script:EnginePath).AddArgument($folder).AddArgument([bool]$script:SubfoldersCheck.Checked).AddArgument($script:Ffprobe).AddArgument($script:ScanQueue).AddArgument($script:ScanCancel).AddArgument((Get-SelectedBudgetPack)).AddArgument((Format-SkipJson $script:SkipRows))
     $script:ScanHandle = $ps.BeginInvoke()
 }
 
@@ -1899,6 +1985,7 @@ function Finish-Scan {
     $dv = 0
     $nodur = 0
     $errors = 0
+    $ignored = 0
     if ($summary) {
         $hits = [int]$summary.Hits
         $seen = [int]$summary.Seen
@@ -1907,6 +1994,7 @@ function Finish-Scan {
         $dv = [int]$summary.Dv
         $nodur = [int]$summary.NoDur
         $errors = [int]$summary.Errors
+        $ignored = [int]$summary.Ignored
     }
     $bytes = [int64]0
     foreach ($item in @($script:Files.Items)) {
@@ -1923,9 +2011,11 @@ function Finish-Scan {
     if ($dv -gt 0) { $extra += "$dv Dolby Vision left alone" }
     if ($nodur -gt 0) { $extra += "$nodur could not be measured" }
     if ($errors -gt 0) { $extra += "$errors could not be read" }
+    if ($ignored -eq 1) { $extra += '1 file left off the list because an earlier convert was not smaller. A smaller budget lists it again. Clear skips forgets that mark' }
+    elseif ($ignored -gt 1) { $extra += "$ignored files left off the list because an earlier convert was not smaller. A smaller budget lists them again. Clear skips forgets those marks" }
     if ($extra.Count -gt 0) { Write-Activity ($extra -join '. ') 'dim' }
     if ($summary -and $summary.Samples) { Write-Activity ([string]$summary.Samples) 'warn' }
-    if ($hits -eq 0 -and $seen -gt 0) { Write-Activity 'Nothing in this folder is over the budget for its picture size.' 'text' }
+    if ($hits -eq 0 -and $seen -gt 0 -and $ignored -eq 0) { Write-Activity 'Nothing in this folder is over the budget for its picture size.' 'text' }
     Update-Buttons
 }
 
@@ -1936,7 +2026,10 @@ function Start-EncodeProcess {
     $tag.Reason = ''
     Update-ResultRow $Item
     $encoder = Get-EncoderName -Probe $Probe
-    $arguments = Get-HandBrakeArguments -Source $Plan.Source -Temp $Plan.Temp -Probe $Probe -VideoKbps $Decision.TargetKbps -Encoder $encoder
+    $reencode = $false
+    if ($script:ReencodeCheck) { $reencode = [bool]$script:ReencodeCheck.Checked }
+    $script:ActiveReencodeAudio = $reencode
+    $arguments = Get-HandBrakeArguments -Source $Plan.Source -Temp $Plan.Temp -Probe $Probe -VideoKbps $Decision.TargetKbps -Encoder $encoder -ReencodeAudio:$reencode
     $script:HbLines = New-Object System.Collections.Generic.List[string]
     $script:ActiveItem = $Item
     $script:ActivePlan = $Plan
@@ -2014,21 +2107,65 @@ function Start-NextEncode {
 }
 
 function Fail-Active {
-    param([string]$Reason)
+    param(
+        [string]$Reason,
+        $Verify
+    )
     Stop-ActivityPulse
     $item = $script:ActiveItem
     $plan = $script:ActivePlan
+    $newBytes = [int64]0
+    $sourceBytes = [int64]0
+    $targetKbps = 0
+    $sourceCodecs = @()
+    $outputCodecs = @()
+    if ($Verify -and $null -ne $Verify.NewBytes) { $newBytes = [int64]$Verify.NewBytes }
+    elseif ($plan -and $plan.Temp -and (Test-Path -LiteralPath $plan.Temp)) {
+        $newBytes = [int64](Get-Item -LiteralPath $plan.Temp).Length
+    }
+    if ($script:ActiveProbe) {
+        $sourceBytes = [int64]$script:ActiveProbe.SizeBytes
+        if ($null -ne $script:ActiveProbe.AudioCodecs) { $sourceCodecs = @($script:ActiveProbe.AudioCodecs) }
+    }
+    if ($Verify -and $Verify.OutProbe -and $null -ne $Verify.OutProbe.AudioCodecs) {
+        $outputCodecs = @($Verify.OutProbe.AudioCodecs)
+    }
+    if ($script:ActiveDecision -and $script:ActiveDecision.TargetKbps) { $targetKbps = [int]$script:ActiveDecision.TargetKbps }
+    $note = Get-LargerFileNote -Reason $Reason -SourceBytes $sourceBytes -NewBytes $newBytes -TargetKbps $targetKbps -SourceCodecs $sourceCodecs -OutputCodecs $outputCodecs
+    $sizeSkip = (Test-SizeSkipReason $Reason) -and [bool]$note
+    if ($sizeSkip) {
+        $note = $note + ' Later scans leave this file off the list. A smaller budget lists it again. Clear skips forgets that mark.'
+        $skipPath = ''
+        if ($plan) { $skipPath = [string]$plan.Source }
+        if ($skipPath -and $sourceBytes -gt 0 -and $targetKbps -gt 0) {
+            Remember-SizeSkip -Path $skipPath -SizeBytes $sourceBytes -TargetKbps $targetKbps
+        }
+    }
     if ($plan) { Remove-TempQuiet $plan.Temp }
     if ($item) {
-        $item.Tag.Status = 'Failed'
-        $item.Tag.Reason = $Reason
-        $item.Checked = $true
+        if ($sizeSkip) {
+            $item.Tag.Status = 'Skipped'
+            $item.Tag.Reason = $note
+            $item.Checked = $false
+        }
+        else {
+            $item.Tag.Status = 'Failed'
+            $item.Tag.Reason = $Reason
+            $item.Checked = $true
+        }
         Update-ResultRow $item
     }
     $name = ''
     if ($plan) { $name = [IO.Path]::GetFileName($plan.Source) }
-    Write-Activity ("Failed  $name  $Reason") 'err'
-    Add-RunLog -Status 'FAIL' -Reason $Reason -Source $(if ($plan) { $plan.Source } else { '' }) -NewPath '' -Kept '' -Width $(if ($script:ActiveProbe) { $script:ActiveProbe.Width } else { '' }) -Height $(if ($script:ActiveProbe) { $script:ActiveProbe.Height } else { '' }) -Kbps $(if ($script:ActiveDecision) { $script:ActiveDecision.TargetKbps } else { '' })
+    if ($sizeSkip) {
+        Write-Activity ("Skipped  $name  $note") 'warn'
+        Add-RunLog -Status 'SKIP' -Reason $note -Source $(if ($plan) { $plan.Source } else { '' }) -NewPath '' -Kept '' -Width $(if ($script:ActiveProbe) { $script:ActiveProbe.Width } else { '' }) -Height $(if ($script:ActiveProbe) { $script:ActiveProbe.Height } else { '' }) -Kbps $(if ($script:ActiveDecision) { $script:ActiveDecision.TargetKbps } else { '' })
+    }
+    else {
+        Write-Activity ("Failed  $name  $Reason") 'err'
+        if ($note) { Write-Activity $note 'warn' }
+        Add-RunLog -Status 'FAIL' -Reason $Reason -Source $(if ($plan) { $plan.Source } else { '' }) -NewPath '' -Kept '' -Width $(if ($script:ActiveProbe) { $script:ActiveProbe.Width } else { '' }) -Height $(if ($script:ActiveProbe) { $script:ActiveProbe.Height } else { '' }) -Kbps $(if ($script:ActiveDecision) { $script:ActiveDecision.TargetKbps } else { '' })
+    }
     $script:ActiveItem = $null
 }
 
@@ -2060,9 +2197,9 @@ function Complete-ActiveEncode {
     }
     Set-Status 'Checking the new file' 'busy'
     $script:Form.Refresh()
-    $verify = Test-EncodedFile -Ffmpeg $script:Ffmpeg -Ffprobe $script:Ffprobe -Temp $plan.Temp -SourceProbe $script:ActiveProbe -HandBrakeLog $log
+    $verify = Test-EncodedFile -Ffmpeg $script:Ffmpeg -Ffprobe $script:Ffprobe -Temp $plan.Temp -SourceProbe $script:ActiveProbe -HandBrakeLog $log -AllowAudioReencode:([bool]$script:ActiveReencodeAudio)
     if (-not $verify.Ok) {
-        Fail-Active $verify.Reason
+        Fail-Active -Reason $verify.Reason -Verify $verify
         Start-NextEncode
         return
     }
@@ -2113,6 +2250,7 @@ function Complete-ActiveEncode {
         Write-Activity ("Ready  $name  saved " + (Format-ByteSize $saved) + ". Original kept for review.") 'ok'
     }
     Update-ResultRow $item
+    if ($plan.Source) { Forget-SizeSkipPath ([string]$plan.Source) }
     Add-RunLog -Status $(if ($swap.Deleted) { 'REPLACED' } else { 'KEPT' }) -Reason 'ok' -Source $plan.Source -NewPath $swap.NewPath -Kept $swap.KeptPath -OldBytes $swap.OldBytes -NewBytes $swap.NewBytes -OldRate $verify.OldGiBph -NewRate $verify.NewGiBph -Width $script:ActiveProbe.Width -Height $script:ActiveProbe.Height -Kbps $script:ActiveDecision.TargetKbps
     $script:ActiveItem = $null
     Start-NextEncode
@@ -2390,7 +2528,7 @@ function Update-AutoChoice {
 
 function Start-Convert {
     if ($script:Work -ne 'idle') { return }
-    $items = @(Get-CheckedItems @('Bloated', 'Failed'))
+    $items = @(Get-CheckedItems @('Bloated', 'Failed', 'Skipped'))
     if ($items.Count -eq 0) { return }
     if ($script:AutoCheck.Checked -and (Test-AutoWarnNeeded)) {
         if ((Show-AutoWarn) -ne 'on') {
@@ -2416,6 +2554,9 @@ function Start-Convert {
     Enable-KeepAwake
     $word = if ($items.Count -eq 1) { 'file' } else { 'files' }
     Write-Activity ("Converting $($items.Count) $word.") 'text'
+    if ($script:ReencodeCheck.Checked) {
+        Write-Activity 'Audio that cannot be copied will be re-encoded to AAC. Other audio is still copied.' 'text'
+    }
     if ($script:ShutdownCheck.Checked) {
         Write-Activity 'The computer will shut down when this convert finishes.' 'text'
     }
@@ -2628,6 +2769,138 @@ function Compare-AppVersion([string]$left, [string]$right) {
     return 0
 }
 
+function Get-WindowsLabel {
+    $build = 0
+    try {
+        $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+        [void][int]::TryParse([string]$cv.CurrentBuild, [ref]$build)
+    } catch { }
+    $name = 'Windows'
+    if ($build -ge 22000) { $name = 'Windows 11' }
+    elseif ($build -ge 10240) { $name = 'Windows 10' }
+    if ($build -gt 0) { return "$name (build $build)" }
+    return $name
+}
+
+function Get-LatestActivityText {
+    param([int]$MaxEncoded = 4500)
+    if ($null -eq $script:Log) { return '' }
+    $raw = [string]$script:Log.Text
+    if ([string]::IsNullOrWhiteSpace($raw)) { return '' }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($raw -split '\r?\n')) {
+        if ($line -ne '') { [void]$lines.Add($line) }
+    }
+    if ($lines.Count -eq 0) { return '' }
+    $last = [string]$lines[$lines.Count - 1]
+    if ($last -match '^Working  [|/\-\\]$') { $lines.RemoveAt($lines.Count - 1) }
+    if ($lines.Count -eq 0) { return '' }
+    $kept = New-Object System.Collections.Generic.List[string]
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $candidate = New-Object System.Collections.Generic.List[string]
+        [void]$candidate.Add([string]$lines[$i])
+        foreach ($older in $kept) { [void]$candidate.Add([string]$older) }
+        $text = [string]::Join("`n", $candidate.ToArray())
+        if (([uri]::EscapeDataString($text)).Length -le $MaxEncoded) {
+            $kept.Insert(0, [string]$lines[$i])
+            continue
+        }
+        if ($kept.Count -eq 0) {
+            $line = [string]$lines[$i]
+            $low = 0
+            $high = $line.Length
+            while ($low -lt $high) {
+                $mid = [int](($low + $high + 1) / 2)
+                $slice = $line.Substring($line.Length - $mid)
+                if (([uri]::EscapeDataString($slice)).Length -le $MaxEncoded) { $low = $mid } else { $high = $mid - 1 }
+            }
+            if ($low -gt 0) { return $line.Substring($line.Length - $low) }
+        }
+        break
+    }
+    if ($kept.Count -eq 0) { return '' }
+    return [string]::Join("`n", $kept.ToArray())
+}
+
+function Get-BugReportUrl {
+    param([string]$Activity = '')
+    $version = [uri]::EscapeDataString((Get-AppVersion))
+    $windows = [uri]::EscapeDataString((Get-WindowsLabel))
+    $url = "https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&version=$version&windows=$windows"
+    if (-not [string]::IsNullOrWhiteSpace($Activity)) {
+        $url = $url + '&activity=' + [uri]::EscapeDataString($Activity)
+    }
+    return $url
+}
+
+function New-BugReportForm {
+    $form = New-Object Windows.Forms.Form
+    $form.Text = 'Video Dehydrator'
+    $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.StartPosition = 'CenterParent'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $false
+    $form.KeyPreview = $true
+    $form.ClientSize = New-Object Drawing.Size(520, 262)
+    $form.Font = $script:FontUi
+    $form.BackColor = [Drawing.Color]::White
+    $icon = Get-AppIcon
+    if ($icon) { $form.Icon = $icon }
+    $label = New-Object Windows.Forms.Label
+    $label.Font = $script:FontUi
+    $label.ForeColor = $script:ColorInk
+    $label.BackColor = [Drawing.Color]::White
+    $label.SetBounds(24, 16, 472, 128)
+    $label.Text = "Report a bug opens a GitHub page. This version and the Windows version are filled in. Nothing else is added unless you check the box.`r`n`r`nInclude latest activity adds the latest lines from the activity box to that page. Those lines can include folder paths. This program does not send the report. You submit it on the GitHub page."
+    $include = New-Check 'Include latest activity'
+    $include.Checked = $false
+    $include.Enabled = -not [string]::IsNullOrWhiteSpace((Get-LatestActivityText))
+    $include.SetBounds(24, 156, 280, 24)
+    $open = New-Button 'Open report' 'primary' 140 34
+    $cancel = New-Button 'Cancel' 'secondary' 110 34
+    $open.SetBounds(238, 204, 140, 34)
+    $cancel.SetBounds(386, 204, 110, 34)
+    $form.Controls.Add($label)
+    $form.Controls.Add($include)
+    $form.Controls.Add($open)
+    $form.Controls.Add($cancel)
+    $state = [pscustomobject]@{ Open = $false; Include = $false }
+    $form.Tag = $state
+    $open.DialogResult = [Windows.Forms.DialogResult]::OK
+    $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $form.AcceptButton = $open
+    $form.CancelButton = $cancel
+    $open.Add_Click({
+        $state.Open = $true
+        $state.Include = [bool]$include.Checked
+    }.GetNewClosure())
+    $cancel.Add_Click({
+        $state.Open = $false
+        $state.Include = $false
+    }.GetNewClosure())
+    return $form
+}
+
+function Show-BugReport {
+    $form = New-BugReportForm
+    $state = $form.Tag
+    try { [void]$form.ShowDialog($script:Form) }
+    finally { $form.Dispose() }
+    if (-not $state.Open) { return }
+    $activity = ''
+    if ($state.Include) { $activity = Get-LatestActivityText }
+    Open-HttpLink (Get-BugReportUrl $activity)
+}
+
+function Open-HttpLink([string]$Url) {
+    $allowed = $false
+    if ($Url -eq 'https://ko-fi.com/philipvern') { $allowed = $true }
+    elseif ($Url.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?')) { $allowed = $true }
+    if (-not $allowed) { return }
+    Start-Process $Url
+}
+
 function Get-AppVersion {
     $path = Join-Path $script:AppDir 'version.txt'
     if (Test-Path -LiteralPath $path) {
@@ -2710,11 +2983,28 @@ function Apply-UpdateOffer($offer) {
     Write-Activity $offer.Message $kind
 }
 
+function Test-UpdatePromptDue($offer) {
+    if ($null -eq $offer -or -not $offer.Newer) { return $false }
+    $seen = [string]$script:UpdatePrompt
+    if ([string]::IsNullOrWhiteSpace($seen)) { return $true }
+    $cmp = Compare-AppVersion ([string]$offer.Version) $seen
+    if ($null -eq $cmp) { return $true }
+    return ($cmp -gt 0)
+}
+
+function Remember-UpdatePrompt([string]$Version) {
+    if ([string]::IsNullOrWhiteSpace($Version)) { return }
+    if ([string]$script:UpdatePrompt -eq $Version) { return }
+    $script:UpdatePrompt = $Version
+    Save-Settings
+}
+
 function Show-UpdateReady($offer) {
     if ($script:SmokeTest) { return }
-    if ($null -eq $offer -or -not $offer.Newer) { return }
+    if (-not (Test-UpdatePromptDue $offer)) { return }
     $text = 'Version ' + $offer.Version + ' is available. Click Update to install it.'
     [Windows.Forms.MessageBox]::Show($script:Form, $text, $script:UpdateProduct, 'OK', 'Information') | Out-Null
+    Remember-UpdatePrompt ([string]$offer.Version)
 }
 
 function Start-UpdateCheck {
@@ -2722,6 +3012,7 @@ function Start-UpdateCheck {
         [Windows.Forms.MessageBox]::Show($script:Form, 'Finish or cancel the current job before checking for updates.', $script:UpdateProduct, 'OK', 'Information') | Out-Null
         return
     }
+    $previous = $script:UpdateOffer
     $script:UpdateOffer = $null
     Update-UpdateButtons
     Set-Status 'Checking for updates...' 'busy'
@@ -2734,14 +3025,20 @@ function Start-UpdateCheck {
         Apply-UpdateOffer (Get-UpdateOffer $release)
         Show-UpdateReady $script:UpdateOffer
     } catch {
-        $script:UpdateOffer = $null
-        Update-UpdateButtons
         $status = 0
         try { $status = [int]$_.Exception.Response.StatusCode } catch { }
         if ($status -eq 404) { $message = 'No published update was found.' }
         else { $message = 'Could not reach GitHub to check for updates.' }
-        Set-Status $message 'err'
         Write-Activity $message 'err'
+        if ($previous -and $previous.Newer) {
+            $script:UpdateOffer = $previous
+            Update-UpdateButtons
+            Set-Status ([string]$previous.Message) 'ok'
+        } else {
+            $script:UpdateOffer = $null
+            Update-UpdateButtons
+            Set-Status $message 'err'
+        }
     } finally {
         $script:Form.Cursor = [Windows.Forms.Cursors]::Default
     }
@@ -2907,7 +3204,7 @@ function Update-RowsForBudgets {
     foreach ($item in @($script:Files.Items)) {
         if (-not $item -or -not $item.Tag) { continue }
         $status = [string]$item.Tag.Status
-        if ($status -ne 'Bloated' -and $status -ne 'Failed') { continue }
+        if ($status -ne 'Bloated' -and $status -ne 'Failed' -and $status -ne 'Skipped') { continue }
         $width = 0
         $height = 0
         [void][int]::TryParse([string]$item.Tag.Width, [ref]$width)
@@ -3009,7 +3306,7 @@ function Layout-Options {
     if ($null -eq $card -or $card.ClientSize.Width -lt 20) { return }
     $script:OptionsTitle.SetBounds(16, 8, 200, 22)
     $y = 36
-    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
+    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
         if (-not $chk) { continue }
         $chk.Location = New-Object Drawing.Point(16, $y)
         $y += 28
@@ -3035,6 +3332,9 @@ function Layout-Options {
         $boxW = $col - 84 - 14
         if ($boxW -lt 120) { $boxW = 120 }
         $box.SetBounds(($x + 88), $rowY, $boxW, 28)
+    }
+    if ($script:ClearSkipsButton) {
+        $script:ClearSkipsButton.Location = New-Object Drawing.Point(16, $y)
     }
 }
 
@@ -3104,7 +3404,13 @@ function Update-ChromeLayout {
             $right = $header.ClientSize.Width - 24
             $script:UpdateButton.Location = New-Object Drawing.Point(($right - $script:UpdateButton.Width), 18)
             $script:CheckUpdateButton.Location = New-Object Drawing.Point(($script:UpdateButton.Left - 8 - $script:CheckUpdateButton.Width), 18)
-            $reserve = $header.ClientSize.Width - $script:CheckUpdateButton.Left + 16
+            $leftEdge = $script:CheckUpdateButton.Left
+            if ($script:ReportBugButton -and $script:DonateButton) {
+                $script:ReportBugButton.Location = New-Object Drawing.Point(($right - $script:ReportBugButton.Width), 60)
+                $script:DonateButton.Location = New-Object Drawing.Point(($script:ReportBugButton.Left - 8 - $script:DonateButton.Width), 60)
+                if ($script:DonateButton.Left -lt $leftEdge) { $leftEdge = $script:DonateButton.Left }
+            }
+            $reserve = $header.ClientSize.Width - $leftEdge + 16
         }
         $textWidth = [Math]::Max(160, ($header.ClientSize.Width - 28 - $reserve))
         $script:TitleLabel.SetBounds(28, 16, $textWidth, 36)
@@ -3144,7 +3450,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'The size rule'
-            Body = "A 1920x1080 video is too big when the whole file is 2 GiB per hour or more. HEVC and AV1 are left alone under 3 GiB per hour. The target for that 1080p picture is 3000 kbps of video. This is the same rule the media library uses.`r`n`r`nOther picture sizes multiply those numbers by how many pixels they have compared with 1920x1080. 3840x2160 has four times the pixels, so 4K is allowed 8 GiB per hour and is encoded at 12000 kbps. 1280x720 is encoded at 1333 kbps. 720x480 is encoded at 500 kbps. A very small picture stays at 200 kbps.`r`n`r`nThe Budgets row has a choice for 2160p, 1080p, 720p, and 480p. Each choice has its own color, and Dimensions on a file uses that same color when the file follows that choice. 2160p is blue, 1080p is teal, 720p is purple, and 480p is orange. Each one starts on Recommended, which is the line above. Half, 1.5 times, and Double lower or raise that line, and the encode rate moves with it. A picture of some other size uses the closest of those four, then scales by its number of pixels. HEVC and AV1 stay at one and a half times the budget you picked. The choices are remembered.`r`n`r`nScan again after a change. A higher budget takes files that are no longer over the line off the list. A lower budget finds new files on the next scan.`r`n`r`nThe encode is software x265, two passes, medium speed. The frame rate stays as it was. The picture is not cropped or scaled. Audio is copied. Subtitles are copied and are not burned into the picture.`r`n`r`nA file whose picture is already at that target rate is left alone, even when the file is large because of the audio. Dolby Vision is left alone."
+            Body = "A 1920x1080 video is too big when the whole file is 2 GiB per hour or more. HEVC and AV1 are left alone under 3 GiB per hour. The target for that 1080p picture is 3000 kbps of video. This is the same rule the media library uses.`r`n`r`nOther picture sizes multiply those numbers by how many pixels they have compared with 1920x1080. 3840x2160 has four times the pixels, so 4K is allowed 8 GiB per hour and is encoded at 12000 kbps. 1280x720 is encoded at 1333 kbps. 720x480 is encoded at 500 kbps. A very small picture stays at 200 kbps.`r`n`r`nThe Budgets row has a choice for 2160p, 1080p, 720p, and 480p. Each choice has its own color, and Dimensions on a file uses that same color when the file follows that choice. 2160p is blue, 1080p is teal, 720p is purple, and 480p is orange. Each one starts on Recommended, which is the line above. Half, 1.5 times, and Double lower or raise that line, and the encode rate moves with it. A picture of some other size uses the closest of those four, then scales by its number of pixels. HEVC and AV1 stay at one and a half times the budget you picked. The choices are remembered.`r`n`r`nScan again after a change. A higher budget takes files that are no longer over the line off the list. A lower budget finds new files on the next scan.`r`n`r`nThe encode is software x265, two passes, medium speed. The frame rate stays as it was. The picture is not cropped or scaled. Audio that can be copied is copied. Re-encode audio that cannot be copied turns the other kinds, such as Windows Media Audio, into AAC. With that box off, a file whose audio cannot be copied is left as it was. Subtitles are copied and are not burned into the picture.`r`n`r`nA file whose picture is already at that target rate is left alone, even when the file is large because of the audio. Dolby Vision is left alone."
         },
         @{
             Title = 'Scanning'
@@ -3152,7 +3458,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Converting'
-            Body = "Convert shrinks every checked file whose status is Bloated or Failed. One file is encoded at a time. The bar is that file. Cancel stops the file that is running. Files that already finished stay finished.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
+            Body = "Convert shrinks every checked file whose status is Bloated or Failed. One file is encoded at a time. The bar is that file. Cancel stops the file that is running. Files that already finished stay finished.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
         },
         @{
             Title = 'Checking the picture'
@@ -3168,7 +3474,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Updates'
-            Body = "The bottom right corner shows this copy's version.`r`n`r`nThe program checks for updates when it opens. Check for updates looks again. When one is there, a window tells you, and the message stays on the status line. Update downloads it and opens the setup program. The setup replaces the installed copy and keeps your settings. The setup asks whether to create a Start menu shortcut and whether to create a desktop shortcut.`r`n`r`nFinish or cancel the current job before you update. The program closes while the setup runs, then you can open it again."
+            Body = "The bottom right corner shows this copy's version.`r`n`r`nThe program checks for updates when it opens. Check for updates looks again. When a newer version is found, a window tells you once. Closing that window keeps it from opening again until a later version is published. The status line keeps saying that version is available. Update downloads it and opens the setup program. The setup replaces the installed copy and keeps your settings. The setup asks whether to create a Start menu shortcut and whether to create a desktop shortcut.`r`n`r`nFinish or cancel the current job before you update. The program closes while the setup runs, then you can open it again.`r`n`r`nDonate opens a tip page. The program stays free. A tip of `$5` or more can include a feature suggestion on that page. Report a bug opens a GitHub page with this version and the Windows version filled in. Include latest activity is a choice on that step. Leave it unchecked and nothing else is added. The latest lines from the activity box can include folder paths. This program does not send the report. You submit it on the GitHub page."
         },
         @{
             Title = 'What is in this folder'
@@ -3326,6 +3632,7 @@ $script:Tips.ShowAlways = $true
 
 $settings = Load-Settings
 $script:AutoWarnAccepted = [bool]$settings.AutoWarnAccepted
+$script:UpdatePrompt = [string]$settings.UpdatePrompt
 $script:AutoWarnShown = $false
 $script:AutoWarnBusy = $false
 Set-BudgetPicks ([string]$settings.Budgets)
@@ -3367,10 +3674,14 @@ $script:SubtitleLabel.BackColor = $script:ColorHeader
 $script:CheckUpdateButton = New-Button 'Check for updates' 'secondary' 168 34
 $script:UpdateButton = New-Button 'Update' 'primary' 100 34
 $script:UpdateButton.Enabled = $false
+$script:DonateButton = New-Button 'Donate' 'secondary' 96 28
+$script:ReportBugButton = New-Button 'Report a bug' 'secondary' 132 28
 $script:Header.Controls.Add($script:TitleLabel)
 $script:Header.Controls.Add($script:SubtitleLabel)
 $script:Header.Controls.Add($script:CheckUpdateButton)
 $script:Header.Controls.Add($script:UpdateButton)
+$script:Header.Controls.Add($script:DonateButton)
+$script:Header.Controls.Add($script:ReportBugButton)
 
 $script:StatusPanel = New-Object Windows.Forms.Panel
 $script:StatusPanel.Dock = 'Bottom'
@@ -3420,7 +3731,7 @@ $table.GrowStyle = 'FixedSize'
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 40)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 36)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Percent, 58)))
-[void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 196)))
+[void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 252)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 56)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 26)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Percent, 42)))
@@ -3629,17 +3940,25 @@ $script:OptionsTitle.BackColor = [Drawing.Color]::White
 $script:SubfoldersCheck = New-Check 'Include subfolders'
 $script:AutoCheck = New-Check 'Delete originals automatically'
 $script:AutoCheck.AutoCheck = $false
+$script:ReencodeCheck = New-Check 'Re-encode audio that cannot be copied'
 $script:DetailedCheck = New-Check 'Show detailed activity'
 $script:ShutdownCheck = New-Check 'Shutdown computer upon completion'
 $script:SubfoldersCheck.Checked = [bool]$settings.IncludeSubfolders
 $script:AutoCheck.Checked = [bool]$settings.AutoDelete
+$script:ReencodeCheck.Checked = [bool]$settings.ReencodeAudio
 $script:DetailedCheck.Checked = [bool]$settings.Detailed
 $script:ShutdownCheck.Checked = [bool]$settings.Shutdown
 $script:OptionsCard.Controls.Add($script:OptionsTitle)
 $script:OptionsCard.Controls.Add($script:SubfoldersCheck)
 $script:OptionsCard.Controls.Add($script:AutoCheck)
+$script:OptionsCard.Controls.Add($script:ReencodeCheck)
 $script:OptionsCard.Controls.Add($script:DetailedCheck)
 $script:OptionsCard.Controls.Add($script:ShutdownCheck)
+$script:ClearSkipsButton = New-Button 'Clear skips' 'secondary' 120 28
+$script:ClearSkipsButton.Margin = New-Object Windows.Forms.Padding(0)
+$script:ClearSkipsButton.Enabled = $false
+$script:OptionsCard.Controls.Add($script:ClearSkipsButton)
+$script:ClearSkipsButton.Add_Click({ Clear-RememberedSkips })
 $script:BudgetTitle = New-Object Windows.Forms.Label
 $script:BudgetTitle.Text = 'Budgets'
 $script:BudgetTitle.Font = $script:FontSection
@@ -3695,7 +4014,7 @@ $script:OptionsCard.Add_Paint({
     $_.Graphics.DrawRectangle($pen, 0, 0, ($script:OptionsCard.Width - 1), ($script:OptionsCard.Height - 1))
     $pen.Dispose()
 })
-foreach ($chk in @($script:SubfoldersCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
+foreach ($chk in @($script:SubfoldersCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
     $chk.Add_CheckedChanged({ if (-not $script:Loading) { Save-Settings } })
 }
 $script:AutoCheck.Add_Click({
@@ -3731,6 +4050,8 @@ $script:UndoButton.Add_Click({ Start-UndoLast })
 $script:DeleteButton.Add_Click({ Remove-CheckedOriginals })
 $script:HelpButton.Add_Click({ Show-Help })
 $script:CheckUpdateButton.Add_Click({ Start-UpdateCheck })
+$script:DonateButton.Add_Click({ Open-HttpLink 'https://ko-fi.com/philipvern' })
+$script:ReportBugButton.Add_Click({ Show-BugReport })
 $script:UpdateButton.Add_Click({ Start-UpdateInstall })
 
 $activityLabel = New-Object Windows.Forms.Label
@@ -3783,18 +4104,22 @@ Set-Tip $script:SavingsLabel 'Current size minus the New size column, for the ch
 Set-Tip $script:BrowseButton 'Choose the folder to scan.'
 Set-Tip $script:SubfoldersCheck 'Look inside folders within the chosen folder. Turn this off to scan only the files sitting directly in that folder.'
 Set-Tip $script:AutoCheck 'After a new file checks out, delete the original. The first time, the program explains what you give up. Leave this off to compare first and delete with the Delete originals button.'
+Set-Tip $script:ReencodeCheck 'Some audio, such as Windows Media Audio, cannot be copied into the new file. With this on, that audio is re-encoded to AAC and the convert can finish. With this off, the convert stops and the original stays. Audio that can be copied is still copied either way.'
 Set-Tip $script:DetailedCheck 'List each encode step in the activity box. The running percent stays on the bar, not as a new line.'
 Set-Tip $script:ShutdownCheck 'After Convert finishes, turn the computer off. A one-minute countdown lets you cancel. The computer stays on if you stop the convert. A scan does not turn it off.'
+Set-Tip $script:ClearSkipsButton 'Forget files that were left off later scans because the new copy was larger. Scan again after this to list them. A smaller budget lists them again without clearing.'
 Set-Tip $script:BudgetTitle 'The size line for each picture. Recommended is where the program starts. Scan again after you change one.'
 Update-BudgetTips
 Set-Tip $script:ScanButton 'Read the videos in the folder and list the ones that are too big for their picture size.'
-Set-Tip $script:ConvertButton 'Shrink every checked video that is bloated or failed earlier. The new file takes the original place.'
+Set-Tip $script:ConvertButton 'Shrink every checked video that is bloated, failed, or skipped earlier. The new file takes the original place. A file marked Skipped was left alone because the new copy was not smaller.'
 Set-Tip $script:CancelButton 'Stop the scan or the file that is converting. Esc does this too.'
 Set-Tip $script:CompareButton 'Play the original and the new file side by side. The sound will not stay in sync with the picture. Go to the file on disk to confirm the audio.'
 Set-Tip $script:UndoButton 'Put the originals from the last conversion back, and delete the new files. The program asks first.'
 Set-Tip $script:DeleteButton 'Delete the checked originals that are waiting in .vd-originals. The new files stay.'
 Set-Tip $script:HelpButton 'Open a short guide to the size rule, comparing, and what each part of this folder is for.'
-Set-Tip $script:CheckUpdateButton 'Look on GitHub for a newer version of Video Dehydrator. A window opens when a newer version is found.'
+Set-Tip $script:CheckUpdateButton 'Look on GitHub for a newer version of Video Dehydrator. A window opens the first time a newer version is found. The status line keeps saying that version is available.'
+Set-Tip $script:DonateButton 'Free forever. Tips of $5 or more can include a feature suggestion.'
+Set-Tip $script:ReportBugButton 'Open a GitHub bug report with this version and the Windows version filled in. Include latest activity is optional. Leave it unchecked and nothing else is added.'
 Set-Tip $script:UpdateButton 'Download the newer version and open its setup program. This window closes while that setup runs.'
 Set-Tip $script:FolderPick 'Folders that have bloated files. A show is listed with the folders inside it. Pick one to make a smaller convert job.'
 Set-Tip $script:SelectFolderButton 'Check the bloated files in the folder shown here, and clear the other checks.'
@@ -3886,6 +4211,7 @@ $script:PlayTimer.Add_Tick({
     Update-PlayChrome
 })
 
+$script:SkipRows = @(Read-SkipFile)
 Add-PendingRows
 Write-Welcome
 $waiting = @($script:Files.Items | Where-Object { [string]$_.Tag.Status -eq 'Ready to delete' })
@@ -4263,6 +4589,9 @@ function Invoke-SmokeTest {
     Assert-True ($script:HelpBox.Text -match 'will not stay in sync with the picture') 'The guide was missing the compare sync note'
     Assert-True ($script:HelpBox.Text -match 'Go to the file on disk to confirm the audio') 'The guide was missing the disk audio note'
     Assert-True ($script:HelpBox.Text -match 'checks for updates when it opens') 'The guide was missing the startup update check'
+    Assert-True ($script:HelpBox.Text -match 'Windows Media Audio') 'The guide was missing the re-encode note'
+    Assert-True ($script:HelpBox.Text -match 'marked Skipped') 'The guide was missing the skip note'
+    Assert-True ($script:HelpBox.Text -match 'Clear skips forgets those marks') 'The guide was missing Clear skips'
     Assert-True (Test-EncodeProgressLine 'Encoding: task 1 of 2, 50.00 % (12.00 fps, avg 10.00 fps, ETA 00h00m10s)') 'An encode percent was treated as a step'
     Assert-True (Test-EncodeProgressLine 'Muxing: 40 %') 'A mux percent was treated as a step'
     Assert-True (-not (Test-EncodeProgressLine '[00:00:01] hb_init: starting libhb thread')) 'A real encode step was hidden'
@@ -4289,7 +4618,74 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.4.1') 'Version file was not 1.0.4.1'
+    Assert-True ((Get-AppVersion) -eq '1.0.5') 'Version file was not 1.0.5'
+    Assert-True ($script:DonateButton.Text -eq 'Donate') 'Donate was missing'
+    Assert-True ($script:ReportBugButton.Text -eq 'Report a bug') 'Report a bug was missing'
+    Assert-True ($script:DonateButton.Parent -eq $script:Header) 'Donate is not in the header'
+    Assert-True ($script:Tips.GetToolTip($script:DonateButton) -eq 'Free forever. Tips of $5 or more can include a feature suggestion.') 'Donate tooltip'
+    Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
+    $bugUrl = Get-BugReportUrl
+    Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
+    Assert-True ($bugUrl -match 'version=1\.0\.5') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
+    Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
+    Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'
+    $plainBug = Get-BugReportUrl
+    Assert-True ($plainBug -notmatch 'activity=') 'The bug report link added activity on its own'
+    $script:Log.Clear()
+    Write-Activity 'older activity line' 'text'
+    Write-Activity 'LATEST-ACTIVITY-MARK' 'text'
+    Start-ActivityPulse
+    $withPulse = Get-LatestActivityText
+    Stop-ActivityPulse
+    Assert-True ($withPulse -match 'LATEST-ACTIVITY-MARK') 'Latest activity was dropped'
+    Assert-True ($withPulse -match 'older activity line') 'Earlier activity was dropped'
+    Assert-True ($withPulse -notmatch 'Working') 'The working mark was included'
+    $filledBug = Get-BugReportUrl $withPulse
+    Assert-True ($filledBug -match 'activity=older%20activity%20line%0ALATEST-ACTIVITY-MARK') 'The activity was not added to the bug report link'
+    $script:Log.Clear()
+    Write-Activity ('Y' * 20000) 'text'
+    Write-Activity 'TAIL-MARK' 'text'
+    $capped = Get-LatestActivityText
+    Assert-True ($capped.EndsWith('TAIL-MARK')) 'The latest activity line was trimmed off'
+    Assert-True (([uri]::EscapeDataString($capped)).Length -le 4500) 'The activity text was too long for the link'
+    $script:Log.Clear()
+    $emptyBugForm = New-BugReportForm
+    try {
+        $emptyBox = @($emptyBugForm.Controls) | Where-Object { $_.Text -eq 'Include latest activity' } | Select-Object -First 1
+        Assert-True ($null -ne $emptyBox) 'Include latest activity was missing'
+        Assert-True (-not $emptyBox.Checked) 'Include latest activity started checked'
+        Assert-True (-not $emptyBox.Enabled) 'Include latest activity stayed available when the activity box was empty'
+    }
+    finally { if (-not $emptyBugForm.IsDisposed) { $emptyBugForm.Dispose() } }
+    Write-Activity 'choice activity' 'text'
+    $bugForm = New-BugReportForm
+    try {
+        $bugForm.StartPosition = 'Manual'
+        $bugForm.Location = New-Object Drawing.Point(-32000, -32000)
+        $bugForm.Show()
+        $choice = @($bugForm.Controls) | Where-Object { $_.Text -eq 'Include latest activity' } | Select-Object -First 1
+        Assert-True ($choice.Enabled) 'Include latest activity stayed off when the activity box had text'
+        Assert-True (-not $choice.Checked) 'Include latest activity started checked'
+        $openReport = @($bugForm.Controls) | Where-Object { $_.Text -eq 'Open report' } | Select-Object -First 1
+        $openReport.PerformClick()
+        Assert-True ($bugForm.Tag.Open -and -not $bugForm.Tag.Include) 'Open report included activity without the box'
+        if (-not $bugForm.IsDisposed) { $bugForm.Close() }
+    }
+    finally { if (-not $bugForm.IsDisposed) { $bugForm.Dispose() } }
+    $checkedForm = New-BugReportForm
+    try {
+        $checkedForm.StartPosition = 'Manual'
+        $checkedForm.Location = New-Object Drawing.Point(-32000, -32000)
+        $checkedForm.Show()
+        $choice = @($checkedForm.Controls) | Where-Object { $_.Text -eq 'Include latest activity' } | Select-Object -First 1
+        $choice.Checked = $true
+        $openReport = @($checkedForm.Controls) | Where-Object { $_.Text -eq 'Open report' } | Select-Object -First 1
+        $openReport.PerformClick()
+        Assert-True ($checkedForm.Tag.Open -and $checkedForm.Tag.Include) 'Open report left the activity choice off'
+        if (-not $checkedForm.IsDisposed) { $checkedForm.Close() }
+    }
+    finally { if (-not $checkedForm.IsDisposed) { $checkedForm.Dispose() } }
     Assert-True ($script:VersionLabel.Text -eq (Get-AppVersion)) 'Version label did not show the version'
     Assert-True ($script:VersionLabel.Parent -eq $script:StatusPanel) 'Version is not in the status bar'
     Assert-True ((Compare-AppVersion '1.0.1' '1.0.0') -eq 1) 'A newer version compared as older'
@@ -4300,8 +4696,8 @@ function Invoke-SmokeTest {
     Assert-True ((Compare-AppVersion '1.0.4.1' '1.0.4') -eq 1) 'A fourth version number was ignored'
     Assert-True ((Compare-AppVersion '1.0.4' '1.0.4.0') -eq 0) 'A missing fourth number did not match zero'
     $sameOffer = Get-UpdateOffer ([pscustomobject]@{
-        tag_name = 'v1.0.4.1'
-        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.4.1/video_dehydrator.exe'; size = 12 })
+        tag_name = 'v1.0.5'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.5/video_dehydrator.exe'; size = 12 })
     })
     Assert-True (-not $sameOffer.Newer) 'The current version was offered as an update'
     $bareOffer = Get-UpdateOffer ([pscustomobject]@{ tag_name = 'v9.9.9'; assets = @() })
@@ -4320,11 +4716,45 @@ function Invoke-SmokeTest {
     $script:UpdateOffer = $null
     Update-UpdateButtons
     Assert-True ($script:CheckUpdateButton.Enabled -and -not $script:UpdateButton.Enabled) 'Update buttons did not return to normal after the job'
+    Assert-True ($script:HelpBox.Text -match 'Closing that window keeps it from opening again') 'The guide was missing the one-time update window'
+    $keptPrompt = [string]$script:UpdatePrompt
+    $script:UpdatePrompt = ''
+    $script:UpdateOffer = $null
+    Assert-True (Test-UpdatePromptDue $offer) 'A new version did not ask'
+    Remember-UpdatePrompt '9.9.9'
+    Assert-True ($script:UpdatePrompt -eq '9.9.9') 'The dismissed version was forgotten'
+    Assert-True (-not (Test-UpdatePromptDue $offer)) 'The same version asked again'
+    $laterOffer = Get-UpdateOffer ([pscustomobject]@{
+        tag_name = 'v9.9.10'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v9.9.10/video_dehydrator.exe'; size = 12 })
+    })
+    Assert-True (Test-UpdatePromptDue $laterOffer) 'A later version stayed quiet'
+    $script:UpdateOffer = $offer
+    Set-Status 'Ready' 'idle'
+    Assert-True ($script:StatusLabel.Text -eq 'Version 9.9.9 is available.') 'The status line dropped the new version'
+    Set-Status 'Listing videos...' 'busy'
+    Assert-True ($script:StatusLabel.Text -eq 'Listing videos...') 'The scan status was replaced by the update'
+    Set-Status 'Scan stopped' 'idle'
+    Assert-True ($script:StatusLabel.Text -eq 'Scan stopped. Version 9.9.9 is available.') 'The update left the status line'
+    $script:UpdateOffer = $null
+    $script:UpdatePrompt = ''
+    Set-Status 'Ready' 'idle'
+    Assert-True ($script:StatusLabel.Text -eq 'Ready') 'An old update stayed after it was cleared'
+    $script:UpdatePrompt = '9.9.9'
+    Set-Status 'Ready' 'idle'
+    Assert-True ($script:StatusLabel.Text -eq 'Version 9.9.9 is available.') 'A dismissed version left the status line'
+    $script:UpdatePrompt = $keptPrompt
+    $script:UpdateOffer = $null
+    Set-Status 'Ready' 'idle'
     $keptWidth = $script:Form.ClientSize.Width
     $script:Form.ClientSize = New-Object Drawing.Size(900, $script:Form.ClientSize.Height)
     Update-ChromeLayout
     Assert-True ($script:TitleLabel.Right -le $script:CheckUpdateButton.Left) 'The title overlaps Check for updates'
     Assert-True ($script:UpdateButton.Right -le ($script:Header.ClientSize.Width - 8)) 'Update sits outside the header'
+    Assert-True ($script:ReportBugButton.Right -le ($script:Header.ClientSize.Width - 8)) 'Report a bug sits outside the header'
+    Assert-True ($script:DonateButton.Right -le ($script:ReportBugButton.Left + 1)) 'Donate overlaps Report a bug'
+    Assert-True ($script:DonateButton.Top -ge $script:UpdateButton.Bottom) 'Donate overlaps the update buttons'
+    Assert-True ($script:TitleLabel.Right -le $script:DonateButton.Left) 'The title overlaps Donate'
     Assert-True ($script:VersionLabel.Right -le ($script:StatusPanel.ClientSize.Width - 8)) 'Version sits outside the status bar'
     Assert-True ($script:StatusLabel.Right -le ($script:VersionLabel.Left + 1)) 'Status overlaps the version'
     Assert-True ($script:FolderPick.Right -le ($script:SelectFolderButton.Left + 1)) 'Folder list overlaps Select folder'
@@ -4378,6 +4808,14 @@ function Invoke-SmokeTest {
         if (-not $warnForm.IsDisposed) { $warnForm.Close() }
     }
     finally { if (-not $warnForm.IsDisposed) { $warnForm.Dispose() } }
+    Assert-True ($script:ReencodeCheck.Text -eq 'Re-encode audio that cannot be copied') 'Re-encode label'
+    Assert-True ($script:Tips.GetToolTip($script:ReencodeCheck) -match 'Windows Media Audio') 'Re-encode tooltip'
+    Assert-True ($script:ReencodeCheck.Bottom -le $script:OptionsCard.ClientSize.Height) 'Re-encode sits outside the options card'
+    Assert-True ($script:ReencodeCheck.Right -lt $script:BudgetTitle.Left) 'Re-encode overlaps the budgets'
+    Assert-True ($script:ClearSkipsButton.Text -eq 'Clear skips') 'Clear skips label'
+    Assert-True ($script:Tips.GetToolTip($script:ClearSkipsButton) -match 'new copy was larger') 'Clear skips tooltip'
+    Assert-True ($script:ClearSkipsButton.Bottom -le $script:OptionsCard.ClientSize.Height) 'Clear skips sits outside the options card'
+    Assert-True ($script:ClearSkipsButton.Right -lt $script:BudgetTitle.Left) 'Clear skips overlaps the budgets'
     Assert-True (-not $script:ShutdownCheck.Checked) 'Shutdown started checked'
     Assert-True ($script:ShutdownCheck.Text -eq 'Shutdown computer upon completion') 'Shutdown label'
     $script:ShutdownRequested = $false

@@ -1,6 +1,7 @@
 # Personal settings, held originals, and the convert record
 app/settings.json
 app/pending.json
+app/skipped.json
 app/convert-log.tsv
 
 # Too large for GitHub. License text stays.

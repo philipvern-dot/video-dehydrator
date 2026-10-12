@@ -1,0 +1,34 @@
+name: Bug report
+description: Something went wrong while using Video Dehydrator.
+title: "[Bug]: "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Video Dehydrator version
+      description: Filled in when you open this page from Report a bug.
+      placeholder: "1.0.5"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Filled in when you open this page from Report a bug.
+      placeholder: "Windows 11 (build 26200)"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you were doing, and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: activity
+    attributes:
+      label: Activity
+      description: Filled in only when Include latest activity is checked. Leave that box unchecked and this stays empty. You can also paste the activity box yourself.
+    validations:
+      required: false

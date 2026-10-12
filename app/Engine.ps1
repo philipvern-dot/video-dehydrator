@@ -520,8 +520,11 @@ function Get-HandBrakeArguments {
         [Parameter(Mandatory)][string]$Temp,
         $Probe,
         [Parameter(Mandatory)][int]$VideoKbps,
-        [Parameter(Mandatory)][string]$Encoder
+        [Parameter(Mandatory)][string]$Encoder,
+        [switch]$ReencodeAudio
     )
+    $fallback = 'none'
+    if ($ReencodeAudio) { $fallback = 'av_aac' }
     $arguments = @(
         '-i', $Source,
         '-o', $Temp,
@@ -538,7 +541,7 @@ function Get-HandBrakeArguments {
         '--all-audio',
         '--aencoder', 'copy',
         '--audio-copy-mask', $script:AudioCopyMask,
-        '--audio-fallback', 'none'
+        '--audio-fallback', $fallback
     )
     $subCount = 0
     if ($Probe -and $null -ne $Probe.SubCount) { $subCount = [int]$Probe.SubCount }
@@ -606,13 +609,126 @@ function Test-DecodeWindow {
     return [pscustomobject]@{ Ok = $true; Detail = '' }
 }
 
+function Test-CopyableAudioCodec([string]$Codec) {
+    if ([string]::IsNullOrWhiteSpace($Codec)) { return $false }
+    $name = $Codec.Trim().ToLowerInvariant()
+    foreach ($allowed in ($script:AudioCopyMask -split ',')) {
+        if ($name -eq $allowed.Trim().ToLowerInvariant()) { return $true }
+    }
+    return $false
+}
+
+function Test-AudioFallbackLog([string]$Log) {
+    if ([string]::IsNullOrEmpty($Log)) { return $false }
+    return [bool]($Log -match 'passthru not possible|Auto Passthru: no codecs allowed|using fallback encoder')
+}
+
+function Get-AudioFallbackReason {
+    param(
+        [string]$Log,
+        [switch]$AllowReencode
+    )
+    if ($AllowReencode) { return '' }
+    if (Test-AudioFallbackLog $Log) { return 'audio could not be copied' }
+    return ''
+}
+
+function Get-AudioChangeReasons {
+    param(
+        [string[]]$SourceCodecs,
+        [string[]]$OutputCodecs,
+        [switch]$AllowReencode
+    )
+    $reasons = New-Object System.Collections.Generic.List[string]
+    $source = @()
+    $output = @()
+    if ($null -ne $SourceCodecs) { $source = @($SourceCodecs) }
+    if ($null -ne $OutputCodecs) { $output = @($OutputCodecs) }
+    if ($source.Count -ne $output.Count) {
+        $reasons.Add("audio tracks changed from $($source.Count) to $($output.Count)")
+    }
+    $slots = [math]::Max($source.Count, $output.Count)
+    for ($i = 0; $i -lt $slots; $i++) {
+        $left = if ($i -lt $source.Count) { [string]$source[$i] } else { 'missing' }
+        $right = if ($i -lt $output.Count) { [string]$output[$i] } else { 'missing' }
+        if ($left -eq $right) { continue }
+        $reencoded = $AllowReencode -and -not (Test-CopyableAudioCodec $left) -and ($right.ToLowerInvariant() -eq 'aac')
+        if ($reencoded) { continue }
+        $reasons.Add("audio $i changed from $left to $right")
+    }
+    return @($reasons.ToArray())
+}
+
+function Test-SizeSkipReason([string]$Reason) {
+    $parts = @(([string]$Reason) -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($parts.Count -eq 0) { return $false }
+    foreach ($part in $parts) {
+        if ($part -ne 'the new file is not smaller' -and $part -ne 'the new file is not smaller per hour') {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-LargerFileNote {
+    param(
+        [string]$Reason,
+        [int64]$SourceBytes = 0,
+        [int64]$NewBytes = 0,
+        [int]$TargetKbps = 0,
+        [string[]]$SourceCodecs,
+        [string[]]$OutputCodecs
+    )
+    if ([string]$Reason -notmatch 'the new file is not smaller') { return '' }
+    $source = @()
+    $output = @()
+    if ($null -ne $SourceCodecs) { $source = @($SourceCodecs) }
+    if ($null -ne $OutputCodecs) { $output = @($OutputCodecs) }
+    $reencoded = $false
+    $copied = $true
+    $slots = [math]::Min($source.Count, $output.Count)
+    for ($i = 0; $i -lt $slots; $i++) {
+        $left = [string]$source[$i]
+        $right = [string]$output[$i]
+        if ($left -eq $right) { continue }
+        $copied = $false
+        if ($right.ToLowerInvariant() -eq 'aac' -and -not (Test-CopyableAudioCodec $left)) { $reencoded = $true }
+    }
+    if ($output.Count -lt $source.Count) { $copied = $false }
+    $sentences = New-Object System.Collections.Generic.List[string]
+    $sentences.Add('The original was left in place.')
+    $rate = 'the target rate'
+    if ($TargetKbps -gt 0) { $rate = "$TargetKbps kbps" }
+    if ($reencoded) {
+        $sentences.Add("The picture was encoded at $rate. Audio that could not be copied was re-encoded to AAC, and the rest was copied.")
+    }
+    elseif ($copied) {
+        $sentences.Add("The picture was encoded at $rate, and the audio was copied as it was.")
+    }
+    else {
+        $sentences.Add("The picture was encoded at $rate.")
+    }
+    if ($SourceBytes -gt 0 -and $NewBytes -ge $SourceBytes) {
+        $sentences.Add("Together that made $(Format-ByteSize $NewBytes), which is not smaller than the original $(Format-ByteSize $SourceBytes).")
+    }
+    elseif ($SourceBytes -gt 0 -and $NewBytes -gt 0) {
+        $sentences.Add("The new file is $(Format-ByteSize $NewBytes) and the original is $(Format-ByteSize $SourceBytes). It is not smaller for the length of the video.")
+    }
+    else {
+        $sentences.Add('Together that is not smaller than the original.')
+    }
+    $sentences.Add('That happens when the target rate plus the audio is more than this file already used.')
+    return ($sentences -join ' ')
+}
+
 function Test-EncodedFile {
     param(
         [Parameter(Mandatory)][string]$Ffmpeg,
         [Parameter(Mandatory)][string]$Ffprobe,
         [Parameter(Mandatory)][string]$Temp,
         $SourceProbe,
-        [string]$HandBrakeLog
+        [string]$HandBrakeLog,
+        [switch]$AllowAudioReencode
     )
     $reasons = New-Object System.Collections.Generic.List[string]
     if (-not (Test-Path -LiteralPath $Temp)) {
@@ -623,9 +739,8 @@ function Test-EncodedFile {
     if ($tempItem.Length -lt $floor) {
         $reasons.Add("new file is too small ($($tempItem.Length) bytes)")
     }
-    if ($HandBrakeLog -match 'passthru not possible|Auto Passthru: no codecs allowed|using fallback encoder') {
-        $reasons.Add('audio could not be copied')
-    }
+    $fallbackReason = Get-AudioFallbackReason -Log $HandBrakeLog -AllowReencode:$AllowAudioReencode
+    if ($fallbackReason) { $reasons.Add($fallbackReason) }
     if ($HandBrakeLog -match 'Burned-in|Render/Burn-in') {
         $reasons.Add('a subtitle was burned into the picture')
     }
@@ -649,16 +764,8 @@ function Test-EncodedFile {
     if (-not $first.Ok) { $reasons.Add($first.Detail) }
     $last = Test-DecodeWindow -Ffmpeg $Ffmpeg -File $Temp -DurationSec $out.DurationSec -Window Last
     if (-not $last.Ok) { $reasons.Add($last.Detail) }
-    if ($out.AudioCount -ne $SourceProbe.AudioCount) {
-        $reasons.Add("audio tracks changed from $($SourceProbe.AudioCount) to $($out.AudioCount)")
-    }
-    $sourceAudio = @($SourceProbe.AudioCodecs)
-    $outputAudio = @($out.AudioCodecs)
-    $audioSlots = [math]::Max($sourceAudio.Count, $outputAudio.Count)
-    for ($i = 0; $i -lt $audioSlots; $i++) {
-        $left = if ($i -lt $sourceAudio.Count) { $sourceAudio[$i] } else { 'missing' }
-        $right = if ($i -lt $outputAudio.Count) { $outputAudio[$i] } else { 'missing' }
-        if ($left -ne $right) { $reasons.Add("audio $i changed from $left to $right") }
+    foreach ($audioReason in @(Get-AudioChangeReasons -SourceCodecs @($SourceProbe.AudioCodecs) -OutputCodecs @($out.AudioCodecs) -AllowReencode:$AllowAudioReencode)) {
+        $reasons.Add($audioReason)
     }
     if ($out.SubCount -lt $SourceProbe.SubCount) {
         $reasons.Add("subtitles dropped from $($SourceProbe.SubCount) to $($out.SubCount)")
@@ -953,6 +1060,114 @@ function Test-VideoFileName {
     return $true
 }
 
+function Test-RememberedSkip {
+    param(
+        $Rows,
+        [string]$Path,
+        [int64]$SizeBytes,
+        [int]$TargetKbps
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or $SizeBytes -le 0 -or $TargetKbps -le 0) { return $false }
+    if ($null -eq $Rows) { return $false }
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row -or -not $row.path) { continue }
+        if (-not [string]::Equals([string]$row.path, $Path, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $savedSize = [int64]0
+        [void][int64]::TryParse([string]$row.size, [ref]$savedSize)
+        if ($savedSize -ne $SizeBytes) { continue }
+        $savedTarget = 0
+        [void][int]::TryParse([string]$row.targetKbps, [ref]$savedTarget)
+        if ($savedTarget -gt 0 -and $TargetKbps -ge $savedTarget) { return $true }
+    }
+    return $false
+}
+
+function Merge-SkipRow {
+    param(
+        $Rows,
+        [Parameter(Mandatory)][string]$Path,
+        [int64]$SizeBytes,
+        [int]$TargetKbps
+    )
+    $kept = New-Object System.Collections.Generic.List[object]
+    $found = $false
+    if ($null -ne $Rows) {
+        foreach ($row in @($Rows)) {
+            if ($null -eq $row -or -not $row.path) { continue }
+            if (-not [string]::Equals([string]$row.path, $Path, [StringComparison]::OrdinalIgnoreCase)) {
+                [void]$kept.Add($row)
+                continue
+            }
+            $found = $true
+            $savedSize = [int64]0
+            [void][int64]::TryParse([string]$row.size, [ref]$savedSize)
+            $savedTarget = 0
+            [void][int]::TryParse([string]$row.targetKbps, [ref]$savedTarget)
+            $target = $TargetKbps
+            if ($savedSize -eq $SizeBytes -and $savedTarget -gt 0 -and $savedTarget -lt $target) { $target = $savedTarget }
+            [void]$kept.Add([pscustomobject]@{ path = $Path; size = $SizeBytes; targetKbps = $target })
+        }
+    }
+    if (-not $found -and $SizeBytes -gt 0 -and $TargetKbps -gt 0) {
+        [void]$kept.Add([pscustomobject]@{ path = $Path; size = $SizeBytes; targetKbps = $TargetKbps })
+    }
+    foreach ($row in $kept) { Write-Output $row }
+}
+
+function Remove-SkipRow {
+    param(
+        $Rows,
+        [string]$Path
+    )
+    if ($null -eq $Rows -or [string]::IsNullOrWhiteSpace($Path)) {
+        if ($null -ne $Rows) {
+            foreach ($row in @($Rows)) { if ($null -ne $row -and $row.path) { Write-Output $row } }
+        }
+        return
+    }
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row -or -not $row.path) { continue }
+        if ([string]::Equals([string]$row.path, $Path, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        Write-Output $row
+    }
+}
+
+function Format-SkipJson {
+    param($Rows)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $Rows) {
+        foreach ($row in @($Rows)) {
+            if ($null -eq $row -or -not $row.path) { continue }
+            $size = [int64]0
+            [void][int64]::TryParse([string]$row.size, [ref]$size)
+            $target = 0
+            [void][int]::TryParse([string]$row.targetKbps, [ref]$target)
+            if ($size -le 0 -or $target -le 0) { continue }
+            $obj = [ordered]@{ path = [string]$row.path; size = $size; targetKbps = $target }
+            [void]$parts.Add(($obj | ConvertTo-Json -Compress))
+        }
+    }
+    if ($parts.Count -eq 0) { return '' }
+    return '[' + ($parts -join ',') + ']'
+}
+
+function Convert-SkipRows([string]$Json) {
+    if ([string]::IsNullOrWhiteSpace($Json)) { return }
+    $parsed = $null
+    try { $parsed = $Json | ConvertFrom-Json } catch { return }
+    if ($null -eq $parsed) { return }
+    foreach ($item in @($parsed)) {
+        if ($null -eq $item) { continue }
+        if ($item -is [System.Array]) {
+            foreach ($inner in @($item)) {
+                if ($null -ne $inner -and $inner.path) { Write-Output $inner }
+            }
+            continue
+        }
+        if ($item.path) { Write-Output $item }
+    }
+}
+
 function Send-ScanMessage {
     param($Queue, $Object)
     $json = $Object | ConvertTo-Json -Compress -Depth 4
@@ -990,6 +1205,10 @@ function Add-ScanDirectory {
             $probe = Get-MediaProbe -Ffprobe $Ffprobe -File $file
             $decision = Get-BloatDecision -Probe $probe
             if ($decision.Decision -eq 'bloated') {
+                if (Test-RememberedSkip -Rows $State.Skips -Path $file -SizeBytes ([int64]$probe.SizeBytes) -TargetKbps ([int]$decision.TargetKbps)) {
+                    $State.Ignored++
+                    continue
+                }
                 $State.Hits++
                 Send-ScanMessage $Queue @{
                     Kind          = 'hit'
@@ -1040,7 +1259,8 @@ function Invoke-ScanFolder {
         [bool]$Recurse,
         [Parameter(Mandatory)][string]$Ffprobe,
         $Queue,
-        $Cancel
+        $Cancel,
+        $Skips
     )
     $samples = New-Object System.Collections.Generic.List[string]
     $state = @{
@@ -1051,8 +1271,17 @@ function Invoke-ScanFolder {
         NoDur     = 0
         Within    = 0
         Errors    = 0
+        Ignored   = 0
         Samples   = $samples
         Cancelled = $false
+        Skips     = @()
+    }
+    if ($null -ne $Skips) {
+        $skipList = New-Object System.Collections.Generic.List[object]
+        foreach ($row in @($Skips)) {
+            if ($null -ne $row -and $row.path) { [void]$skipList.Add($row) }
+        }
+        $state.Skips = $skipList.ToArray()
     }
     try {
         if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
@@ -1074,6 +1303,7 @@ function Invoke-ScanFolder {
             NoDur     = $state.NoDur
             Within    = $state.Within
             Errors    = $state.Errors
+            Ignored   = $state.Ignored
             Samples   = ($state.Samples -join ' | ')
             Cancelled = [bool]$state.Cancelled
         }
@@ -1189,6 +1419,54 @@ function Invoke-EngineSelfTest {
     Assert-Engine (Test-HarmlessDecodeNote '') 'an empty decode note is harmless'
     Assert-Engine (-not (Test-HarmlessDecodeNote '[null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 4')) 'a backwards timestamp is not harmless'
     Assert-Engine (-not (Test-HarmlessDecodeNote ($sameStamp + ' | Error while decoding stream'))) 'another decode message is not harmless'
+
+    Assert-Engine (Test-CopyableAudioCodec 'aac') 'aac can be copied'
+    Assert-Engine (Test-CopyableAudioCodec 'AC3') 'ac3 can be copied'
+    Assert-Engine (-not (Test-CopyableAudioCodec 'wmav2')) 'wmav2 cannot be copied'
+    Assert-Engine (-not (Test-CopyableAudioCodec 'vorbis')) 'vorbis cannot be copied'
+    Assert-Engine (-not (Test-CopyableAudioCodec '')) 'a blank codec cannot be copied'
+    Assert-Engine ((Get-AudioFallbackReason 'using fallback encoder') -eq 'audio could not be copied') 'a fallback encode is rejected'
+    Assert-Engine ((Get-AudioFallbackReason 'using fallback encoder' -AllowReencode) -eq '') 'a chosen re-encode is allowed'
+    Assert-Engine ((Get-AudioFallbackReason 'encoded fine') -eq '') 'a clean log has no audio failure'
+    $blockedAudio = @(Get-AudioChangeReasons -SourceCodecs @('wmav2') -OutputCodecs @('aac'))
+    Assert-Engine ($blockedAudio.Count -eq 1 -and $blockedAudio[0] -match 'wmav2 to aac') 'wmav2 re-encode is rejected when left off'
+    $allowedAudio = @(Get-AudioChangeReasons -SourceCodecs @('wmav2') -OutputCodecs @('aac') -AllowReencode)
+    Assert-Engine ($allowedAudio.Count -eq 0) 'wmav2 re-encode to aac is kept when turned on'
+    $mixedAudio = @(Get-AudioChangeReasons -SourceCodecs @('aac', 'wmav2') -OutputCodecs @('aac', 'aac') -AllowReencode)
+    Assert-Engine ($mixedAudio.Count -eq 0) 'copied aac plus re-encoded wmav2 is kept'
+    $copyBroken = @(Get-AudioChangeReasons -SourceCodecs @('ac3') -OutputCodecs @('aac') -AllowReencode)
+    Assert-Engine ($copyBroken.Count -eq 1) 'audio that can be copied is still required to stay as it was'
+    $droppedAudio = @(Get-AudioChangeReasons -SourceCodecs @('wmav2') -OutputCodecs @() -AllowReencode)
+    Assert-Engine (($droppedAudio -join ' ') -match 'tracks changed') 'a dropped track still fails when re-encode is on'
+    $probeForArgs = New-FakeProbe -Width 640 -Height 480 -SizeBytes 1000000 -DurationSec 60
+    $offArgs = (Get-HandBrakeArguments -Source 'in.wmv' -Temp 'out.mkv' -Probe $probeForArgs -VideoKbps 444 -Encoder 'x265') -join ' '
+    $onArgs = (Get-HandBrakeArguments -Source 'in.wmv' -Temp 'out.mkv' -Probe $probeForArgs -VideoKbps 444 -Encoder 'x265' -ReencodeAudio) -join ' '
+    Assert-Engine ($offArgs -match '--audio-fallback none') 'audio fallback stays off'
+    Assert-Engine ($onArgs -match '--audio-fallback av_aac' -and $onArgs -match '--aencoder copy') 'audio fallback re-encodes to AAC'
+    $bigger = Get-LargerFileNote -Reason 'the new file is not smaller; the new file is not smaller per hour' -SourceBytes 46391948 -NewBytes 55000000 -TargetKbps 200 -SourceCodecs @('aac') -OutputCodecs @('aac')
+    Assert-Engine ($bigger -match 'left in place' -and $bigger -match '200 kbps' -and $bigger -match 'copied as it was' -and $bigger -match [regex]::Escape((Format-ByteSize 46391948)) -and $bigger -match 'more than this file already used') 'a larger file explains why'
+    $biggerRe = Get-LargerFileNote -Reason 'the new file is not smaller per hour' -SourceBytes 100000000 -NewBytes 120000000 -TargetKbps 444 -SourceCodecs @('wmav2') -OutputCodecs @('aac')
+    Assert-Engine ($biggerRe -match 're-encoded to AAC' -and $biggerRe -match '444 kbps') 'a larger re-encoded file says the audio changed'
+    Assert-Engine ((Get-LargerFileNote -Reason 'audio could not be copied' -SourceBytes 100 -NewBytes 50 -TargetKbps 200) -eq '') 'another failure does not get the size note'
+    Assert-Engine (Test-SizeSkipReason 'the new file is not smaller') 'a larger file is a skip'
+    Assert-Engine (Test-SizeSkipReason 'the new file is not smaller; the new file is not smaller per hour') 'both size reasons are a skip'
+    Assert-Engine (-not (Test-SizeSkipReason 'audio could not be copied; the new file is not smaller')) 'a size reason mixed with another problem is still a failure'
+    Assert-Engine (-not (Test-SizeSkipReason 'audio could not be copied')) 'a real problem is not a skip'
+    Assert-Engine (-not (Test-SizeSkipReason '')) 'a blank reason is not a skip'
+    $remembered = @(Merge-SkipRow -Rows @() -Path 'C:\Show\A.mkv' -SizeBytes 1000 -TargetKbps 3000)
+    Assert-Engine ($remembered.Count -eq 1) 'a size skip was not remembered'
+    Assert-Engine (Test-RememberedSkip -Rows $remembered -Path 'c:\show\a.mkv' -SizeBytes 1000 -TargetKbps 3000) 'the same file was not ignored'
+    Assert-Engine (Test-RememberedSkip -Rows $remembered -Path 'C:\Show\A.mkv' -SizeBytes 1000 -TargetKbps 4000) 'a higher target was not ignored'
+    Assert-Engine (-not (Test-RememberedSkip -Rows $remembered -Path 'C:\Show\A.mkv' -SizeBytes 1000 -TargetKbps 1500)) 'a smaller target stayed ignored'
+    Assert-Engine (-not (Test-RememberedSkip -Rows $remembered -Path 'C:\Show\A.mkv' -SizeBytes 999 -TargetKbps 3000)) 'a changed file stayed ignored'
+    $tighter = @(Merge-SkipRow -Rows $remembered -Path 'C:\Show\A.mkv' -SizeBytes 1000 -TargetKbps 1500)
+    Assert-Engine (Test-RememberedSkip -Rows $tighter -Path 'C:\Show\A.mkv' -SizeBytes 1000 -TargetKbps 1500) 'a later skip did not keep the smaller target'
+    Assert-Engine (-not (Test-RememberedSkip -Rows $tighter -Path 'C:\Show\A.mkv' -SizeBytes 1000 -TargetKbps 1499)) 'a target under the remembered one stayed ignored'
+    $roundTrip = @(Convert-SkipRows (Format-SkipJson $tighter))
+    Assert-Engine (Test-RememberedSkip -Rows $roundTrip -Path 'C:\Show\A.mkv' -SizeBytes 1000 -TargetKbps 1500) 'a remembered skip did not survive saving'
+    $cleared = @(Remove-SkipRow -Rows $roundTrip -Path 'c:\show\a.mkv')
+    Assert-Engine ($cleared.Count -eq 0) 'clearing a skip left the file'
+    Assert-Engine ((Format-SkipJson @()) -eq '') 'an empty skip list was written'
 
     $fraction = Get-HandBrakeFraction 'Encoding: task 1 of 2, 50.00 % (12.00 fps, avg 10.00 fps, ETA 00h00m10s)'
     Assert-Engine ([math]::Abs($fraction - 25) -lt 0.01) 'pass 1 progress'
