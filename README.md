@@ -39,6 +39,16 @@ They are not in this repository. Each one is larger than GitHub allows. Copy the
 
 FFmpeg's license is `tools\FFmpeg-LICENSE.txt`. HandBrake's license is `tools\HandBrake-LICENSE.txt`.
 
+## Support
+
+Video Dehydrator is free and always will be.
+
+[![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-Support-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/philipvern)
+
+- **Tips:** welcome at [ko-fi.com/philipvern](https://ko-fi.com/philipvern). Pick $1, $2, $5, or a custom amount. A tip of $5 or more can include a feature suggestion.
+- **Bugs:** Report a bug in the program opens a GitHub page with this version and the Windows version filled in. Include latest activity is optional.
+- **Commissions:** I'm open to them. Reach out through Ko-fi.
+
 ## License
 
 This program is released under the MIT License. See [LICENSE](LICENSE).
