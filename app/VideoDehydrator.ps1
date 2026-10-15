@@ -341,13 +341,155 @@ $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.6'
+$script:UpdateFallback = '1.0.6.1'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+if (-not ('VideoDehydrator.HeaderDrag' -as [type])) {
+    $formsRef = ([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'System.Windows.Forms' } | Select-Object -First 1).Location
+    $drawRef = ([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'System.Drawing' } | Select-Object -First 1).Location
+    Add-Type -ReferencedAssemblies @($formsRef, $drawRef) -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+namespace VideoDehydrator {
+  public class HeaderDrag : NativeWindow {
+    const int WM_LBUTTONDOWN = 0x0201;
+    const int WM_MOUSEMOVE = 0x0200;
+    const int WM_LBUTTONUP = 0x0202;
+    const int LVM_GETHEADER = 0x101F;
+    const int LVM_GETSUBITEMRECT = 0x1038;
+    const int HDM_HITTEST = 0x1206;
+    const int HDM_GETITEMRECT = 0x1207;
+    const uint HHT_ONDIVIDER = 0x0004;
+    const uint HHT_ONDIVOPEN = 0x0008;
+    readonly ListView list;
+    bool armed;
+    bool dragged;
+    int startX;
+    int columnIndex;
+    public event EventHandler Reordered;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct HDHITTESTINFO {
+      public int x;
+      public int y;
+      public uint flags;
+      public int iItem;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT {
+      public int left;
+      public int top;
+      public int right;
+      public int bottom;
+    }
+
+    [DllImport("user32.dll")]
+    static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    static extern bool GetUpdateRect(IntPtr hWnd, IntPtr lpRect, bool bErase);
+
+    public HeaderDrag(ListView list) { this.list = list; }
+
+    public void Attach() {
+      IntPtr header = SendMessage(list.Handle, LVM_GETHEADER, IntPtr.Zero, IntPtr.Zero);
+      if (header == IntPtr.Zero || Handle == header) return;
+      if (Handle != IntPtr.Zero) ReleaseHandle();
+      AssignHandle(header);
+    }
+
+    public void InjectMouse(int msg, int x, int y) {
+      long packed = ((long)y << 16) | (uint)(x & 0xFFFF);
+      SendMessage(Handle, msg, (IntPtr)1, (IntPtr)packed);
+    }
+
+    public bool RowsNeedPaint() {
+      return GetUpdateRect(list.Handle, IntPtr.Zero, false);
+    }
+
+    public int HeaderLeft(int index) {
+      return ReadRectLeft(Handle, HDM_GETITEMRECT, (IntPtr)index, 0, 0);
+    }
+
+    public int CellLeft(int index) {
+      // This Windows build reads left as LVIR_* and top as the subitem.
+      int portion = index == 0 ? 2 : 0;
+      return ReadRectLeft(list.Handle, LVM_GETSUBITEMRECT, IntPtr.Zero, portion, index);
+    }
+
+    int ReadRectLeft(IntPtr hwnd, int msg, IntPtr wParam, int left, int top) {
+      RECT rect = new RECT();
+      rect.left = left;
+      rect.top = top;
+      IntPtr ptr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(RECT)));
+      try {
+        Marshal.StructureToPtr(rect, ptr, false);
+        SendMessage(hwnd, msg, wParam, ptr);
+        rect = (RECT)Marshal.PtrToStructure(ptr, typeof(RECT));
+      } finally {
+        Marshal.FreeHGlobal(ptr);
+      }
+      return rect.left;
+    }
+
+    static int XOf(IntPtr lParam) { return (short)(lParam.ToInt64() & 0xFFFF); }
+    static int YOf(IntPtr lParam) { return (short)((lParam.ToInt64() >> 16) & 0xFFFF); }
+
+    int Hit(int x, int y, out bool divider) {
+      HDHITTESTINFO info = new HDHITTESTINFO();
+      info.x = x;
+      info.y = y;
+      IntPtr ptr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(HDHITTESTINFO)));
+      try {
+        Marshal.StructureToPtr(info, ptr, false);
+        SendMessage(Handle, HDM_HITTEST, IntPtr.Zero, ptr);
+        info = (HDHITTESTINFO)Marshal.PtrToStructure(ptr, typeof(HDHITTESTINFO));
+      } finally {
+        Marshal.FreeHGlobal(ptr);
+      }
+      divider = (info.flags & (HHT_ONDIVIDER | HHT_ONDIVOPEN)) != 0;
+      return info.iItem;
+    }
+
+    protected override void WndProc(ref Message m) {
+      if (m.Msg == WM_LBUTTONDOWN) {
+        int x = XOf(m.LParam);
+        bool divider;
+        int index = Hit(x, YOf(m.LParam), out divider);
+        armed = !divider && index >= 0 && index < list.Columns.Count;
+        dragged = false;
+        startX = x;
+        columnIndex = index;
+      } else if (m.Msg == WM_MOUSEMOVE && armed) {
+        if (Math.Abs(XOf(m.LParam) - startX) >= 6) dragged = true;
+      } else if (m.Msg == WM_LBUTTONUP && armed) {
+        int x = XOf(m.LParam);
+        bool move = dragged || Math.Abs(x - startX) >= 6;
+        int from = columnIndex;
+        armed = false;
+        if (move) {
+          bool divider;
+          int target = Hit(x, YOf(m.LParam), out divider);
+          if (!divider && target >= 0 && target < list.Columns.Count && target != from) {
+            list.Columns[from].DisplayIndex = list.Columns[target].DisplayIndex;
+            list.Invalidate();
+            EventHandler handler = Reordered;
+            if (handler != null) handler(this, EventArgs.Empty);
+          }
+        }
+      }
+      base.WndProc(ref m);
+    }
+  }
+}
+'@
+}
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
 
@@ -679,6 +821,7 @@ function Load-Settings {
         Shutdown = $false
         UpdatePrompt = ''
         DeleteConfirmVersion = ''
+        ColumnOrder = @()
     }
     if (-not (Test-Path -LiteralPath $script:SettingsPath)) { return $defaults }
     try {
@@ -693,6 +836,7 @@ function Load-Settings {
         if ($null -ne $json.shutdown) { $defaults.Shutdown = [bool]$json.shutdown }
         if ($json.updatePrompt) { $defaults.UpdatePrompt = [string]$json.updatePrompt }
         if ($json.deleteConfirmVersion) { $defaults.DeleteConfirmVersion = [string]$json.deleteConfirmVersion }
+        if ($json.columnOrder) { $defaults.ColumnOrder = @($json.columnOrder | ForEach-Object { [string]$_ }) }
     } catch {
     }
     return $defaults
@@ -714,6 +858,7 @@ function Save-Settings {
         shutdown = [bool]$script:ShutdownCheck.Checked
         updatePrompt = [string]$script:UpdatePrompt
         deleteConfirmVersion = [string]$script:DeleteConfirmVersion
+        columnOrder = @($script:ColumnOrder)
     }
     $json = $obj | ConvertTo-Json
     $utf8 = New-Object System.Text.UTF8Encoding $true
@@ -919,8 +1064,24 @@ function Get-RowText($tag, [int]$index) {
             }
             return ''
         }
+        9 { return [string]$tag.Status }
+        10 {
+            $saved = Get-SpaceSavedBytes $tag
+            if ($null -eq $saved) { return '' }
+            return (Format-ByteSize ([int64]$saved))
+        }
         default { return [string]$tag.Status }
     }
+}
+
+function Get-SpaceSavedBytes($tag) {
+    if ($null -eq $tag) { return $null }
+    if ($null -eq $tag.OldBytes -or [string]$tag.OldBytes -eq '') { return $null }
+    if ($null -eq $tag.SizeBytes -or [string]$tag.SizeBytes -eq '') { return $null }
+    $old = [int64]$tag.OldBytes
+    $new = [int64]$tag.SizeBytes
+    if ($old -le 0 -or $new -le 0 -or $old -le $new) { return $null }
+    return ($old - $new)
 }
 
 function Get-OverBands {
@@ -998,7 +1159,7 @@ function Update-ResultRow($item) {
     if ($null -eq $item) { return }
     $tag = $item.Tag
     $item.Text = Get-RowText $tag 0
-    for ($i = 1; $i -le 9; $i++) { $item.SubItems[$i].Text = Get-RowText $tag $i }
+    for ($i = 1; $i -le 10; $i++) { $item.SubItems[$i].Text = Get-RowText $tag $i }
     Update-OverCell $item
     Update-BudgetCell $item
     $tip = [string]$tag.Path
@@ -1011,13 +1172,14 @@ function Update-ResultRow($item) {
     $anchor = Get-RowBudgetAnchor $tag
     if ($anchor) { $tip = $tip + "`r`n" + 'Follows the ' + $anchor.Name + ' budget.' }
     if ($tag.EstimateRough) { $tip = $tip + "`r`n" + 'New size starts with ~ because the picture rate could not be read. That guess can run high.' }
+    if ($null -ne (Get-SpaceSavedBytes $tag)) { $tip = $tip + "`r`n" + 'Space saved is the original size minus the converted file.' }
     $item.ToolTipText = $tip
 }
 
 function Add-ResultRow($tag) {
     $item = New-Object Windows.Forms.ListViewItem (Get-RowText $tag 0)
     $item.UseItemStyleForSubItems = $false
-    for ($i = 1; $i -le 9; $i++) { [void]$item.SubItems.Add((Get-RowText $tag $i)) }
+    for ($i = 1; $i -le 10; $i++) { [void]$item.SubItems.Add((Get-RowText $tag $i)) }
     $item.Tag = $tag
     $item.Checked = ($tag.Status -eq 'Bloated' -or $tag.Status -eq 'Failed' -or $tag.Status -eq 'Ready to delete')
     [void]$script:Files.Items.Add($item)
@@ -1314,11 +1476,85 @@ function Get-RowSortKey($tag, [int]$Column) {
             if ($null -eq $tag.EstimateBytes -or [string]$tag.EstimateBytes -eq '') { return $null }
             return [double]$tag.EstimateBytes
         }
+        10 {
+            $saved = Get-SpaceSavedBytes $tag
+            if ($null -eq $saved) { return $null }
+            return [double]$saved
+        }
         default {
             if (-not $tag.Status) { return $null }
             return [string]$tag.Status
         }
     }
+}
+
+function Get-ColumnOrderNames {
+    if (-not $script:Files -or -not $script:ColumnTitles) { return @() }
+    if ($script:Files.Columns.Count -ne $script:ColumnTitles.Count) { return @() }
+    $order = New-Object string[] $script:Files.Columns.Count
+    for ($i = 0; $i -lt $script:Files.Columns.Count; $i++) {
+        $display = $script:Files.Columns[$i].DisplayIndex
+        if ($display -lt 0 -or $display -ge $order.Length) { return @() }
+        if ($order[$display]) { return @() }
+        $order[$display] = [string]$script:ColumnTitles[$i]
+    }
+    return @($order)
+}
+
+function Restore-ColumnOrder {
+    param([string[]]$Order)
+    if (-not $script:Files -or -not $script:ColumnTitles) { return $false }
+    $titles = @($script:ColumnTitles)
+    $wanted = @($Order | ForEach-Object { [string]$_ })
+    if ($wanted.Count -ne $titles.Count) { return $false }
+    $seen = @{}
+    foreach ($name in $wanted) {
+        if (-not $name -or $seen.ContainsKey($name)) { return $false }
+        $seen[$name] = $true
+    }
+    foreach ($title in $titles) {
+        if (-not $seen.ContainsKey([string]$title)) { return $false }
+    }
+    $changed = $false
+    for ($display = 0; $display -lt $wanted.Count; $display++) {
+        for ($i = 0; $i -lt $titles.Count; $i++) {
+            if ([string]$titles[$i] -eq [string]$wanted[$display]) {
+                if ($script:Files.Columns[$i].DisplayIndex -ne $display) {
+                    $script:Files.Columns[$i].DisplayIndex = $display
+                    $changed = $true
+                }
+                break
+            }
+        }
+    }
+    $script:ColumnOrder = @(Get-ColumnOrderNames)
+    if ($changed -and $script:Files) { $script:Files.Invalidate() }
+    return ($script:ColumnOrder.Count -eq $titles.Count)
+}
+
+function Get-ColumnHeaderCenter([int]$Index) {
+    $display = $script:Files.Columns[$Index].DisplayIndex
+    $x = 0
+    for ($d = 0; $d -lt $display; $d++) {
+        for ($i = 0; $i -lt $script:Files.Columns.Count; $i++) {
+            if ($script:Files.Columns[$i].DisplayIndex -eq $d) {
+                $x += $script:Files.Columns[$i].Width
+                break
+            }
+        }
+    }
+    return ($x + [int]($script:Files.Columns[$Index].Width / 2))
+}
+
+function Install-ColumnDrag {
+    if ($script:HeaderDrag) { return }
+    $script:HeaderDrag = New-Object VideoDehydrator.HeaderDrag($script:Files)
+    $script:HeaderDrag.Add_Reordered({
+        $script:SkipNextColumnClick = $true
+        $script:ColumnOrder = @(Get-ColumnOrderNames)
+        Save-Settings
+    })
+    $script:HeaderDrag.Attach()
 }
 
 function Update-SortHeaders {
@@ -1338,7 +1574,7 @@ function Sort-FileList([int]$Column) {
         $script:SortAscending = -not $script:SortAscending
     } else {
         $script:SortColumn = $Column
-        $script:SortAscending = ($Column -ne 6)
+        $script:SortAscending = ($Column -ne 6 -and $Column -ne 10)
     }
     $rows = @()
     foreach ($item in @($script:Files.Items)) {
@@ -2864,6 +3100,7 @@ function Start-UndoLast {
                 $item.Tag.Kept = ''
                 $item.Tag.PendingId = ''
                 if ($row.oldBytes) { $item.Tag.SizeBytes = [int64]$row.oldBytes }
+                $item.Tag.OldBytes = $null
                 $item.Tag.Reason = 'The original was put back and the new file was deleted.'
                 $item.Checked = $false
                 Update-ResultRow $item
@@ -3657,7 +3894,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Scanning'
-            Body = "Browse, or drop a folder onto the path, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows the bloated files, checked and ready to convert.`r`n`r`nSelect all checks every row. Deselect all clears every check. Clear removes the scanned files from the list. Files still waiting in .vd-originals stay. The folder list names each folder that has bloated files, and a show is listed along with the season folders inside it. Select folder checks only the bloated files in the folder you picked and clears the other checks, so Convert is that smaller job. Right-click a row for the same choices.`r`n`r`nGiB/h is the size of the whole file per hour of runtime. Budget is the line for that picture size. Over is how many times that budget the file uses. 2.0x is twice the line. Slight, shown in green, is under 1.5 times and barely over. Heavy, shown in yellow, is from 1.5 times up to 3 times. Extreme, shown in red, is 3 times the budget or more. Click a heading to sort. The first click on Over puts the worst files first.`r`n`r`nThe list beside Select folder offers Slight, Heavy, and Extreme. Select slight, Select heavy, or Select extreme checks only that group and clears the other checks, so Convert is that group. Right-click a row for the same choice.`r`n`r`nTarget is the video rate the new file will use. New size is a rough guess of the new file. When the current picture rate can be read, the guess keeps the audio and other tracks. When that rate is missing, the guess uses the target picture rate for the length of the video, so it can run a little high. That New size starts with a tilde. Estimated savings is the current size minus New size, added up for the checked files. It changes as those checks change. A file with no New size figure is left out of the total."
+            Body = "Browse, or drop a folder onto the path, then click Scan. Include subfolders looks inside every folder within the one you chose. The list shows the bloated files, checked and ready to convert.`r`n`r`nSelect all checks every row. Deselect all clears every check. Clear removes the scanned files from the list. Files still waiting in .vd-originals stay. The folder list names each folder that has bloated files, and a show is listed along with the season folders inside it. Select folder checks only the bloated files in the folder you picked and clears the other checks, so Convert is that smaller job. Right-click a row for the same choices.`r`n`r`nGiB/h is the size of the whole file per hour of runtime. Budget is the line for that picture size. Over is how many times that budget the file uses. 2.0x is twice the line. Slight, shown in green, is under 1.5 times and barely over. Heavy, shown in yellow, is from 1.5 times up to 3 times. Extreme, shown in red, is 3 times the budget or more. Click a heading to sort. The first click on Over puts the worst files first. Drag a heading sideways to move that column. The order is remembered, and an update can put the columns back.`r`n`r`nThe list beside Select folder offers Slight, Heavy, and Extreme. Select slight, Select heavy, or Select extreme checks only that group and clears the other checks, so Convert is that group. Right-click a row for the same choice.`r`n`r`nTarget is the video rate the new file will use. New size is a rough guess of the new file. When the current picture rate can be read, the guess keeps the audio and other tracks. When that rate is missing, the guess uses the target picture rate for the length of the video, so it can run a little high. That New size starts with a tilde. Estimated savings is the current size minus New size, added up for the checked files. It changes as those checks change. A file with no New size figure is left out of the total. Space Saved is the original file size minus the converted file. It fills in when a convert finishes and stays blank before that."
         },
         @{
             Title = 'Converting'
@@ -4122,6 +4359,7 @@ $script:Files.Dock = 'Fill'
 $script:Files.View = 'Details'
 $script:Files.FullRowSelect = $true
 $script:Files.CheckBoxes = $true
+$script:Files.AllowColumnReorder = $false
 $script:Files.GridLines = $false
 $script:Files.HideSelection = $false
 $script:Files.MultiSelect = $false
@@ -4131,7 +4369,7 @@ $script:Files.ForeColor = $script:ColorInk
 $script:Files.BorderStyle = 'FixedSingle'
 $script:Files.ShowItemToolTips = $true
 $script:Files.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 4)
-$script:ColumnTitles = @('File', 'Dimensions', 'Length', 'Size', 'GiB/h', 'Budget', 'Over', 'Target', 'New size', 'Status')
+$script:ColumnTitles = @('File', 'Dimensions', 'Length', 'Size', 'GiB/h', 'Budget', 'Over', 'Target', 'New size', 'Status', 'Space Saved')
 $script:SortColumn = -1
 $script:SortAscending = $true
 [void]$script:Files.Columns.Add('File', 280)
@@ -4144,7 +4382,14 @@ $script:SortAscending = $true
 [void]$script:Files.Columns.Add('Target', 100)
 [void]$script:Files.Columns.Add('New size', 110)
 [void]$script:Files.Columns.Add('Status', 150)
-$script:Files.Add_ColumnClick({ Sort-FileList $_.Column })
+[void]$script:Files.Columns.Add('Space Saved', 120)
+$script:Files.Add_ColumnClick({
+    if ($script:SkipNextColumnClick) {
+        $script:SkipNextColumnClick = $false
+        return
+    }
+    Sort-FileList $_.Column
+})
 $script:Files.Add_ItemChecked({ if (-not $script:BulkCheck) { Update-Buttons } })
 $script:Files.Add_SelectedIndexChanged({ Update-Buttons })
 $script:FileMenu = New-Object Windows.Forms.ContextMenuStrip
@@ -4388,13 +4633,18 @@ Set-Tip $script:SelectOverButton 'Check the files in the group shown here, and c
 Set-Tip $script:SelectAllButton 'Check every row.'
 Set-Tip $script:SelectNoneButton 'Clear every check.'
 Set-Tip $script:ClearButton 'Remove the scanned files from the list. Files still waiting in .vd-originals stay.'
-Set-Tip $script:Files 'Bloated videos are checked. Over shows how many times the budget each file uses. Click a heading to sort. Right-click a row to select that folder or that overage. Double-click a file that is ready to delete to compare it.'
+Set-Tip $script:Files 'Bloated videos are checked. Over shows how many times the budget each file uses. Space Saved is the original size minus the converted file, filled in after a convert finishes. Click a heading to sort. Drag a heading sideways to move that column. The order is remembered. Right-click a row to select that folder or that overage. Double-click a file that is ready to delete to compare it.'
 Set-Tip $script:Log 'Saved space, skipped videos, and problems are listed here.'
 Set-Tip $script:ProgressTrack 'How far the current file has been encoded.'
 Set-Tip $script:StatusLabel 'What the program is doing right now.'
 Set-Tip $script:VersionLabel 'This copy of Video Dehydrator.'
 
 if ($settings.Folder) { Set-FolderText $settings.Folder }
+[void]$script:Files.Handle
+if (-not (Restore-ColumnOrder @($settings.ColumnOrder))) {
+    $script:ColumnOrder = @($script:ColumnTitles)
+}
+Install-ColumnDrag
 $script:Loading = $false
 
 $script:Form.Add_KeyDown({
@@ -4439,6 +4689,7 @@ $script:FolderCard.Add_Resize({ Layout-Folder })
 $script:ListHeader.Add_Resize({ Layout-ListHeader })
 $script:Files.Add_Resize({ Layout-FileColumns })
 $script:Form.Add_Shown({
+    if ($script:HeaderDrag) { $script:HeaderDrag.Attach() }
     Update-ChromeLayout
     if (-not $script:SmokeTest) {
         try {
@@ -4572,6 +4823,13 @@ function Invoke-OverCheck {
     Assert-True ($extreme.SubItems[6].Text -eq '5.0x') ("Extreme over was $($extreme.SubItems[6].Text)")
     Assert-True ($script:Files.Columns[1].Text -eq 'Dimensions') 'Dimensions heading was missing'
     Assert-True ($script:Files.Columns[8].Text -eq 'New size') 'New size heading was missing'
+    Assert-True ($script:Files.Columns[10].Text -eq 'Space Saved') 'Space Saved heading was missing'
+    Assert-True ([string]$slight.SubItems[10].Text -eq '') 'An unconverted file showed space saved'
+    $done.Tag.OldBytes = 100000000
+    $done.Tag.SizeBytes = 20000000
+    Update-ResultRow $done
+    Assert-True ($done.SubItems[10].Text -eq (Format-ByteSize 80000000)) ("Space saved was $($done.SubItems[10].Text)")
+    Assert-True ($done.SubItems[9].Text -eq 'Ready to delete') 'Status moved out of its column'
     Assert-True ($slight.SubItems[1].BackColor.ToArgb() -eq (Get-BudgetMark '1080').Back.ToArgb()) '1080p file did not match its budget color'
     Assert-True ($script:BudgetBoxes[1].BackColor.ToArgb() -eq (Get-BudgetMark '1080').Back.ToArgb()) '1080p budget did not use its color'
     Assert-True ($script:BudgetSwatches[0].BackColor.ToArgb() -eq (Get-BudgetMark '2160').Mark.ToArgb()) '2160p mark was missing'
@@ -4809,6 +5067,67 @@ function Invoke-ClearCheck {
     Update-Buttons
 }
 
+function Invoke-ColumnOrderCheck {
+    $saved = @(Get-ColumnOrderNames)
+    $kept = Restore-ColumnOrder @('Space Saved', 'Status', 'File', 'Dimensions', 'Length', 'Size', 'GiB/h', 'Budget', 'Over', 'Target', 'New size')
+    Assert-True $kept 'A full column order was rejected'
+    Assert-True ($script:Files.Columns[10].DisplayIndex -eq 0) 'Space Saved did not move to the front'
+    Assert-True ($script:Files.Columns[0].DisplayIndex -eq 2) 'File did not move with the saved order'
+    Assert-True ((Get-ColumnOrderNames)[0] -eq 'Space Saved') 'The remembered order did not start with Space Saved'
+    $before = @(Get-ColumnOrderNames) -join '|'
+    Assert-True (-not (Restore-ColumnOrder @('File', 'Missing'))) 'An unknown column order was kept'
+    Assert-True (-not (Restore-ColumnOrder @('File'))) 'A short column order was kept'
+    Assert-True ((@(Get-ColumnOrderNames) -join '|') -eq $before) 'A bad order changed the columns'
+    [void](Restore-ColumnOrder @($script:ColumnTitles))
+    Update-ChromeLayout
+    [Windows.Forms.Application]::DoEvents()
+    $script:SortColumn = -1
+    Update-SortHeaders
+    if ($script:HeaderDrag) { $script:HeaderDrag.Attach() }
+    $script:Files.Items.Clear()
+    Add-OverFile 'C:\Library\column-move.mkv' 2.4 2 'Bloated'
+    $row = $script:Files.Items[0]
+    $row.Checked = $true
+    $row.Selected = $true
+    $row.SubItems[3].BackColor = [Drawing.Color]::FromArgb(255, 128, 0)
+    $color = $row.SubItems[3].BackColor.ToArgb()
+    $sizeText = [string]$row.SubItems[3].Text
+    [Windows.Forms.Application]::DoEvents()
+    Assert-True (-not $script:HeaderDrag.RowsNeedPaint()) 'The file list was already waiting to paint'
+    $fileX = Get-ColumnHeaderCenter 0
+    $dimX = Get-ColumnHeaderCenter 1
+    $script:HeaderDrag.InjectMouse(0x0201, $fileX, 10)
+    $script:HeaderDrag.InjectMouse(0x0200, [int](($fileX + $dimX) / 2), 10)
+    $script:HeaderDrag.InjectMouse(0x0202, $dimX, 10)
+    Assert-True ($script:SortColumn -eq -1) 'Dragging a heading also sorted'
+    Assert-True ($script:HeaderDrag.RowsNeedPaint()) 'Moving a heading left the current rows unpainted'
+    [Windows.Forms.Application]::DoEvents()
+    Assert-True ($script:Files.Columns[0].DisplayIndex -eq 1) ("Dragging File left it at display $($script:Files.Columns[0].DisplayIndex) fileX=$fileX dimX=$dimX listW=$($script:Files.ClientSize.Width) fileW=$($script:Files.Columns[0].Width)")
+    Assert-True ($script:Files.Items.Count -eq 1) 'The row disappeared while a heading moved'
+    $row = $script:Files.Items[0]
+    Assert-True $row.Checked 'The checkbox cleared while a heading moved'
+    Assert-True $row.Selected 'The selection cleared while a heading moved'
+    Assert-True ($row.SubItems[3].BackColor.ToArgb() -eq $color) 'A cell color cleared while a heading moved'
+    Assert-True ([string]$row.SubItems[3].Text -eq $sizeText) 'A cell value changed while a heading moved'
+    for ($i = 0; $i -lt $script:Files.Columns.Count; $i++) {
+        $header = $script:HeaderDrag.HeaderLeft($i)
+        $cell = $script:HeaderDrag.CellLeft($i)
+        $gap = [math]::Abs($cell - $header)
+        Assert-True ($gap -le 30) ("Column $i ($($script:ColumnTitles[$i])) cell was $gap px from its heading (header $header cell $cell)")
+    }
+    $dimX = Get-ColumnHeaderCenter 1
+    $script:HeaderDrag.InjectMouse(0x0201, $dimX, 10)
+    $script:HeaderDrag.InjectMouse(0x0202, $dimX, 10)
+    Assert-True ($script:SortColumn -eq 1) ("Clicking Dimensions sorted column $($script:SortColumn)")
+    [void](Restore-ColumnOrder $saved)
+    $script:Files.Items.Clear()
+    $script:SortColumn = -1
+    Update-SortHeaders
+    $script:ColumnOrder = @($saved)
+    Update-OverChoices
+    Update-Buttons
+}
+
 function Invoke-SmokeTest {
     $missing = @(Get-MissingTools)
     Assert-True ($missing.Count -eq 0) ("Missing tools: " + ($missing -join ', '))
@@ -4822,6 +5141,7 @@ function Invoke-SmokeTest {
     [Windows.Forms.Application]::DoEvents()
     Invoke-FolderSelectCheck
     Invoke-OverCheck
+    Invoke-ColumnOrderCheck
     Invoke-BudgetCheck
     Invoke-ClearCheck
     Save-FormImage $script:Form (Join-Path $env:TEMP 'vdh-main.png')
@@ -4834,6 +5154,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:HelpBox.Text -match 'Select folder') 'The guide was missing folder selection'
     Assert-True ($script:HelpBox.Text -match 'Slight' -and $script:HelpBox.Text -match 'Extreme') 'The guide was missing overage groups'
     Assert-True ($script:HelpBox.Text -match 'Estimated savings') 'The guide was missing the savings total'
+    Assert-True ($script:HelpBox.Text -match 'Drag a heading sideways') 'The guide was missing column dragging'
     Assert-True ($script:HelpBox.Text -match 'starts on Recommended') 'The guide was missing the budget choices'
     Assert-True ($script:HelpBox.Text -match 'one-minute countdown') 'The guide was missing shutdown'
     Assert-True ($script:HelpBox.Text -match 'Undo puts back the last conversion') 'The guide was missing undo'
@@ -4891,7 +5212,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.6') 'Version file was not 1.0.6'
+    Assert-True ((Get-AppVersion) -eq '1.0.6.1') 'Version file was not 1.0.6.1'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -4902,7 +5223,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.0\.6') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.0\.6\.1') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'
@@ -4972,8 +5293,8 @@ function Invoke-SmokeTest {
     Assert-True ((Compare-AppVersion '1.0.4.1' '1.0.4') -eq 1) 'A fourth version number was ignored'
     Assert-True ((Compare-AppVersion '1.0.4' '1.0.4.0') -eq 0) 'A missing fourth number did not match zero'
     $sameOffer = Get-UpdateOffer ([pscustomobject]@{
-        tag_name = 'v1.0.6'
-        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.6/video_dehydrator.exe'; size = 12 })
+        tag_name = 'v1.0.6.1'
+        assets = @([pscustomobject]@{ name = 'video_dehydrator.exe'; browser_download_url = 'https://github.com/philipvern-dot/video-dehydrator/releases/download/v1.0.6.1/video_dehydrator.exe'; size = 12 })
     })
     Assert-True (-not $sameOffer.Newer) 'The current version was offered as an update'
     $bareOffer = Get-UpdateOffer ([pscustomobject]@{ tag_name = 'v9.9.9'; assets = @() })

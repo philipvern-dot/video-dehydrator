@@ -1,6 +1,6 @@
 # Video Dehydrator
 
-Version 1.0.6
+Version 1.0.6.1
 
 A Windows program that finds videos that are too big for their picture size, encodes a smaller copy, and puts that copy where the original was.
 
@@ -9,6 +9,12 @@ Double-click **Video Dehydrator** in this folder. If that shortcut does nothing,
 Choose a folder and click Scan. Checked rows are the ones Convert will shrink. Estimated savings uses the New size column. If the picture rate is missing, New size starts with ~ and uses the target rate times the length. Over shows how many times the budget a file uses. Slight, Heavy, and Extreme can be checked as one group. The original is kept in `.vd-originals` until you delete it. Compare plays the new file. Undo puts the last conversion back.
 
 The bottom right corner shows this copy's version. The program checks for updates when it opens. Check for updates looks again. When a newer version is found, a window tells you once. After you close it, it stays closed until a later version is published. The status line keeps saying that version is available. Update downloads that version and opens the setup program. The setup replaces the installed copy and keeps your settings. Donate opens a tip page. The program stays free. Report a bug opens a GitHub page with this version and the Windows version filled in. Include latest activity is optional. Leave it unchecked and nothing else is added.
+
+## What's new in 1.0.6.1
+
+Space Saved shows the original file size minus the converted file. It fills in when a convert finishes.
+
+Drag a heading sideways to move that column. The rows move with it. The order is remembered. An update can put the columns back. A click still sorts, and the edge of a heading still changes its width.
 
 ## What's new in 1.0.6
 
