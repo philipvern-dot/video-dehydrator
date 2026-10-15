@@ -13,5 +13,18 @@ tools/*.exe
 # Uploaded separately as a GitHub Release
 video_dehydrator.exe
 
+# Linux install state and downloaded tools
+linux/app/settings.json
+linux/app/pending.json
+linux/app/skipped.json
+linux/app/convert-log.tsv
+linux/tools/ffmpeg
+linux/tools/ffprobe
+linux/tools/ffplay
+linux/tools/HandBrakeCLI
+linux/tools/FFmpeg-LICENSE.txt
+**/__pycache__/
+*.pyc
+
 Thumbs.db
 desktop.ini

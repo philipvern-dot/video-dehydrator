@@ -1,6 +1,6 @@
 # Video Dehydrator
 
-Version 1.0.5.1
+Version 1.0.6
 
 A Windows program that finds videos that are too big for their picture size, encodes a smaller copy, and puts that copy where the original was.
 
@@ -9,6 +9,12 @@ Double-click **Video Dehydrator** in this folder. If that shortcut does nothing,
 Choose a folder and click Scan. Checked rows are the ones Convert will shrink. Estimated savings uses the New size column. If the picture rate is missing, New size starts with ~ and uses the target rate times the length. Over shows how many times the budget a file uses. Slight, Heavy, and Extreme can be checked as one group. The original is kept in `.vd-originals` until you delete it. Compare plays the new file. Undo puts the last conversion back.
 
 The bottom right corner shows this copy's version. The program checks for updates when it opens. Check for updates looks again. When a newer version is found, a window tells you once. After you close it, it stays closed until a later version is published. The status line keeps saying that version is available. Update downloads that version and opens the setup program. The setup replaces the installed copy and keeps your settings. Donate opens a tip page. The program stays free. Report a bug opens a GitHub page with this version and the Windows version filled in. Include latest activity is optional. Leave it unchecked and nothing else is added.
+
+## What's new in 1.0.6
+
+Delete originals, and automatic delete, also remove the matching copy from a drive's `#recycle` folder when the path and the size match. The `.plexignore` from that convert is removed when it only hides the holding folder. Empty folders left by that delete are removed when nothing else is in them. The recycle folder itself stays. If that cleanup cannot finish, a window lists the problem and opens the manual steps in How this works.
+
+Delete originals asks before it deletes. Don't show this in the future hides that question until the next version.
 
 ## What's new in 1.0.5.1
 

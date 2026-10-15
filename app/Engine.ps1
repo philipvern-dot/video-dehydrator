@@ -833,7 +833,11 @@ function Remove-PlexIgnore {
             if ($line.Trim() -ne '') { $meaningful++ }
         }
         if ($meaningful -eq 0) {
+            $length = [int64](Get-Item -LiteralPath $path -Force).Length
             Remove-Item -LiteralPath $path -Force
+            if (-not (Test-Path -LiteralPath $path)) {
+                try { [void](Remove-RecycledPlexIgnore -Path $path -Length $length) } catch { }
+            }
             return
         }
         if ($removed -eq 0) { return }
@@ -843,6 +847,748 @@ function Remove-PlexIgnore {
         [IO.File]::WriteAllText($path, (($kept.ToArray() -join "`r`n") + "`r`n"))
     }
     catch { }
+}
+
+# A shared drive can park a deleted file in a #recycle folder at the share
+# root. The purge below removes one of those copies, and only when every
+# gate passes: the path is \\server\share\#recycle\ plus the original path,
+# the parent folder is named .vd-originals, the size matches the file just
+# deleted, and the item is a normal file. Empty folders are removed on the
+# way back up and the walk stops at #recycle. AllowLocal exists so the
+# self-test can point at a temp folder. Production plans keep it false,
+# which refuses a drive-letter share root.
+$script:RecycleFolderName = '#recycle'
+$script:RecycleResults = New-Object System.Collections.ArrayList
+
+function New-RecycleResult {
+    param(
+        [string]$Status,
+        [string]$Path,
+        [string]$RecycleFile,
+        [string]$Message,
+        [string]$Name
+    )
+    return [pscustomobject]@{
+        Status      = $Status
+        Path        = $Path
+        RecycleFile = $RecycleFile
+        Message     = $Message
+        Name        = $Name
+        Reported    = $false
+        Shown       = $false
+    }
+}
+
+function Add-RecycleResult($Result) {
+    if (-not $script:RecycleResults) {
+        $script:RecycleResults = New-Object System.Collections.ArrayList
+    }
+    [void]$script:RecycleResults.Add($Result)
+    return $Result
+}
+
+function Clear-RecycleResults {
+    if ($script:RecycleResults) { $script:RecycleResults.Clear() }
+    $script:RecycleLogOnce = @{}
+}
+
+function Get-PlainPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $raw = $Path.Trim().Replace('/', '\')
+    if ($raw.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $raw.Substring(8)
+    }
+    if ($raw.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $raw.Substring(4)
+    }
+    return $raw
+}
+
+function Test-PlainSegments([string]$Path) {
+    foreach ($part in @($Path.Split('\'))) {
+        if ($part -eq '.' -or $part -eq '..') { return $false }
+    }
+    return $true
+}
+
+function ConvertTo-NormalPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    try { return [IO.Path]::GetFullPath($Path) } catch { return '' }
+}
+
+function Get-MappedUncRoot {
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        $DriveMap
+    )
+    $letter = $DriveLetter.Substring(0, 1).ToUpperInvariant()
+    if ($null -ne $DriveMap) {
+        if ($DriveMap.Contains($letter)) {
+            $mapped = [string]$DriveMap[$letter]
+            if ([string]::IsNullOrWhiteSpace($mapped)) { return $null }
+            return $mapped.TrimEnd('\')
+        }
+        return $null
+    }
+    try {
+        $info = New-Object System.IO.DriveInfo ($letter + ':')
+        if ($info.DriveType -ne [IO.DriveType]::Network) { return $null }
+    }
+    catch { return $null }
+    $root = ''
+    try {
+        $drive = Get-PSDrive -Name $letter -PSProvider FileSystem -ErrorAction Stop
+        $root = [string]$drive.DisplayRoot
+    }
+    catch { }
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        try {
+            $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='" + $letter + ":'") -ErrorAction Stop
+            $root = [string]$disk.ProviderName
+        }
+        catch { }
+    }
+    if ([string]::IsNullOrWhiteSpace($root)) { return $null }
+    if (-not $root.StartsWith('\\')) { return $null }
+    return $root.TrimEnd('\')
+}
+
+function Split-UncLocation([string]$Unc) {
+    if ([string]::IsNullOrWhiteSpace($Unc)) { return $null }
+    $body = $Unc.TrimEnd('\')
+    if ($body -notmatch '^\\\\([^\\]+)\\([^\\]+)\\(.+)$') { return $null }
+    $server = $Matches[1]
+    $share = $Matches[2]
+    if ($server -eq '.' -or $server -eq '..' -or $share -eq '.' -or $share -eq '..') { return $null }
+    $relativeParts = @($Matches[3].Split('\') | Where-Object { $_ -ne '' })
+    if ($relativeParts.Count -lt 1) { return $null }
+    foreach ($part in $relativeParts) {
+        if ($part -eq '.' -or $part -eq '..') { return $null }
+        if ($part.IndexOfAny([char[]]@('/', ':', '*', '?', '"', '<', '>', '|')) -ge 0) { return $null }
+    }
+    $relative = $relativeParts -join '\'
+    $shareRoot = '\\' + $server + '\' + $share
+    return [pscustomobject]@{
+        UncFile   = ($shareRoot + '\' + $relative)
+        ShareRoot = $shareRoot
+        Relative  = $relative
+        Parts     = $relativeParts
+    }
+}
+
+function Get-ShareLocation {
+    param([string]$Path, $DriveMap)
+    $plain = Get-PlainPath $Path
+    if (-not $plain) { return $null }
+    if (-not (Test-PlainSegments $plain)) { return $null }
+    if ($plain -match '^[A-Za-z]:\\') {
+        $root = Get-MappedUncRoot -DriveLetter $plain.Substring(0, 1) -DriveMap $DriveMap
+        if (-not $root) { return $null }
+        if (-not (Test-PlainSegments $root)) { return $null }
+        $rest = $plain.Substring(2).TrimStart('\')
+        $plain = $root.TrimEnd('\') + '\' + $rest
+        if (-not (Test-PlainSegments $plain)) { return $null }
+    }
+    elseif (-not $plain.StartsWith('\\')) {
+        return $null
+    }
+    $loc = Split-UncLocation $plain
+    if (-not $loc) { return $null }
+    if ($null -ne $DriveMap) { return $loc }
+    $normal = ConvertTo-NormalPath $loc.UncFile
+    if (-not $normal) { return $loc }
+    $again = Split-UncLocation $normal
+    if (-not $again) { return $null }
+    if (-not [string]::Equals($again.ShareRoot, $loc.ShareRoot, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    return $again
+}
+
+function Test-RecycleSegment([string]$Part) {
+    if ($Part.Equals('#recycle', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if ($Part.Equals('@Recycle', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    return $false
+}
+
+function Get-RecyclePlan {
+    param([string]$Path, $DriveMap)
+    $loc = Get-ShareLocation -Path $Path -DriveMap $DriveMap
+    if (-not $loc) { return $null }
+    $parts = @($loc.Parts)
+    if ($parts.Count -lt 2) { return $null }
+    $leaf = [string]$parts[$parts.Count - 1]
+    $parent = [string]$parts[$parts.Count - 2]
+    if (-not $parent.Equals('.vd-originals', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    if ($leaf.Equals('.vd-originals', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    foreach ($part in $parts) {
+        if (Test-RecycleSegment $part) { return $null }
+    }
+    $recycleRoot = $loc.ShareRoot + '\' + $script:RecycleFolderName
+    return [pscustomobject]@{
+        SourcePath  = $Path
+        ShareRoot   = $loc.ShareRoot
+        Relative    = $loc.Relative
+        RecycleRoot = $recycleRoot
+        RecycleFile = ($recycleRoot + '\' + $loc.Relative)
+        Name        = $leaf
+        AllowLocal  = $false
+        DriveMap    = $DriveMap
+    }
+}
+
+function Get-RecycleDirectoryPlan {
+    param([string]$Directory, $DriveMap)
+    $loc = Get-ShareLocation -Path $Directory -DriveMap $DriveMap
+    if (-not $loc) { return $null }
+    $parts = @($loc.Parts)
+    if ($parts.Count -lt 1) { return $null }
+    $leaf = [string]$parts[$parts.Count - 1]
+    if (-not $leaf.Equals('.vd-originals', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    foreach ($part in $parts) {
+        if (Test-RecycleSegment $part) { return $null }
+    }
+    $recycleRoot = $loc.ShareRoot + '\' + $script:RecycleFolderName
+    return [pscustomobject]@{
+        SourcePath  = $Directory
+        ShareRoot   = $loc.ShareRoot
+        Relative    = $loc.Relative
+        RecycleRoot = $recycleRoot
+        RecycleFile = ($recycleRoot + '\' + $loc.Relative)
+        Name        = $leaf
+        AllowLocal  = $false
+        DriveMap    = $DriveMap
+    }
+}
+
+function Test-SamePath([string]$Left, [string]$Right) {
+    $a = ConvertTo-NormalPath $Left
+    $b = ConvertTo-NormalPath $Right
+    if (-not $a -or -not $b) { return $false }
+    return [string]::Equals($a.TrimEnd('\'), $b.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-PathUnderRoot([string]$Path, [string]$Root) {
+    $pathFull = (ConvertTo-NormalPath $Path)
+    $rootFull = (ConvertTo-NormalPath $Root)
+    if (-not $pathFull -or -not $rootFull) { return $false }
+    $pathFull = $pathFull.TrimEnd('\')
+    $rootFull = $rootFull.TrimEnd('\')
+    if ([string]::Equals($pathFull, $rootFull, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    return $pathFull.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-PathBelowRoot([string]$Path, [string]$Root) {
+    $pathFull = ConvertTo-NormalPath $Path
+    $rootFull = ConvertTo-NormalPath $Root
+    if (-not $pathFull -or -not $rootFull) { return $null }
+    $pathFull = $pathFull.TrimEnd('\')
+    $rootFull = $rootFull.TrimEnd('\')
+    if ([string]::Equals($pathFull, $rootFull, [StringComparison]::OrdinalIgnoreCase)) { return '' }
+    $prefix = $rootFull + '\'
+    if (-not $pathFull.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    return $pathFull.Substring($prefix.Length)
+}
+
+function Test-RecycleNotFound($ErrorRecord) {
+    $ex = $null
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ex = $ErrorRecord.Exception }
+    elseif ($ErrorRecord -is [Exception]) { $ex = $ErrorRecord }
+    while ($ex) {
+        if ($ex -is [System.Management.Automation.ItemNotFoundException]) { return $true }
+        if ($ex -is [System.IO.DirectoryNotFoundException]) { return $true }
+        if ($ex -is [System.IO.FileNotFoundException]) { return $true }
+        $io = $ex -as [System.IO.IOException]
+        if ($io) {
+            $code = $io.HResult -band 0xFFFF
+            if ($code -eq 2 -or $code -eq 3) { return $true }
+        }
+        $ex = $ex.InnerException
+    }
+    return $false
+}
+
+function Test-RecycleAccessDenied($ErrorRecord) {
+    $ex = $null
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ex = $ErrorRecord.Exception }
+    elseif ($ErrorRecord -is [Exception]) { $ex = $ErrorRecord }
+    while ($ex) {
+        if ($ex -is [UnauthorizedAccessException]) { return $true }
+        if ($ex -is [System.Security.SecurityException]) { return $true }
+        $io = $ex -as [System.IO.IOException]
+        if ($io) {
+            $code = $io.HResult -band 0xFFFF
+            if ($code -eq 5 -or $code -eq 32 -or $code -eq 33) { return $true }
+        }
+        $ex = $ex.InnerException
+    }
+    return $false
+}
+
+function Test-ReparsePoint($Item) {
+    if (-not $Item) { return $false }
+    return (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function New-RecycleRefusal {
+    param($Plan, [string]$Message)
+    $name = ''
+    $source = ''
+    $recycleFile = ''
+    if ($Plan) {
+        $name = [string]$Plan.Name
+        $source = [string]$Plan.SourcePath
+        $recycleFile = [string]$Plan.RecycleFile
+    }
+    if (-not $Message) { $Message = 'The recycle path did not pass the safety check. Nothing was deleted.' }
+    return (New-RecycleResult 'skipped' $source $recycleFile $Message $name)
+}
+
+function Test-RecycleFilePlan($Plan) {
+    if (-not $Plan) { return (New-RecycleRefusal $null '') }
+    $relative = [string]$Plan.Relative
+    $parts = @($relative.Split('\') | Where-Object { $_ -ne '' })
+    if ($parts.Count -lt 2) { return (New-RecycleRefusal $Plan '') }
+    $leaf = [string]$parts[$parts.Count - 1]
+    $parent = [string]$parts[$parts.Count - 2]
+    if (-not $parent.Equals('.vd-originals', [StringComparison]::OrdinalIgnoreCase)) { return (New-RecycleRefusal $Plan '') }
+    if (-not $leaf.Equals([string]$Plan.Name, [StringComparison]::OrdinalIgnoreCase)) { return (New-RecycleRefusal $Plan '') }
+    foreach ($part in $parts) {
+        if ($part -eq '.' -or $part -eq '..') { return (New-RecycleRefusal $Plan '') }
+        if (Test-RecycleSegment $part) { return (New-RecycleRefusal $Plan '') }
+        if ($part.IndexOfAny([char[]]@('/', ':', '*', '?', '"', '<', '>', '|')) -ge 0) { return (New-RecycleRefusal $Plan '') }
+    }
+    $share = ConvertTo-NormalPath ([string]$Plan.ShareRoot)
+    if (-not $share) { return (New-RecycleRefusal $Plan '') }
+    $share = $share.TrimEnd('\')
+    $isUnc = $share.StartsWith('\\')
+    if (-not $isUnc -and -not [bool]$Plan.AllowLocal) { return (New-RecycleRefusal $Plan '') }
+    if ($isUnc -and $share -notmatch '^\\\\[^\\]+\\[^\\]+$') { return (New-RecycleRefusal $Plan '') }
+    $rootExpected = $share + '\' + $script:RecycleFolderName
+    $fileExpected = $rootExpected + '\' + ($parts -join '\')
+    if (-not (Test-SamePath ([string]$Plan.RecycleRoot) $rootExpected)) { return (New-RecycleRefusal $Plan '') }
+    if (-not (Test-SamePath ([string]$Plan.RecycleFile) $fileExpected)) { return (New-RecycleRefusal $Plan '') }
+    if (-not (Test-PathUnderRoot $fileExpected $rootExpected)) { return (New-RecycleRefusal $Plan '') }
+    return $null
+}
+
+function Get-UnderRecycleRelative($Plan, [string]$Path) {
+    if ([bool]$Plan.AllowLocal) { return (Get-PathBelowRoot $Path ([string]$Plan.RecycleRoot)) }
+    $loc = Get-ShareLocation -Path $Path -DriveMap $Plan.DriveMap
+    if (-not $loc) { return $null }
+    if (-not [string]::Equals($loc.ShareRoot, [string]$Plan.ShareRoot, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    if ($loc.Relative.Equals($script:RecycleFolderName, [StringComparison]::OrdinalIgnoreCase)) { return '' }
+    $prefix = $script:RecycleFolderName + '\'
+    if (-not $loc.Relative.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    return $loc.Relative.Substring($prefix.Length)
+}
+
+function Test-RecycleFileItem($Item, $Plan, [int64]$Length) {
+    $source = [string]$Plan.SourcePath
+    $recycleFile = [string]$Plan.RecycleFile
+    $name = [string]$Plan.Name
+    if (Test-ReparsePoint $Item) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("A link is at $recycleFile. It was left in place.") $name)
+    }
+    if ($Item.PSIsContainer) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("A folder is at $recycleFile. It was left in place.") $name)
+    }
+    $itemName = [string]$Item.Name
+    if (-not $itemName.Equals($name, [StringComparison]::OrdinalIgnoreCase)) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("The file at $recycleFile is named $itemName. It was left in place.") $name)
+    }
+    $parentName = [IO.Path]::GetFileName($Item.DirectoryName)
+    if (-not $parentName.Equals('.vd-originals', [StringComparison]::OrdinalIgnoreCase)) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("The file at $recycleFile is outside .vd-originals. It was left in place.") $name)
+    }
+    $relative = Get-UnderRecycleRelative $Plan ([string]$Item.FullName)
+    if (-not $relative -or -not $relative.Equals([string]$Plan.Relative, [StringComparison]::OrdinalIgnoreCase)) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("The file at $recycleFile resolved to a different path. It was left in place.") $name)
+    }
+    $size = [int64]$Item.Length
+    if ($size -ne $Length) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("A file at $recycleFile does not match the size of $name. It was left in place.") $name)
+    }
+    return $null
+}
+
+function Test-StaleRecycleChild($Children, [string]$RemovedName) {
+    if ([string]::IsNullOrWhiteSpace($RemovedName)) { return $false }
+    $list = @($Children)
+    if ($list.Count -ne 1) { return $false }
+    $only = ''
+    try { $only = [string]$list[0].Name } catch { return $false }
+    if ([string]::IsNullOrWhiteSpace($only)) { return $false }
+    return $only.Equals($RemovedName, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-RecycleDirectoryEmpty {
+    param(
+        [string]$Directory,
+        [string]$RemovedChild
+    )
+    try { $children = @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop) } catch { return $null }
+    if ($children.Count -eq 0) { return $true }
+    if (-not (Test-StaleRecycleChild $children $RemovedChild)) { return $false }
+    $stale = Join-Path $Directory $RemovedChild
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        Start-Sleep -Milliseconds 150
+        try { $children = @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop) } catch { return $null }
+        if ($children.Count -eq 0) { return $true }
+        if (-not (Test-StaleRecycleChild $children $RemovedChild)) { return $false }
+    }
+    if (Test-Path -LiteralPath $stale) { return $false }
+    return $true
+}
+
+function Remove-VerifiedEmptyRecycleDirectory {
+    param(
+        [string]$Path,
+        [string]$RemovedChild
+    )
+    for ($attempt = 0; $attempt -lt 4; $attempt++) {
+        $empty = Test-RecycleDirectoryEmpty -Directory $Path -RemovedChild $RemovedChild
+        if ($null -eq $empty -or -not $empty) { return $false }
+        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { }
+        if (-not (Test-Path -LiteralPath $Path)) { return $true }
+        if ($attempt -ge 3) { return $false }
+        Start-Sleep -Milliseconds 150
+    }
+    return $false
+}
+
+function Remove-EmptyRecycleDirectories {
+    param(
+        $Plan,
+        [string]$StartDirectory,
+        [string]$ExpectedRelative
+    )
+    if (-not $Plan -or -not $StartDirectory -or -not $ExpectedRelative) { return }
+    $expected = $ExpectedRelative.Trim('\')
+    $holding = $expected.Equals('.vd-originals', [StringComparison]::OrdinalIgnoreCase) -or $expected.EndsWith('\.vd-originals', [StringComparison]::OrdinalIgnoreCase)
+    if (-not $holding) { return }
+    $actual = Get-UnderRecycleRelative $Plan $StartDirectory
+    if (-not $actual -or -not $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) { return }
+    $dir = $StartDirectory
+    $requireHolding = $true
+    $removedChild = ''
+    while ($dir) {
+        $relative = Get-UnderRecycleRelative $Plan $dir
+        if (-not $relative) { return }
+        $leaf = [IO.Path]::GetFileName($relative.TrimEnd('\'))
+        if ($requireHolding -and -not $leaf.Equals('.vd-originals', [StringComparison]::OrdinalIgnoreCase)) { return }
+        $requireHolding = $false
+        if ($relative.Split('\') | Where-Object { Test-RecycleSegment $_ }) { return }
+        try { $item = Get-Item -LiteralPath $dir -Force -ErrorAction Stop } catch { return }
+        if (Test-ReparsePoint $item) { return }
+        if (-not $item.PSIsContainer) { return }
+        $itemRelative = Get-UnderRecycleRelative $Plan ([string]$item.FullName)
+        if (-not $itemRelative -or -not $itemRelative.Equals($relative, [StringComparison]::OrdinalIgnoreCase)) { return }
+        $leafName = [IO.Path]::GetFileName(([string]$item.FullName).TrimEnd('\'))
+        if (-not (Remove-VerifiedEmptyRecycleDirectory -Path ([string]$item.FullName) -RemovedChild $removedChild)) { return }
+        $removedChild = $leafName
+        $dir = Split-Path -Parent $item.FullName
+    }
+}
+
+function Invoke-RecyclePurge {
+    param($Plan, [int64]$Length)
+    $refusal = Test-RecycleFilePlan $Plan
+    if ($refusal) { return $refusal }
+    $source = [string]$Plan.SourcePath
+    $name = [string]$Plan.Name
+    $recycleFile = [string]$Plan.RecycleFile
+    if ($Length -le 0) {
+        return (New-RecycleResult 'skipped' $source $recycleFile 'The file length was not known.' $name)
+    }
+    try {
+        $rootItem = Get-Item -LiteralPath ([string]$Plan.RecycleRoot) -Force -ErrorAction Stop
+    }
+    catch {
+        if (Test-RecycleNotFound $_) {
+            return (New-RecycleResult 'absent' $source $recycleFile ("No #recycle folder on " + $Plan.ShareRoot + ". Deleted files were not left in a drive recycle bin.") $name)
+        }
+        if (Test-RecycleAccessDenied $_) {
+            return (New-RecycleResult 'denied' $source $recycleFile ("The drive recycle bin on " + $Plan.ShareRoot + " could not be opened. A copy of $name may still be there.") $name)
+        }
+        return (New-RecycleResult 'failed' $source $recycleFile ("Could not open the drive recycle bin. " + $_.Exception.Message) $name)
+    }
+    if (Test-ReparsePoint $rootItem) {
+        return (New-RecycleResult 'failed' $source $recycleFile 'The #recycle path is a link. Nothing was deleted.' $name)
+    }
+    if (-not $rootItem.PSIsContainer) {
+        return (New-RecycleResult 'failed' $source $recycleFile 'The #recycle path is not a folder. Nothing was deleted.' $name)
+    }
+    $rootRelative = Get-UnderRecycleRelative $Plan ([string]$rootItem.FullName)
+    if ($null -eq $rootRelative -or $rootRelative -ne '') {
+        return (New-RecycleResult 'failed' $source $recycleFile 'The #recycle folder resolved to a different path. Nothing was deleted.' $name)
+    }
+    try {
+        $fileItem = Get-Item -LiteralPath $recycleFile -Force -ErrorAction Stop
+    }
+    catch {
+        if (Test-RecycleNotFound $_) {
+            return (New-RecycleResult 'missing' $source $recycleFile ("The drive recycle bin has no copy of $name at $recycleFile.") $name)
+        }
+        if (Test-RecycleAccessDenied $_) {
+            return (New-RecycleResult 'denied' $source $recycleFile ("The drive recycle bin could not be changed for $name. $recycleFile may still hold a copy.") $name)
+        }
+        return (New-RecycleResult 'failed' $source $recycleFile ("Could not read the recycle copy of $name. " + $_.Exception.Message) $name)
+    }
+    $mismatch = Test-RecycleFileItem $fileItem $Plan $Length
+    if ($mismatch) { return $mismatch }
+    try {
+        Remove-Item -LiteralPath $fileItem.FullName -Force -ErrorAction Stop
+    }
+    catch {
+        if (Test-RecycleAccessDenied $_) {
+            return (New-RecycleResult 'denied' $source $recycleFile ("The drive recycle bin could not be changed for $name. $recycleFile may still hold a copy.") $name)
+        }
+        return (New-RecycleResult 'failed' $source $recycleFile ("Could not remove the recycle copy of $name. " + $_.Exception.Message) $name)
+    }
+    if (Test-Path -LiteralPath $fileItem.FullName) {
+        return (New-RecycleResult 'remained' $source $recycleFile ("The recycle copy of $name is still at $recycleFile.") $name)
+    }
+    $nested = ([string]$Plan.RecycleRoot).TrimEnd('\') + '\' + $script:RecycleFolderName + '\' + [string]$Plan.Relative
+    if (Test-Path -LiteralPath $nested) {
+        return (New-RecycleResult 'remained' $source $nested ("The drive put another copy of $name inside the recycle bin at $nested. It was left in place.") $name)
+    }
+    $parentRelative = ''
+    $slash = $Plan.Relative.LastIndexOf('\')
+    if ($slash -gt 0) { $parentRelative = $Plan.Relative.Substring(0, $slash) }
+    Remove-EmptyRecycleDirectories -Plan $Plan -StartDirectory (Split-Path -Parent $fileItem.FullName) -ExpectedRelative $parentRelative
+    return (New-RecycleResult 'purged' $source $recycleFile ("Removed the drive recycle copy of $name.") $name)
+}
+
+function Test-OwnedPlexIgnoreText([string]$Text) {
+    if ($null -eq $Text) { return $false }
+    $clean = $Text.TrimStart([char]0xFEFF)
+    $kept = New-Object System.Collections.Generic.List[string]
+    foreach ($line in @($clean -split '\r\n|\n|\r')) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq '') { continue }
+        [void]$kept.Add($trimmed)
+    }
+    $owned = @(Get-PlexIgnoreLines)
+    if ($kept.Count -ne $owned.Count) { return $false }
+    for ($i = 0; $i -lt $owned.Count; $i++) {
+        if (-not $kept[$i].Equals([string]$owned[$i], [StringComparison]::Ordinal)) { return $false }
+    }
+    return $true
+}
+
+function Get-RecycleNamedPlan {
+    param(
+        [string]$Path,
+        [string]$LeafName,
+        $DriveMap
+    )
+    if ($LeafName -ne '.plexignore') { return $null }
+    $loc = Get-ShareLocation -Path $Path -DriveMap $DriveMap
+    if (-not $loc) { return $null }
+    $parts = @($loc.Parts)
+    if ($parts.Count -lt 1) { return $null }
+    $leaf = [string]$parts[$parts.Count - 1]
+    if (-not $leaf.Equals($LeafName, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    foreach ($part in $parts) {
+        if (Test-RecycleSegment $part) { return $null }
+    }
+    $recycleRoot = $loc.ShareRoot + '\' + $script:RecycleFolderName
+    return [pscustomobject]@{
+        SourcePath  = $Path
+        ShareRoot   = $loc.ShareRoot
+        Relative    = $loc.Relative
+        RecycleRoot = $recycleRoot
+        RecycleFile = ($recycleRoot + '\' + $loc.Relative)
+        Name        = $leaf
+        AllowLocal  = $false
+        DriveMap    = $DriveMap
+    }
+}
+
+function Remove-EmptyRecycleAncestors {
+    param(
+        $Plan,
+        [string]$StartDirectory,
+        [string]$ExpectedRelative
+    )
+    if (-not $Plan -or -not $StartDirectory -or -not $ExpectedRelative) { return }
+    $expected = $ExpectedRelative.Trim('\')
+    if (-not $expected) { return }
+    foreach ($part in @($expected.Split('\'))) {
+        if ($part -eq '.' -or $part -eq '..' -or (Test-RecycleSegment $part)) { return }
+    }
+    $actual = Get-UnderRecycleRelative $Plan $StartDirectory
+    if (-not $actual -or -not $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) { return }
+    $dir = $StartDirectory
+    $removedChild = ''
+    while ($dir) {
+        $relative = Get-UnderRecycleRelative $Plan $dir
+        if (-not $relative) { return }
+        if ($relative.Split('\') | Where-Object { Test-RecycleSegment $_ }) { return }
+        try { $item = Get-Item -LiteralPath $dir -Force -ErrorAction Stop } catch { return }
+        if (Test-ReparsePoint $item) { return }
+        if (-not $item.PSIsContainer) { return }
+        $itemRelative = Get-UnderRecycleRelative $Plan ([string]$item.FullName)
+        if (-not $itemRelative -or -not $itemRelative.Equals($relative, [StringComparison]::OrdinalIgnoreCase)) { return }
+        $leafName = [IO.Path]::GetFileName(([string]$item.FullName).TrimEnd('\'))
+        if (-not (Remove-VerifiedEmptyRecycleDirectory -Path ([string]$item.FullName) -RemovedChild $removedChild)) { return }
+        $removedChild = $leafName
+        $dir = Split-Path -Parent $item.FullName
+    }
+}
+
+function Invoke-RecyclePlexIgnorePurge {
+    param($Plan, [int64]$Length)
+    if (-not $Plan) { return (New-RecycleRefusal $null '') }
+    $source = [string]$Plan.SourcePath
+    $name = '.plexignore'
+    $recycleFile = [string]$Plan.RecycleFile
+    $relative = [string]$Plan.Relative
+    $parts = @($relative.Split('\') | Where-Object { $_ -ne '' })
+    if ($parts.Count -lt 1) { return (New-RecycleRefusal $Plan '') }
+    $leaf = [string]$parts[$parts.Count - 1]
+    if (-not $leaf.Equals('.plexignore', [StringComparison]::OrdinalIgnoreCase)) { return (New-RecycleRefusal $Plan '') }
+    if (-not ([string]$Plan.Name).Equals('.plexignore', [StringComparison]::OrdinalIgnoreCase)) { return (New-RecycleRefusal $Plan '') }
+    foreach ($part in $parts) {
+        if ($part -eq '.' -or $part -eq '..' -or (Test-RecycleSegment $part)) { return (New-RecycleRefusal $Plan '') }
+    }
+    $share = ConvertTo-NormalPath ([string]$Plan.ShareRoot)
+    if (-not $share) { return (New-RecycleRefusal $Plan '') }
+    $share = $share.TrimEnd('\')
+    if (-not $share.StartsWith('\\') -and -not [bool]$Plan.AllowLocal) { return (New-RecycleRefusal $Plan '') }
+    $rootExpected = $share + '\' + $script:RecycleFolderName
+    $fileExpected = $rootExpected + '\' + ($parts -join '\')
+    if (-not (Test-SamePath ([string]$Plan.RecycleRoot) $rootExpected)) { return (New-RecycleRefusal $Plan '') }
+    if (-not (Test-SamePath $recycleFile $fileExpected)) { return (New-RecycleRefusal $Plan '') }
+    if ($Length -le 0 -or $Length -gt 4096) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("A .plexignore at $recycleFile is not the holding-folder file. It was left in place.") $name)
+    }
+    try {
+        $rootItem = Get-Item -LiteralPath ([string]$Plan.RecycleRoot) -Force -ErrorAction Stop
+    }
+    catch {
+        if (Test-RecycleNotFound $_) { return (New-RecycleResult 'absent' $source $recycleFile 'No #recycle folder was found.' $name) }
+        if (Test-RecycleAccessDenied $_) {
+            return (New-RecycleResult 'denied' $source $recycleFile ("The drive recycle bin on " + $Plan.ShareRoot + " could not be opened. A .plexignore copy may still be there.") $name)
+        }
+        return (New-RecycleResult 'failed' $source $recycleFile ("Could not open the drive recycle bin. " + $_.Exception.Message) $name)
+    }
+    if ((Test-ReparsePoint $rootItem) -or -not $rootItem.PSIsContainer) {
+        return (New-RecycleResult 'failed' $source $recycleFile 'The #recycle path is not the recycle folder. Nothing was deleted.' $name)
+    }
+    try {
+        $fileItem = Get-Item -LiteralPath $recycleFile -Force -ErrorAction Stop
+    }
+    catch {
+        if (Test-RecycleNotFound $_) { return (New-RecycleResult 'missing' $source $recycleFile 'The recycled .plexignore was not found.' $name) }
+        if (Test-RecycleAccessDenied $_) {
+            return (New-RecycleResult 'denied' $source $recycleFile ("The drive recycle bin could not be changed for .plexignore. $recycleFile may still hold a copy.") $name)
+        }
+        return (New-RecycleResult 'failed' $source $recycleFile ("Could not read the recycled .plexignore. " + $_.Exception.Message) $name)
+    }
+    if ((Test-ReparsePoint $fileItem) -or $fileItem.PSIsContainer -or -not $fileItem.Name.Equals('.plexignore', [StringComparison]::OrdinalIgnoreCase)) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("The item at $recycleFile is not the holding-folder .plexignore. It was left in place.") $name)
+    }
+    $seen = Get-UnderRecycleRelative $Plan ([string]$fileItem.FullName)
+    if (-not $seen -or -not $seen.Equals($relative, [StringComparison]::OrdinalIgnoreCase)) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("The .plexignore at $recycleFile resolved to a different path. It was left in place.") $name)
+    }
+    if ([int64]$fileItem.Length -ne $Length) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("A .plexignore at $recycleFile does not match the size of the file that was deleted. It was left in place.") $name)
+    }
+    $text = ''
+    try { $text = [IO.File]::ReadAllText($fileItem.FullName) } catch {
+        return (New-RecycleResult 'failed' $source $recycleFile ("Could not read the recycled .plexignore. " + $_.Exception.Message) $name)
+    }
+    if (-not (Test-OwnedPlexIgnoreText $text)) {
+        return (New-RecycleResult 'mismatch' $source $recycleFile ("A .plexignore at $recycleFile lists more than the holding folder. It was left in place.") $name)
+    }
+    try { Remove-Item -LiteralPath $fileItem.FullName -Force -ErrorAction Stop }
+    catch {
+        if (Test-RecycleAccessDenied $_) {
+            return (New-RecycleResult 'denied' $source $recycleFile ("The drive recycle bin could not be changed for .plexignore. $recycleFile may still hold a copy.") $name)
+        }
+        return (New-RecycleResult 'failed' $source $recycleFile ("Could not remove the recycled .plexignore. " + $_.Exception.Message) $name)
+    }
+    if (Test-Path -LiteralPath $fileItem.FullName) {
+        return (New-RecycleResult 'remained' $source $recycleFile ("The recycled .plexignore is still at $recycleFile.") $name)
+    }
+    $parentRelative = ''
+    $slash = $relative.LastIndexOf('\')
+    if ($slash -gt 0) { $parentRelative = $relative.Substring(0, $slash) }
+    if ($parentRelative) {
+        Remove-EmptyRecycleAncestors -Plan $Plan -StartDirectory (Split-Path -Parent $fileItem.FullName) -ExpectedRelative $parentRelative
+    }
+    return (New-RecycleResult 'purged' $source $recycleFile 'Removed the drive recycle copy of .plexignore.' $name)
+}
+
+function Remove-RecycledPlexIgnore {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int64]$Length,
+        $DriveMap
+    )
+    if ($Length -le 0 -or $Length -gt 4096) { return }
+    $plan = Get-RecycleNamedPlan -Path $Path -LeafName '.plexignore' -DriveMap $DriveMap
+    if (-not $plan) { return }
+    try { $result = Invoke-RecyclePlexIgnorePurge -Plan $plan -Length $Length }
+    catch {
+        $result = New-RecycleResult 'failed' $Path ([string]$plan.RecycleFile) ("Could not remove the recycled .plexignore. " + $_.Exception.Message) '.plexignore'
+    }
+    if (-not $result) { return }
+    if ($result.Status -eq 'missing' -or $result.Status -eq 'absent' -or $result.Status -eq 'skipped') { return }
+    return (Add-RecycleResult $result)
+}
+
+function Remove-RecycleCopy {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int64]$Length,
+        $DriveMap
+    )
+    $name = ''
+    try { $name = [IO.Path]::GetFileName($Path) } catch { $name = '' }
+    if ($Length -le 0) {
+        return (Add-RecycleResult (New-RecycleResult 'skipped' $Path '' 'The file length was not known.' $name))
+    }
+    $plan = Get-RecyclePlan -Path $Path -DriveMap $DriveMap
+    if (-not $plan) {
+        return (Add-RecycleResult (New-RecycleResult 'skipped' $Path '' 'This path is not a held original on a shared drive.' $name))
+    }
+    try { $result = Invoke-RecyclePurge -Plan $plan -Length $Length }
+    catch {
+        $result = New-RecycleResult 'failed' $Path ([string]$plan.RecycleFile) ("Could not remove the recycle copy of $name. " + $_.Exception.Message) $name
+    }
+    return (Add-RecycleResult $result)
+}
+
+function Invoke-RecycleDirectoryCleanup {
+    param($Plan)
+    if (-not $Plan) { return }
+    $relative = [string]$Plan.Relative
+    $parts = @($relative.Split('\') | Where-Object { $_ -ne '' })
+    if ($parts.Count -lt 1) { return }
+    $leaf = [string]$parts[$parts.Count - 1]
+    if (-not $leaf.Equals('.vd-originals', [StringComparison]::OrdinalIgnoreCase)) { return }
+    foreach ($part in $parts) {
+        if ($part -eq '.' -or $part -eq '..' -or (Test-RecycleSegment $part)) { return }
+    }
+    $share = ConvertTo-NormalPath ([string]$Plan.ShareRoot)
+    if (-not $share) { return }
+    $share = $share.TrimEnd('\')
+    if (-not $share.StartsWith('\\') -and -not [bool]$Plan.AllowLocal) { return }
+    $rootExpected = $share + '\' + $script:RecycleFolderName
+    $dirExpected = $rootExpected + '\' + ($parts -join '\')
+    if (-not (Test-SamePath ([string]$Plan.RecycleRoot) $rootExpected)) { return }
+    if (-not (Test-SamePath ([string]$Plan.RecycleFile) $dirExpected)) { return }
+    Remove-EmptyRecycleDirectories -Plan $Plan -StartDirectory $dirExpected -ExpectedRelative ($parts -join '\')
+}
+
+function Remove-RecycledHoldingFolder {
+    param([string]$Directory, $DriveMap)
+    if (-not $Directory) { return }
+    $plan = Get-RecycleDirectoryPlan -Directory $Directory -DriveMap $DriveMap
+    if (-not $plan) { return }
+    try { Invoke-RecycleDirectoryCleanup -Plan $plan } catch { }
 }
 
 function Remove-EmptyDirectory {
@@ -858,6 +1604,7 @@ function Remove-EmptyDirectory {
     if ($leaf -ne '.vd-originals') { return }
     $parent = Split-Path -Parent $Directory
     if ($parent) { Remove-PlexIgnore -Directory $parent }
+    Remove-RecycledHoldingFolder -Directory $Directory
 }
 
 function Get-ReplacePlan {
@@ -928,9 +1675,13 @@ function Invoke-ReplaceWithEncode {
     $kept = $plan.Hold
     $deleted = $false
     if ($DeleteOriginal) {
+        $holdLength = [int64](Get-Item -LiteralPath $plan.Hold -Force).Length
         Remove-Item -LiteralPath $plan.Hold -Force
         $kept = $null
         $deleted = $true
+        if (-not (Test-Path -LiteralPath $plan.Hold)) {
+            try { [void](Remove-RecycleCopy -Path $plan.Hold -Length $holdLength) } catch { }
+        }
         Remove-EmptyDirectory -Directory $plan.HoldDir
     }
 
@@ -989,7 +1740,11 @@ function Undo-ReplacedFile {
         }
         throw
     }
+    $asideLength = [int64](Get-Item -LiteralPath $aside -Force).Length
     Remove-Item -LiteralPath $aside -Force
+    if (-not (Test-Path -LiteralPath $aside)) {
+        try { [void](Remove-RecycleCopy -Path $aside -Length $asideLength) } catch { }
+    }
     Remove-EmptyDirectory -Directory $holdDir
     return $true
 }
@@ -1007,7 +1762,11 @@ function Remove-KeptOriginal {
         throw "The new file is missing, so the original stays: $NewPath"
     }
     if (-not (Test-Path -LiteralPath $full)) { return $false }
+    $length = [int64](Get-Item -LiteralPath $full -Force).Length
     Remove-Item -LiteralPath $full -Force
+    if (-not (Test-Path -LiteralPath $full)) {
+        try { [void](Remove-RecycleCopy -Path $full -Length $length) } catch { }
+    }
     Remove-EmptyDirectory -Directory (Split-Path -Parent $full)
     return $true
 }
@@ -1310,6 +2069,236 @@ function Invoke-ScanFolder {
     }
 }
 
+function Invoke-RecycleSelfTest {
+    $lone = @([pscustomobject]@{ Name = 'Movies' })
+    Assert-Engine (Test-StaleRecycleChild -Children $lone -RemovedName 'Movies') 'a lone removed folder was not stale'
+    $pair = @([pscustomobject]@{ Name = 'Movies' }, [pscustomobject]@{ Name = 'other.txt' })
+    Assert-Engine (-not (Test-StaleRecycleChild -Children $pair -RemovedName 'Movies')) 'another name was treated as a stale listing'
+    $otherName = @([pscustomobject]@{ Name = 'keep.txt' })
+    Assert-Engine (-not (Test-StaleRecycleChild -Children $otherName -RemovedName 'Movies')) 'a different file was treated as a stale listing'
+    $none = @()
+    Assert-Engine (-not (Test-StaleRecycleChild -Children $none -RemovedName 'Movies')) 'an empty folder was treated as a stale listing'
+    $plain = Get-RecyclePlan -Path '\\nas\media\TV\Show\.vd-originals\Episode.avi'
+    Assert-Engine ($null -ne $plain) 'share path did not produce a recycle plan'
+    Assert-Engine ($plain.ShareRoot -eq '\\nas\media') 'share root'
+    Assert-Engine ($plain.RecycleFile -eq '\\nas\media\#recycle\TV\Show\.vd-originals\Episode.avi') 'recycle file path'
+    Assert-Engine (-not $plain.AllowLocal) 'production plan allowed a local root'
+    $rootHeld = Get-RecyclePlan -Path '\\nas\media\.vd-originals\Episode.avi'
+    Assert-Engine ($rootHeld.RecycleFile -eq '\\nas\media\#recycle\.vd-originals\Episode.avi') 'share-root holding folder'
+    $map = @{ Z = '\\nas\media\TV Shows' }
+    $mapped = Get-RecyclePlan -Path 'Z:\Season 1\.vd-originals\Pilot.avi' -DriveMap $map
+    Assert-Engine ($null -ne $mapped) 'mapped drive did not produce a recycle plan'
+    Assert-Engine ($mapped.ShareRoot -eq '\\nas\media') 'mapped drive share root'
+    Assert-Engine ($mapped.RecycleFile -eq '\\nas\media\#recycle\TV Shows\Season 1\.vd-originals\Pilot.avi') 'mapped drive recycle path'
+    Assert-Engine ($null -eq (Get-RecyclePlan -Path 'C:\Library\.vd-originals\Episode.avi')) 'local disk produced a recycle plan'
+    Assert-Engine ($null -eq (Get-RecyclePlan -Path '\\nas\media\TV\Show\Episode.avi')) 'a library file produced a recycle plan'
+    Assert-Engine ($null -eq (Get-RecyclePlan -Path '\\nas\media\TV\.vd-originals\extra\Episode.avi')) 'a nested holding file produced a recycle plan'
+    Assert-Engine ($null -eq (Get-RecyclePlan -Path '\\nas\media\#recycle\TV\.vd-originals\Episode.avi')) 'a path already in #recycle produced a plan'
+    Assert-Engine ($null -eq (Get-RecyclePlan -Path '\\nas\media\ShowA\.vd-originals\..\ShowB\.vd-originals\Episode.avi')) 'a parent segment produced a plan'
+    $odd = Get-RecyclePlan -Path ('\\nas\media\TV\Show' + "'" + 's\.vd-originals\Episode.avi')
+    Assert-Engine ($odd.RecycleFile -eq ('\\nas\media\#recycle\TV\Show' + "'" + 's\.vd-originals\Episode.avi')) 'apostrophe path'
+    $zero = Remove-RecycleCopy -Path '\\nas\media\TV\.vd-originals\Episode.avi' -Length 0
+    Assert-Engine ($zero.Status -eq 'skipped') 'unknown length was purged'
+    $localSkip = Remove-RecycleCopy -Path 'C:\Library\.vd-originals\Episode.avi' -Length 100
+    Assert-Engine ($localSkip.Status -eq 'skipped') 'a local file was treated as a share'
+
+    $root = $null
+    $absentRoot = $null
+    $junction = $null
+    try {
+        $root = Join-Path $env:TEMP ('vdh-recycle-' + [guid]::NewGuid().ToString('n'))
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        $relative = 'TV\Show\.vd-originals\Episode.avi'
+        $recycleRoot = Join-Path $root '#recycle'
+        $hold = Join-Path $recycleRoot 'TV\Show\.vd-originals'
+        New-Item -ItemType Directory -Force -Path $hold | Out-Null
+        $target = Join-Path $hold 'Episode.avi'
+        $bytes = [Text.Encoding]::UTF8.GetBytes('original-bytes')
+        [IO.File]::WriteAllBytes($target, $bytes)
+        $decoy = Join-Path (Join-Path $recycleRoot 'TV\Show') 'Episode.avi'
+        [IO.File]::WriteAllBytes($decoy, $bytes)
+        $sibling = Join-Path $hold 'Other.avi'
+        [IO.File]::WriteAllBytes($sibling, $bytes)
+        $hidden = Join-Path $hold 'desktop.ini'
+        [IO.File]::WriteAllText($hidden, 'keep')
+        (Get-Item -LiteralPath $hidden -Force).Attributes = [IO.FileAttributes]::Hidden
+        $tv = Join-Path $recycleRoot 'TV'
+        $keep = Join-Path $tv 'keep.txt'
+        [IO.File]::WriteAllText($keep, 'keep')
+        $liveDir = Join-Path $root 'TV\Show'
+        New-Item -ItemType Directory -Force -Path $liveDir | Out-Null
+        $live = Join-Path $liveDir 'Episode.mkv'
+        [IO.File]::WriteAllText($live, 'library')
+        $plan = [pscustomobject]@{
+            SourcePath  = '\\nas\media\TV\Show\.vd-originals\Episode.avi'
+            ShareRoot   = $root
+            Relative    = $relative
+            RecycleRoot = $recycleRoot
+            RecycleFile = $target
+            Name        = 'Episode.avi'
+            AllowLocal  = $true
+            DriveMap    = $null
+        }
+        $off = [pscustomobject]@{
+            SourcePath  = $plan.SourcePath
+            ShareRoot   = $root
+            Relative    = $relative
+            RecycleRoot = $recycleRoot
+            RecycleFile = $target
+            Name        = 'Episode.avi'
+            AllowLocal  = $false
+            DriveMap    = $null
+        }
+        $blocked = Invoke-RecyclePurge -Plan $off -Length ([int64]$bytes.Length)
+        Assert-Engine ($blocked.Status -eq 'skipped') 'a local root was accepted'
+        Assert-Engine (Test-Path -LiteralPath $target) 'a local root removed the file'
+        $wrong = Invoke-RecyclePurge -Plan $plan -Length ([int64]($bytes.Length + 9))
+        Assert-Engine ($wrong.Status -eq 'mismatch') 'a different size was deleted'
+        Assert-Engine ((Get-Item -LiteralPath $target).Length -eq $bytes.Length) 'a different size changed the file'
+        $bad = [pscustomobject]@{
+            SourcePath  = $live
+            ShareRoot   = $root
+            Relative    = 'TV\Show\Episode.mkv'
+            RecycleRoot = $recycleRoot
+            RecycleFile = $live
+            Name        = 'Episode.mkv'
+            AllowLocal  = $true
+            DriveMap    = $null
+        }
+        $refused = Invoke-RecyclePurge -Plan $bad -Length ([int64](Get-Item -LiteralPath $live).Length)
+        Assert-Engine ($refused.Status -eq 'skipped') 'a library path passed the recycle check'
+        Assert-Engine ((Get-Content -LiteralPath $live -Raw) -eq 'library') 'the library file was changed'
+        $purged = Invoke-RecyclePurge -Plan $plan -Length ([int64]$bytes.Length)
+        Assert-Engine ($purged.Status -eq 'purged') 'the matching copy was not removed'
+        Assert-Engine (-not (Test-Path -LiteralPath $target)) 'the matching copy remained'
+        Assert-Engine (Test-Path -LiteralPath $decoy) 'a same-named file outside .vd-originals was deleted'
+        Assert-Engine ((Get-Item -LiteralPath $decoy).Length -eq $bytes.Length) 'the decoy was changed'
+        Assert-Engine (Test-Path -LiteralPath $sibling) 'a different held file was deleted'
+        Assert-Engine (Test-Path -LiteralPath $hidden) 'a hidden file was deleted'
+        Assert-Engine (Test-Path -LiteralPath $keep) 'keep.txt was deleted'
+        Assert-Engine ((Get-Content -LiteralPath $live -Raw) -eq 'library') 'the library file was deleted'
+        Assert-Engine (Test-Path -LiteralPath $hold) 'the holding folder was removed while files remained'
+        Assert-Engine (Test-Path -LiteralPath $recycleRoot) 'the recycle root was removed'
+        Remove-Item -LiteralPath $sibling -Force
+        Remove-Item -LiteralPath $hidden -Force
+        Remove-Item -LiteralPath $decoy -Force
+        [IO.File]::WriteAllBytes($target, $bytes)
+        $collapsed = Invoke-RecyclePurge -Plan $plan -Length ([int64]$bytes.Length)
+        Assert-Engine ($collapsed.Status -eq 'purged') 'the empty-folder purge failed'
+        Assert-Engine (-not (Test-Path -LiteralPath $hold)) 'the empty holding folder remained'
+        $show = Join-Path $recycleRoot 'TV\Show'
+        Assert-Engine (-not (Test-Path -LiteralPath $show)) 'the empty show folder remained'
+        Assert-Engine (Test-Path -LiteralPath $tv) 'a folder that still had a file was removed'
+        Assert-Engine (Test-Path -LiteralPath $keep) 'keep.txt was removed with its folder'
+        Assert-Engine (Test-Path -LiteralPath $recycleRoot) 'the recycle root was removed after cleanup'
+        Assert-Engine ((Get-Content -LiteralPath $live -Raw) -eq 'library') 'cleanup removed the library file'
+        $soloHold = Join-Path $recycleRoot 'Solo\Nest\.vd-originals'
+        New-Item -ItemType Directory -Force -Path $soloHold | Out-Null
+        $clip = Join-Path $soloHold 'Clip.avi'
+        [IO.File]::WriteAllBytes($clip, $bytes)
+        $soloPlan = [pscustomobject]@{
+            SourcePath  = '\\nas\media\Solo\Nest\.vd-originals\Clip.avi'
+            ShareRoot   = $root
+            Relative    = 'Solo\Nest\.vd-originals\Clip.avi'
+            RecycleRoot = $recycleRoot
+            RecycleFile = $clip
+            Name        = 'Clip.avi'
+            AllowLocal  = $true
+            DriveMap    = $null
+        }
+        $solo = Invoke-RecyclePurge -Plan $soloPlan -Length ([int64]$bytes.Length)
+        Assert-Engine ($solo.Status -eq 'purged') 'an empty folder chain was not purged'
+        Assert-Engine (-not (Test-Path -LiteralPath $soloHold)) 'the empty nest holding folder remained'
+        Assert-Engine (-not (Test-Path -LiteralPath (Join-Path $recycleRoot 'Solo\Nest'))) 'the empty nest folder remained'
+        Assert-Engine (-not (Test-Path -LiteralPath (Join-Path $recycleRoot 'Solo'))) 'the empty solo folder remained'
+        Assert-Engine (Test-Path -LiteralPath $recycleRoot) 'the recycle root was removed with an empty chain'
+        Assert-Engine (Test-Path -LiteralPath $keep) 'an empty chain removed keep.txt'
+        $busyDir = Join-Path $recycleRoot 'Busy'
+        New-Item -ItemType Directory -Force -Path $busyDir | Out-Null
+        $busyFile = Join-Path $busyDir 'other.txt'
+        [IO.File]::WriteAllText($busyFile, 'keep')
+        $busyWatch = [Diagnostics.Stopwatch]::StartNew()
+        $busyEmpty = Test-RecycleDirectoryEmpty -Directory $busyDir -RemovedChild 'Gone'
+        $busyWatch.Stop()
+        Assert-Engine ($busyEmpty -eq $false) 'a folder with another file was treated as empty'
+        Assert-Engine ($busyWatch.ElapsedMilliseconds -lt 120) 'a folder with another file waited'
+        $busyRemoved = Remove-VerifiedEmptyRecycleDirectory -Path $busyDir -RemovedChild 'Gone'
+        Assert-Engine (-not $busyRemoved) 'a folder with a file was removed'
+        Assert-Engine ((Get-Content -LiteralPath $busyFile -Raw) -eq 'keep') 'a folder with a file lost that file'
+        $sameDir = Join-Path $recycleRoot 'SameParent\Child'
+        New-Item -ItemType Directory -Force -Path $sameDir | Out-Null
+        $sameEmpty = Test-RecycleDirectoryEmpty -Directory (Split-Path -Parent $sameDir) -RemovedChild 'Child'
+        Assert-Engine ($sameEmpty -eq $false) 'a real folder with the removed name was treated as empty'
+        Assert-Engine (Test-Path -LiteralPath $sameDir) 'the real same-named folder was removed'
+        $emptyShow = Join-Path $recycleRoot 'EmptyShow'
+        New-Item -ItemType Directory -Force -Path $emptyShow | Out-Null
+        Remove-EmptyRecycleDirectories -Plan $plan -StartDirectory $emptyShow -ExpectedRelative 'EmptyShow'
+        Assert-Engine (Test-Path -LiteralPath $emptyShow) 'a folder outside .vd-originals was removed'
+        $nestedHold = Join-Path (Join-Path $recycleRoot '#recycle\TV\Show') '.vd-originals'
+        New-Item -ItemType Directory -Force -Path $nestedHold | Out-Null
+        New-Item -ItemType Directory -Force -Path $hold | Out-Null
+        [IO.File]::WriteAllBytes($target, $bytes)
+        $nested = Join-Path $nestedHold 'Episode.avi'
+        [IO.File]::WriteAllBytes($nested, $bytes)
+        $nestedResult = Invoke-RecyclePurge -Plan $plan -Length ([int64]$bytes.Length)
+        Assert-Engine ($nestedResult.Status -eq 'remained') 'a nested recycle copy was ignored'
+        Assert-Engine (-not (Test-Path -LiteralPath $target)) 'the exact copy remained after the nested check'
+        Assert-Engine (Test-Path -LiteralPath $nested) 'the nested copy was deleted'
+        Assert-Engine (Test-Path -LiteralPath $keep) 'the nested check removed keep.txt'
+        $linkHold = Join-Path $recycleRoot 'TV\LinkShow\.vd-originals'
+        New-Item -ItemType Directory -Force -Path $linkHold | Out-Null
+        $realDir = Join-Path $root 'real-dir'
+        New-Item -ItemType Directory -Force -Path $realDir | Out-Null
+        $marker = Join-Path $realDir 'marker.txt'
+        [IO.File]::WriteAllText($marker, 'marker')
+        $junction = Join-Path $linkHold 'Episode.avi'
+        & cmd.exe /c "mklink /J `"$junction`" `"$realDir`"" | Out-Null
+        Assert-Engine ($LASTEXITCODE -eq 0) 'the junction could not be created'
+        $linkPlan = [pscustomobject]@{
+            SourcePath  = '\\nas\media\TV\LinkShow\.vd-originals\Episode.avi'
+            ShareRoot   = $root
+            Relative    = 'TV\LinkShow\.vd-originals\Episode.avi'
+            RecycleRoot = $recycleRoot
+            RecycleFile = $junction
+            Name        = 'Episode.avi'
+            AllowLocal  = $true
+            DriveMap    = $null
+        }
+        $linked = Invoke-RecyclePurge -Plan $linkPlan -Length 6
+        Assert-Engine ($linked.Status -eq 'mismatch') 'a junction was deleted'
+        Assert-Engine ((Get-Content -LiteralPath $marker -Raw) -eq 'marker') 'the junction target was deleted'
+        Assert-Engine (Test-Path -LiteralPath $junction) 'the junction was removed'
+        $absentRoot = Join-Path $env:TEMP ('vdh-recycle-absent-' + [guid]::NewGuid().ToString('n'))
+        New-Item -ItemType Directory -Force -Path $absentRoot | Out-Null
+        $bait = Join-Path $absentRoot 'Episode.avi'
+        [IO.File]::WriteAllText($bait, 'bait')
+        $absentPlan = [pscustomobject]@{
+            SourcePath  = '\\nas\media\TV\.vd-originals\Episode.avi'
+            ShareRoot   = $absentRoot
+            Relative    = 'TV\.vd-originals\Episode.avi'
+            RecycleRoot = (Join-Path $absentRoot '#recycle')
+            RecycleFile = (Join-Path $absentRoot '#recycle\TV\.vd-originals\Episode.avi')
+            Name        = 'Episode.avi'
+            AllowLocal  = $true
+            DriveMap    = $null
+        }
+        $absent = Invoke-RecyclePurge -Plan $absentPlan -Length 4
+        Assert-Engine ($absent.Status -eq 'absent') 'a missing bin was treated as a failure'
+        Assert-Engine ((Get-Content -LiteralPath $bait -Raw) -eq 'bait') 'a missing bin deleted another file'
+    }
+    finally {
+        if ($junction -and (Test-Path -LiteralPath $junction)) {
+            & cmd.exe /c "rmdir `"$junction`"" | Out-Null
+        }
+        if ($root -and (Test-Path -LiteralPath $root)) {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if ($absentRoot -and (Test-Path -LiteralPath $absentRoot)) {
+            Remove-Item -LiteralPath $absentRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Assert-Engine {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
@@ -1338,7 +2327,84 @@ function New-FakeProbe {
     }
 }
 
+function Invoke-RecycleSidecarSelfTest {
+    $owned = ((@(Get-PlexIgnoreLines) -join "`r`n") + "`r`n")
+    Assert-Engine (Test-OwnedPlexIgnoreText $owned) 'owned plexignore text was rejected'
+    Assert-Engine (-not (Test-OwnedPlexIgnoreText ($owned + "KeepMe`r`n"))) 'a plexignore with another line was accepted'
+    Assert-Engine ($null -eq (Get-RecycleNamedPlan -Path '\\nas\media\Movies\Show\.plexignore' -LeafName 'notes.txt')) 'a non-plexignore name produced a plan'
+    $named = Get-RecycleNamedPlan -Path '\\nas\media\Movies\Show\.plexignore' -LeafName '.plexignore'
+    Assert-Engine ($named.RecycleFile -eq '\\nas\media\#recycle\Movies\Show\.plexignore') 'plexignore recycle path'
+    Assert-Engine ($null -eq (Get-RecycleNamedPlan -Path '\\nas\media\#recycle\Movies\Show\.plexignore' -LeafName '.plexignore')) 'a plexignore already in #recycle produced a plan'
+    $root = $null
+    try {
+        $root = Join-Path $env:TEMP ('vdh-plex-' + [guid]::NewGuid().ToString('n'))
+        $recycleRoot = Join-Path $root '#recycle'
+        $show = Join-Path $recycleRoot 'Movies\Show'
+        New-Item -ItemType Directory -Force -Path $show | Out-Null
+        $ignore = Join-Path $show '.plexignore'
+        $bytes = [Text.Encoding]::UTF8.GetBytes($owned)
+        [IO.File]::WriteAllBytes($ignore, $bytes)
+        $other = Join-Path $recycleRoot 'Movies\other.txt'
+        [IO.File]::WriteAllText($other, 'keep')
+        $tv = Join-Path $recycleRoot 'TV'
+        New-Item -ItemType Directory -Force -Path $tv | Out-Null
+        $keep = Join-Path $tv 'keep.mkv'
+        [IO.File]::WriteAllText($keep, 'video')
+        $library = Join-Path $root 'library.txt'
+        [IO.File]::WriteAllText($library, 'library')
+        $plan = [pscustomobject]@{
+            SourcePath  = '\\nas\media\Movies\Show\.plexignore'
+            ShareRoot   = $root
+            Relative    = 'Movies\Show\.plexignore'
+            RecycleRoot = $recycleRoot
+            RecycleFile = $ignore
+            Name        = '.plexignore'
+            AllowLocal  = $true
+            DriveMap    = $null
+        }
+        $off = Invoke-RecyclePlexIgnorePurge -Plan ([pscustomobject]@{
+            SourcePath = $plan.SourcePath; ShareRoot = $root; Relative = $plan.Relative
+            RecycleRoot = $recycleRoot; RecycleFile = $ignore; Name = '.plexignore'
+            AllowLocal = $false; DriveMap = $null
+        }) -Length ([int64]$bytes.Length)
+        Assert-Engine ($off.Status -eq 'skipped') 'a local plexignore root was accepted'
+        Assert-Engine (Test-Path -LiteralPath $ignore) 'a local plexignore root removed the file'
+        $wrong = Invoke-RecyclePlexIgnorePurge -Plan $plan -Length ([int64]($bytes.Length + 4))
+        Assert-Engine ($wrong.Status -eq 'mismatch') 'a different plexignore size was deleted'
+        Assert-Engine (Test-Path -LiteralPath $ignore) 'a different plexignore size removed the file'
+        $extraDir = Join-Path $recycleRoot 'Movies\OtherShow'
+        New-Item -ItemType Directory -Force -Path $extraDir | Out-Null
+        $extra = Join-Path $extraDir '.plexignore'
+        [IO.File]::WriteAllText($extra, ($owned + "KeepMe`r`n"))
+        $extraPlan = [pscustomobject]@{
+            SourcePath = $plan.SourcePath; ShareRoot = $root; Relative = 'Movies\OtherShow\.plexignore'
+            RecycleRoot = $recycleRoot; RecycleFile = $extra; Name = '.plexignore'
+            AllowLocal = $true; DriveMap = $null
+        }
+        $extraResult = Invoke-RecyclePlexIgnorePurge -Plan $extraPlan -Length ([int64](Get-Item -LiteralPath $extra).Length)
+        Assert-Engine ($extraResult.Status -eq 'mismatch') 'a plexignore with other lines was deleted'
+        Assert-Engine (Test-Path -LiteralPath $extra) 'a plexignore with other lines was removed'
+        $purged = Invoke-RecyclePlexIgnorePurge -Plan $plan -Length ([int64]$bytes.Length)
+        Assert-Engine ($purged.Status -eq 'purged') 'the owned plexignore was not removed'
+        Assert-Engine (-not (Test-Path -LiteralPath $ignore)) 'the owned plexignore remained'
+        Assert-Engine (-not (Test-Path -LiteralPath $show)) 'the empty show folder remained'
+        Assert-Engine (Test-Path -LiteralPath (Join-Path $recycleRoot 'Movies')) 'a folder that still had a file was removed'
+        Assert-Engine (Test-Path -LiteralPath $other) 'other.txt was removed'
+        Assert-Engine (Test-Path -LiteralPath $keep) 'a video in another folder was removed'
+        Assert-Engine (Test-Path -LiteralPath $extra) 'the other plexignore was removed'
+        Assert-Engine ((Get-Content -LiteralPath $library -Raw) -eq 'library') 'the library file was removed'
+        Assert-Engine (Test-Path -LiteralPath $recycleRoot) 'the recycle root was removed'
+    }
+    finally {
+        if ($root -and (Test-Path -LiteralPath $root)) {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Invoke-EngineSelfTest {
+    Invoke-RecycleSelfTest
+    Invoke-RecycleSidecarSelfTest
     Assert-Engine ((Get-TargetKbps -Width 1920 -Height 1080) -eq 3000) '1080p target'
     Assert-Engine ((Get-TargetKbps -Width 3840 -Height 2160) -eq 12000) '4K target'
     Assert-Engine ((Get-TargetKbps -Width 1280 -Height 720) -eq 1333) '720p target'
