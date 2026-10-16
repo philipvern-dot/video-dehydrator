@@ -1,12 +1,24 @@
 # Video Dehydrator
 
-Version 1.0.6.1
+Version 1.0.7
 
 A Windows program that finds videos that are too big for their picture size, encodes a smaller copy, and puts that copy where the original was.
 
 Double-click **Video Dehydrator** in this folder. If that shortcut does nothing, open `app\launch.vbs` once. That starts the program and repairs the shortcut.
 
-Choose a folder and click Scan. Checked rows are the ones Convert will shrink. Estimated savings uses the New size column. If the picture rate is missing, New size starts with ~ and uses the target rate times the length. Over shows how many times the budget a file uses. Slight, Heavy, and Extreme can be checked as one group. The original is kept in `.vd-originals` until you delete it. Compare plays the new file. Undo puts the last conversion back.
+Choose a folder and click Scan. Checked rows are the ones Optimize will shrink. ~Savings is the current size minus New size, and the first click on that heading puts the largest estimates first. If the picture rate is missing, New size and ~Savings start with ~. Ratio shows how many times the budget a file uses. `1.00x` is on the line. Slight, Heavy, and Extreme can be checked as one group. Can shrink rows are under the line and the picture is still above the target rate. Showing all leaves every row on screen until a group box is checked. The original is kept in `.vd-originals` until you delete it. Compare plays the original on the left and the new file on the right. Undo puts the last conversion back.
+
+## What's new in 1.0.7
+
+Ratio replaces the Over heading. The number uses two decimal places. `1.00x` is on the budget line. A file just over the line keeps the extra digits, such as `1.04x`, so it does not look like `1.00x`.
+
+Can shrink lists a file that is under the budget line when its picture is still above the target rate and the New size is smaller. Those rows start checked and are not colored. Select slight, Select heavy, and Select extreme leave them alone. The scan lists every file it listed before, and these rows in addition.
+
+~Savings is a new column. It is the current size minus New size. The first click puts the largest estimates first. After a convert, that cell clears and Space Saved shows the real result.
+
+Showing all opens a checkbox for Can shrink, Bloated, Slight, Heavy, Extreme, Failed, Skipped, Ready to delete, and Finished. With none checked, every row stays. Check one group to show only those rows, then check more groups to add them. Hidden rows are unchecked, so Optimize leaves them out. Select shown checks the rows still on screen.
+
+The convert button is labeled Optimize. Stop after current file lets the file already encoding finish, then stops the batch. Continue keeps the batch going. Every button has a tooltip, including a button that is grayed out.
 
 The bottom right corner shows this copy's version. The program checks for updates when it opens. Check for updates looks again. When a newer version is found, a window tells you once. After you close it, it stays closed until a later version is published. The status line keeps saying that version is available. Update downloads that version and opens the setup program. The setup replaces the installed copy and keeps your settings. Donate opens a tip page. The program stays free. Report a bug opens a GitHub page with this version and the Windows version filled in. Include latest activity is optional. Leave it unchecked and nothing else is added.
 

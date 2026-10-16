@@ -286,7 +286,13 @@ function Get-OverBandId($Ratio) {
 
 function Format-OverRatio($Ratio) {
     if ($null -eq $Ratio -or [string]$Ratio -eq '') { return '' }
-    return ('{0:0.0}x' -f [double]$Ratio)
+    $value = [double]$Ratio
+    $places = 2
+    if ($value -gt 1) {
+        while ($places -lt 4 -and ([math]::Round($value, $places) -le 1)) { $places++ }
+    }
+    $text = [math]::Round($value, $places).ToString(('0.' + ('0' * $places)), [Globalization.CultureInfo]::InvariantCulture)
+    return ($text + 'x')
 }
 
 function Get-HandBrakeFraction {
@@ -448,6 +454,15 @@ function Get-EstimatedBytes {
     return [int64][math]::Round($estimate)
 }
 
+function Test-ShrinkablePicture($Probe, [int]$TargetKbps, $Estimate) {
+    if ($null -eq $Probe -or $TargetKbps -le 0) { return $false }
+    if ($Probe.VideoBitrate -le 0 -or $Probe.SizeBytes -le 0 -or $Probe.DurationSec -le 0) { return $false }
+    if ($null -eq $Estimate -or [int64]$Estimate -le 0 -or [int64]$Estimate -ge [int64]$Probe.SizeBytes) { return $false }
+    $fileBps = ($Probe.SizeBytes * 8.0) / $Probe.DurationSec
+    if ($fileBps -le 0 -or $Probe.VideoBitrate -lt ($fileBps * 0.4)) { return $false }
+    return ($Probe.VideoBitrate -gt ($TargetKbps * 1000.0 * 1.05))
+}
+
 function Get-BloatDecision {
     param($Probe)
     $scale = Get-PictureScale -Width $Probe.Width -Height $Probe.Height
@@ -479,8 +494,14 @@ function Get-BloatDecision {
         $reason = 'The size per hour could not be read.'
     }
     elseif ($gibph -lt $budget) {
-        $decision = 'lean'
-        $reason = 'Under the budget for this picture size.'
+        if (Test-ShrinkablePicture $Probe $target $estimate) {
+            $decision = 'shrink'
+            $reason = 'The file is under the budget line. The picture is still above the target rate, so a new file should be smaller.'
+        }
+        else {
+            $decision = 'lean'
+            $reason = 'Under the budget for this picture size.'
+        }
     }
     else {
         $fileBps = ($Probe.SizeBytes * 8.0) / $Probe.DurationSec
@@ -1959,18 +1980,19 @@ function Add-ScanDirectory {
         if (-not (Test-VideoFileName $file)) { continue }
         $State.Seen++
         $name = [IO.Path]::GetFileName($file)
-        Send-ScanMessage $Queue @{ Kind = 'progress'; Seen = $State.Seen; Hits = $State.Hits; Name = $name }
+        Send-ScanMessage $Queue @{ Kind = 'progress'; Seen = $State.Seen; Hits = $State.Hits; Shrink = $State.Shrink; Name = $name }
         try {
             $probe = Get-MediaProbe -Ffprobe $Ffprobe -File $file
             $decision = Get-BloatDecision -Probe $probe
-            if ($decision.Decision -eq 'bloated') {
+            if ($decision.Decision -eq 'bloated' -or $decision.Decision -eq 'shrink') {
                 if (Test-RememberedSkip -Rows $State.Skips -Path $file -SizeBytes ([int64]$probe.SizeBytes) -TargetKbps ([int]$decision.TargetKbps)) {
                     $State.Ignored++
                     continue
                 }
-                $State.Hits++
+                if ($decision.Decision -eq 'shrink') { $State.Shrink++ } else { $State.Hits++ }
                 Send-ScanMessage $Queue @{
                     Kind          = 'hit'
+                    Decision      = $decision.Decision
                     Path          = $file
                     Codec         = $probe.VideoCodec
                     Width         = $probe.Width
@@ -2025,6 +2047,7 @@ function Invoke-ScanFolder {
     $state = @{
         Seen      = 0
         Hits      = 0
+        Shrink    = 0
         Lean      = 0
         Dv        = 0
         NoDur     = 0
@@ -2057,6 +2080,7 @@ function Invoke-ScanFolder {
             Kind      = 'done'
             Seen      = $state.Seen
             Hits      = $state.Hits
+            Shrink    = $state.Shrink
             Lean      = $state.Lean
             Dv        = $state.Dv
             NoDur     = $state.NoDur
@@ -2427,7 +2451,10 @@ function Invoke-EngineSelfTest {
     Assert-Engine ((Get-OverBandId 2.9) -eq 'heavy') 'under 3x is heavy'
     Assert-Engine ((Get-OverBandId 3) -eq 'extreme') '3x is extreme'
     Assert-Engine ((Get-OverBandId 0.8) -eq '') 'under budget is not a band'
-    Assert-Engine ((Format-OverRatio 2) -eq '2.0x') 'over format'
+    Assert-Engine ((Format-OverRatio 2) -eq '2.00x') 'over format'
+    Assert-Engine ((Format-OverRatio 1) -eq '1.00x') 'the budget line reads 1.00x'
+    Assert-Engine ((Format-OverRatio 1.04) -eq '1.04x') 'a small overage keeps two decimals'
+    Assert-Engine ((Format-OverRatio 1.004) -eq '1.004x') 'a tiny overage does not round back to 1.00x'
     Assert-Engine ((Format-OverRatio $null) -eq '') 'blank over format'
 
     $hour = 3600.0
@@ -2438,13 +2465,22 @@ function Invoke-EngineSelfTest {
     Assert-Engine ($lean.Decision -eq 'lean') '1080p under budget is lean'
 
     $hevcOk = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]2.5GB) -DurationSec $hour -VideoBitrate 5000000 -Efficient $true)
-    Assert-Engine ($hevcOk.Decision -eq 'lean') 'HEVC under 3 GiB/h is lean'
+    Assert-Engine ($hevcOk.Decision -eq 'shrink') 'HEVC under 3 GiB/h with a high picture rate can shrink'
+    $hevcAtTarget = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]2.5GB) -DurationSec $hour -VideoBitrate 3000000 -Efficient $true)
+    Assert-Engine ($hevcAtTarget.Decision -eq 'lean') 'HEVC under the line with a picture at the target is left alone'
 
     $hevcFat = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]3.2GB) -DurationSec $hour -VideoBitrate 7000000 -Efficient $true)
     Assert-Engine ($hevcFat.Decision -eq 'bloated') 'HEVC over 3 GiB/h is bloated'
 
-    $fourLean = Get-BloatDecision -Probe (New-FakeProbe -Width 3840 -Height 2160 -SizeBytes ([int64]7GB) -DurationSec $hour -VideoBitrate 14000000)
-    Assert-Engine ($fourLean.Decision -eq 'lean') '4K under 8 GiB/h is lean'
+    $fourLean = Get-BloatDecision -Probe (New-FakeProbe -Width 3840 -Height 2160 -SizeBytes ([int64]7GB) -DurationSec $hour -VideoBitrate 12000000)
+    Assert-Engine ($fourLean.Decision -eq 'lean') '4K under 8 GiB/h with a picture at the target is left alone'
+    $underLine = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64](1.9GB)) -DurationSec $hour -VideoBitrate 4500000)
+    Assert-Engine ($underLine.Decision -eq 'shrink') 'a file under the line with a high picture rate can shrink'
+    Assert-Engine ($underLine.EstimateBytes -lt [int64](1.9GB)) 'the can-shrink estimate is smaller'
+    $underMissing = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64](1.9GB)) -DurationSec $hour)
+    Assert-Engine ($underMissing.Decision -eq 'lean') 'a missing picture rate under the line stays off the list'
+    $tinyUnder = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64](1.9GB)) -DurationSec $hour -VideoBitrate 100000)
+    Assert-Engine ($tinyUnder.Decision -eq 'lean') 'a tiny picture rate under the line stays off the list'
 
     $fourFat = Get-BloatDecision -Probe (New-FakeProbe -Width 3840 -Height 2160 -SizeBytes ([int64]9GB) -DurationSec $hour -VideoBitrate 20000000)
     Assert-Engine ($fourFat.Decision -eq 'bloated' -and $fourFat.TargetKbps -eq 12000) '4K over 8 GiB/h targets 12000 kbps'
