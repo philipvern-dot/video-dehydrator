@@ -10,6 +10,48 @@
 # never burn subtitles.
 
 $script:AudioCopyMask = 'aac,ac3,eac3,truehd,dts,dtshd,mp2,mp3,flac,opus'
+# AC-3 frame size in 16-bit words, from the ATSC table ffmpeg uses.
+# Row is frmsizecod 0..37. Column is 48 kHz, 44.1 kHz, 32 kHz.
+$script:Ac3FrameWords = @(
+    ,@(64, 69, 96)
+    ,@(64, 70, 96)
+    ,@(80, 87, 120)
+    ,@(80, 88, 120)
+    ,@(96, 104, 144)
+    ,@(96, 105, 144)
+    ,@(112, 121, 168)
+    ,@(112, 122, 168)
+    ,@(128, 139, 192)
+    ,@(128, 140, 192)
+    ,@(160, 174, 240)
+    ,@(160, 175, 240)
+    ,@(192, 208, 288)
+    ,@(192, 209, 288)
+    ,@(224, 243, 336)
+    ,@(224, 244, 336)
+    ,@(256, 278, 384)
+    ,@(256, 279, 384)
+    ,@(320, 348, 480)
+    ,@(320, 349, 480)
+    ,@(384, 417, 576)
+    ,@(384, 418, 576)
+    ,@(448, 487, 672)
+    ,@(448, 488, 672)
+    ,@(512, 557, 768)
+    ,@(512, 558, 768)
+    ,@(640, 696, 960)
+    ,@(640, 697, 960)
+    ,@(768, 835, 1152)
+    ,@(768, 836, 1152)
+    ,@(896, 975, 1344)
+    ,@(896, 976, 1344)
+    ,@(1024, 1114, 1536)
+    ,@(1024, 1115, 1536)
+    ,@(1152, 1253, 1728)
+    ,@(1152, 1254, 1728)
+    ,@(1280, 1393, 1920)
+    ,@(1280, 1394, 1920)
+)
 $script:ReferencePixels = [double](1920 * 1080)
 $script:ReferenceKbps = 3000
 $script:ReferenceBudgetGiBph = 2.0
@@ -376,6 +418,7 @@ function Get-MediaProbe {
     $videoBitrate = Get-StreamBitrate $video $duration
 
     return [pscustomobject]@{
+        Path             = $File
         DurationSec      = $duration
         SizeBytes        = $size
         VideoCodec       = $codec
@@ -603,6 +646,151 @@ function Test-HarmlessDecodeNote([string]$Text) {
     return $true
 }
 
+function Get-Ac3FrameSize([byte[]]$Data, [int]$Offset) {
+    if ($null -eq $Data -or $Offset -lt 0 -or ($Offset + 5) -gt $Data.Length) { return 0 }
+    if ($Data[$Offset] -ne 0x0B -or $Data[$Offset + 1] -ne 0x77) { return 0 }
+    $fscod = [int]($Data[$Offset + 4] -shr 6)
+    $code = [int]($Data[$Offset + 4] -band 0x3F)
+    if ($fscod -gt 2 -or $code -gt 37) { return 0 }
+    $words = [int]$script:Ac3FrameWords[$code][$fscod]
+    if ($words -le 0) { return 0 }
+    return ($words * 2)
+}
+
+function Test-Ac3ShortTailBytes([byte[]]$Data) {
+    if ($null -eq $Data -or $Data.Length -lt 16) { return $false }
+    $start = -1
+    $limit = $Data.Length - 5
+    for ($i = 0; $i -lt $limit; $i++) {
+        $size = Get-Ac3FrameSize $Data $i
+        if ($size -lt 64) { continue }
+        $next = $i + $size
+        if ($next -ge $Data.Length) { continue }
+        if ((Get-Ac3FrameSize $Data $next) -gt 0) {
+            $start = $i
+            break
+        }
+    }
+    if ($start -lt 0) { return $false }
+    $pos = $start
+    $frames = 0
+    while ($pos -lt $Data.Length) {
+        $size = Get-Ac3FrameSize $Data $pos
+        if ($size -lt 64) { return $false }
+        if (($pos + $size) -gt $Data.Length) {
+            return ($frames -ge 2)
+        }
+        if (($pos + $size) -eq $Data.Length) { return $false }
+        $frames++
+        $pos += $size
+    }
+    return $false
+}
+
+function Test-TrailingAc3Note([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $lines = @($Text -split '\s+\|\s+|\r?\n' | Where-Object { $_ -and $_.Trim() })
+    if ($lines.Count -eq 0) { return $false }
+    $incomplete = 0
+    foreach ($line in $lines) {
+        $body = $line.Trim()
+        if ($body -match '^decode Last exit=(-?\d+)\s+(.*)$') {
+            $exitCode = [int64]$Matches[1]
+            if ($exitCode -eq 0) { return $false }
+            $body = [string]$Matches[2]
+        }
+        $known = $false
+        if ($body -match '^\[ac3 @ [0-9A-Fa-fx]+\] incomplete frame$') {
+            $incomplete++
+            $known = $true
+        }
+        elseif ($body -match '^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] corrupt decoded frame$') {
+            $known = $true
+        }
+        elseif ($body -match '^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] Error processing packet in decoder: Invalid data found when processing input$') {
+            $known = $true
+        }
+        elseif ($body -match '^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] Error submitting packet to decoder: Invalid data found when processing input$') {
+            $known = $true
+        }
+        elseif ($body -match '^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] Task finished with error code: -1094995529 \(Invalid data found when processing input\)$') {
+            $known = $true
+        }
+        elseif ($body -match '^\[aist#\d+:\d+/ac3 @ [^\]]+\] \[dec:ac3 @ [^\]]+\] Terminating thread with return code -1094995529 \(Invalid data found when processing input\)$') {
+            $known = $true
+        }
+        if (-not $known) { return $false }
+    }
+    return ($incomplete -eq 1)
+}
+
+function Test-CopiedAc3([string[]]$SourceCodecs, [string[]]$OutputCodecs) {
+    $source = @()
+    $output = @()
+    if ($null -ne $SourceCodecs) { $source = @($SourceCodecs) }
+    if ($null -ne $OutputCodecs) { $output = @($OutputCodecs) }
+    $found = $false
+    for ($i = 0; $i -lt $source.Count; $i++) {
+        $left = [string]$source[$i]
+        if ($left.Trim().ToLowerInvariant() -ne 'ac3') { continue }
+        $right = ''
+        if ($i -lt $output.Count) { $right = [string]$output[$i] }
+        if ($right.Trim().ToLowerInvariant() -ne 'ac3') { return $false }
+        $found = $true
+    }
+    return $found
+}
+
+function Test-OneAc3ShortTail {
+    param(
+        [Parameter(Mandatory)][string]$Ffmpeg,
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][int]$AudioIndex
+    )
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ('vd-ac3-' + [guid]::NewGuid().ToString('n') + '.ac3')
+    try {
+        $run = Invoke-CapturedProcess -File $Ffmpeg -Arguments @(
+            '-y', '-hide_banner', '-nostdin', '-v', 'error',
+            '-sseof', '-3', '-i', $File,
+            '-map', "0:a:$AudioIndex",
+            '-c', 'copy', '-f', 'ac3', $temp
+        )
+        if ($run.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $temp)) { return $false }
+        $bytes = [IO.File]::ReadAllBytes($temp)
+        return (Test-Ac3ShortTailBytes $bytes)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if (Test-Path -LiteralPath $temp) {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Test-SourceAc3ShortTail {
+    param(
+        [Parameter(Mandatory)][string]$Ffmpeg,
+        [Parameter(Mandatory)][string]$File,
+        [string[]]$Codecs
+    )
+    if ([string]::IsNullOrWhiteSpace($File) -or -not (Test-Path -LiteralPath $File)) { return $false }
+    $names = @()
+    if ($null -ne $Codecs) { $names = @($Codecs) }
+    $indexes = New-Object System.Collections.Generic.List[int]
+    for ($i = 0; $i -lt $names.Count; $i++) {
+        if ([string]$names[$i] -and [string]$names[$i].Trim().ToLowerInvariant() -eq 'ac3') {
+            $indexes.Add($i)
+        }
+    }
+    if ($indexes.Count -eq 0) { return $false }
+    foreach ($index in $indexes) {
+        if (-not (Test-OneAc3ShortTail -Ffmpeg $Ffmpeg -File $File -AudioIndex $index)) { return $false }
+    }
+    return $true
+}
+
 function Test-DecodeWindow {
     param(
         [Parameter(Mandatory)][string]$Ffmpeg,
@@ -784,7 +972,15 @@ function Test-EncodedFile {
     $first = Test-DecodeWindow -Ffmpeg $Ffmpeg -File $Temp -DurationSec $out.DurationSec -Window First
     if (-not $first.Ok) { $reasons.Add($first.Detail) }
     $last = Test-DecodeWindow -Ffmpeg $Ffmpeg -File $Temp -DurationSec $out.DurationSec -Window Last
-    if (-not $last.Ok) { $reasons.Add($last.Detail) }
+    if (-not $last.Ok) {
+        # A VirtualDub-style AVI can end in the middle of an AC3 frame.
+        # Copying that track keeps the short tail. Accept one incomplete
+        # frame at the end when every copied AC3 track already ended that way.
+        $sourcePath = ''
+        if ($SourceProbe -and $SourceProbe.Path) { $sourcePath = [string]$SourceProbe.Path }
+        $trailing = (Test-TrailingAc3Note $last.Detail) -and (Test-CopiedAc3 @($SourceProbe.AudioCodecs) @($out.AudioCodecs)) -and (Test-SourceAc3ShortTail -Ffmpeg $Ffmpeg -File $sourcePath -Codecs @($SourceProbe.AudioCodecs))
+        if (-not $trailing) { $reasons.Add($last.Detail) }
+    }
     foreach ($audioReason in @(Get-AudioChangeReasons -SourceCodecs @($SourceProbe.AudioCodecs) -OutputCodecs @($out.AudioCodecs) -AllowReencode:$AllowAudioReencode)) {
         $reasons.Add($audioReason)
     }
@@ -2521,6 +2717,34 @@ function Invoke-EngineSelfTest {
     Assert-Engine (Test-HarmlessDecodeNote '') 'an empty decode note is harmless'
     Assert-Engine (-not (Test-HarmlessDecodeNote '[null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 4')) 'a backwards timestamp is not harmless'
     Assert-Engine (-not (Test-HarmlessDecodeNote ($sameStamp + ' | Error while decoding stream'))) 'another decode message is not harmless'
+    $ac3Tail = 'decode Last exit=-1094995529 [ac3 @ 00000200d45dad40] incomplete frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] corrupt decoded frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Error processing packet in decoder: Invalid data found when processing input | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Task finished with error code: -1094995529 (Invalid data found when processing input) | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Terminating thread with return code -1094995529 (Invalid data found when processing input)'
+    Assert-Engine (Test-TrailingAc3Note $ac3Tail) 'one trailing incomplete AC3 frame is the allowed note'
+    Assert-Engine (-not (Test-TrailingAc3Note ($ac3Tail + ' | [mpeg4 @ 00000001] error while decoding'))) 'a picture error stays a failure'
+    Assert-Engine (-not (Test-TrailingAc3Note ($ac3Tail + ' | [ac3 @ 00000001] incomplete frame'))) 'two incomplete AC3 frames stay a failure'
+    Assert-Engine (-not (Test-TrailingAc3Note ($ac3Tail -replace 'decode Last', 'decode First'))) 'the first window does not use the tail exception'
+    Assert-Engine (-not (Test-TrailingAc3Note '')) 'a blank note is not a trailing AC3 frame'
+    $ac3Frame = New-Object byte[] 768
+    $ac3Frame[0] = 0x0B
+    $ac3Frame[1] = 0x77
+    $ac3Frame[4] = 20
+    Assert-Engine ((Get-Ac3FrameSize $ac3Frame 0) -eq 768) '192 kbps 48 kHz AC3 frame is 768 bytes'
+    $ac3Whole = New-Object byte[] 1536
+    [Buffer]::BlockCopy($ac3Frame, 0, $ac3Whole, 0, 768)
+    [Buffer]::BlockCopy($ac3Frame, 0, $ac3Whole, 768, 768)
+    Assert-Engine (-not (Test-Ac3ShortTailBytes $ac3Whole)) 'a complete AC3 tail is not short'
+    $ac3Short = New-Object byte[] (1536 + 288)
+    [Buffer]::BlockCopy($ac3Whole, 0, $ac3Short, 0, 1536)
+    $ac3Short[1536] = 0x0B
+    $ac3Short[1537] = 0x77
+    $ac3Short[1540] = 20
+    Assert-Engine (Test-Ac3ShortTailBytes $ac3Short) 'a copied AC3 tail that ends mid-frame is short'
+    $ac3Prefixed = New-Object byte[] (20 + $ac3Short.Length)
+    [Buffer]::BlockCopy($ac3Short, 0, $ac3Prefixed, 20, $ac3Short.Length)
+    Assert-Engine (Test-Ac3ShortTailBytes $ac3Prefixed) 'junk before the AC3 frames still shows the short tail'
+    Assert-Engine (Test-CopiedAc3 @('ac3') @('ac3')) 'copied AC3 stays AC3'
+    Assert-Engine (-not (Test-CopiedAc3 @('ac3') @('aac'))) 'AC3 re-encoded to AAC is not the tail exception'
+    Assert-Engine (-not (Test-CopiedAc3 @('aac') @('aac'))) 'AAC does not use the AC3 tail exception'
+    Assert-Engine (-not (Test-CopiedAc3 @('ac3', 'ac3') @('ac3', 'aac'))) 'one changed AC3 track blocks the exception'
 
     Assert-Engine (Test-CopyableAudioCodec 'aac') 'aac can be copied'
     Assert-Engine (Test-CopyableAudioCodec 'AC3') 'ac3 can be copied'
