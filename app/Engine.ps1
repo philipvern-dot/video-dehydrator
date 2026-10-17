@@ -1077,6 +1077,13 @@ function Remove-PlexIgnore {
 $script:RecycleFolderName = '#recycle'
 $script:RecycleResults = New-Object System.Collections.ArrayList
 
+# The window stores the checkbox in RecyclePurgeEnabled. An unset value means
+# the engine is running its own self-test, where the purge stays available.
+function Test-RecyclePurgeEnabled {
+    if ($null -eq $script:RecyclePurgeEnabled) { return $true }
+    return [bool]$script:RecyclePurgeEnabled
+}
+
 function New-RecycleResult {
     param(
         [string]$Status,
@@ -1744,6 +1751,7 @@ function Remove-RecycledPlexIgnore {
         [Parameter(Mandatory)][int64]$Length,
         $DriveMap
     )
+    if (-not (Test-RecyclePurgeEnabled)) { return }
     if ($Length -le 0 -or $Length -gt 4096) { return }
     $plan = Get-RecycleNamedPlan -Path $Path -LeafName '.plexignore' -DriveMap $DriveMap
     if (-not $plan) { return }
@@ -1762,6 +1770,7 @@ function Remove-RecycleCopy {
         [Parameter(Mandatory)][int64]$Length,
         $DriveMap
     )
+    if (-not (Test-RecyclePurgeEnabled)) { return }
     $name = ''
     try { $name = [IO.Path]::GetFileName($Path) } catch { $name = '' }
     if ($Length -le 0) {
@@ -1802,6 +1811,7 @@ function Invoke-RecycleDirectoryCleanup {
 
 function Remove-RecycledHoldingFolder {
     param([string]$Directory, $DriveMap)
+    if (-not (Test-RecyclePurgeEnabled)) { return }
     if (-not $Directory) { return }
     $plan = Get-RecycleDirectoryPlan -Directory $Directory -DriveMap $DriveMap
     if (-not $plan) { return }
@@ -2317,6 +2327,14 @@ function Invoke-RecycleSelfTest {
     Assert-Engine ($null -eq (Get-RecyclePlan -Path '\\nas\media\ShowA\.vd-originals\..\ShowB\.vd-originals\Episode.avi')) 'a parent segment produced a plan'
     $odd = Get-RecyclePlan -Path ('\\nas\media\TV\Show' + "'" + 's\.vd-originals\Episode.avi')
     Assert-Engine ($odd.RecycleFile -eq ('\\nas\media\#recycle\TV\Show' + "'" + 's\.vd-originals\Episode.avi')) 'apostrophe path'
+    $keptPurge = $script:RecyclePurgeEnabled
+    $script:RecyclePurgeEnabled = $false
+    $gated = Remove-RecycleCopy -Path '\\nas\media\TV\.vd-originals\Episode.avi' -Length 100
+    Assert-Engine ($null -eq $gated) 'a turned-off recycle purge still ran'
+    $gatedIgnore = Remove-RecycledPlexIgnore -Path '\\nas\media\TV\.plexignore' -Length 40
+    Assert-Engine ($null -eq $gatedIgnore) 'a turned-off recycle purge removed a plexignore'
+    $script:RecyclePurgeEnabled = $keptPurge
+    Assert-Engine (Test-RecyclePurgeEnabled) 'recycle purge was off with no choice stored'
     $zero = Remove-RecycleCopy -Path '\\nas\media\TV\.vd-originals\Episode.avi' -Length 0
     Assert-Engine ($zero.Status -eq 'skipped') 'unknown length was purged'
     $localSkip = Remove-RecycleCopy -Path 'C:\Library\.vd-originals\Episode.avi' -Length 100

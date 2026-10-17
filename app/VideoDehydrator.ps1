@@ -341,7 +341,7 @@ $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.7.1'
+$script:UpdateFallback = '1.0.7.2'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -857,6 +857,8 @@ function Load-Settings {
         Detailed = $false
         Budgets = ''
         Shutdown = $false
+        PurgeRecycle = $false
+        RecycleAlertMuted = $false
         UpdatePrompt = ''
         DeleteConfirmVersion = ''
         ColumnOrder = @()
@@ -872,6 +874,8 @@ function Load-Settings {
         if ($null -ne $json.detailed) { $defaults.Detailed = [bool]$json.detailed }
         if ($json.budgets) { $defaults.Budgets = [string]$json.budgets }
         if ($null -ne $json.shutdown) { $defaults.Shutdown = [bool]$json.shutdown }
+        if ($null -ne $json.purgeRecycle) { $defaults.PurgeRecycle = [bool]$json.purgeRecycle }
+        if ($null -ne $json.recycleAlertMuted) { $defaults.RecycleAlertMuted = [bool]$json.recycleAlertMuted }
         if ($json.updatePrompt) { $defaults.UpdatePrompt = [string]$json.updatePrompt }
         if ($json.deleteConfirmVersion) { $defaults.DeleteConfirmVersion = [string]$json.deleteConfirmVersion }
         if ($json.columnOrder) {
@@ -899,6 +903,12 @@ function Load-Settings {
     return $defaults
 }
 
+function Sync-RecyclePurge {
+    $on = $false
+    if ($script:RecycleCheck) { $on = [bool]$script:RecycleCheck.Checked }
+    $script:RecyclePurgeEnabled = $on
+}
+
 function Save-Settings {
     if ($script:SmokeTest) { return }
     if ($null -eq $script:SubfoldersCheck) { return }
@@ -913,6 +923,8 @@ function Save-Settings {
         detailed = [bool]$script:DetailedCheck.Checked
         budgets = (Get-SelectedBudgetPack)
         shutdown = [bool]$script:ShutdownCheck.Checked
+        purgeRecycle = $(if ($script:RecycleCheck) { [bool]$script:RecycleCheck.Checked } else { [bool]$script:RecyclePurgeEnabled })
+        recycleAlertMuted = [bool]$script:RecycleAlertMuted
         updatePrompt = [string]$script:UpdatePrompt
         deleteConfirmVersion = [string]$script:DeleteConfirmVersion
         columnOrder = @($script:ColumnOrder)
@@ -1368,9 +1380,9 @@ function Update-ResultRow($item) {
     }
     $anchor = Get-RowBudgetAnchor $tag
     if ($anchor) { $tip = $tip + "`r`n" + 'Follows the ' + $anchor.Name + ' budget.' }
-    if ($tag.EstimateRough) { $tip = $tip + "`r`n" + 'New size starts with ~ because the picture rate could not be read. That guess can run high.' }
-    if ($null -ne (Get-EstimatedSavingsBytes $tag)) { $tip = $tip + "`r`n" + '~Savings is the current size minus New size. The first click on that heading puts the largest estimates first.' }
-    if ($null -ne (Get-SpaceSavedBytes $tag)) { $tip = $tip + "`r`n" + 'Space saved is the original size minus the converted file.' }
+    if ($tag.EstimateRough) { $tip = $tip + "`r`n" + 'New size is a guess.' }
+    if ($null -ne (Get-EstimatedSavingsBytes $tag)) { $tip = $tip + "`r`n" + '~Savings is current size minus New size.' }
+    if ($null -ne (Get-SpaceSavedBytes $tag)) { $tip = $tip + "`r`n" + 'Space saved is the original minus the new file.' }
     $item.ToolTipText = $tip
 }
 
@@ -1930,7 +1942,7 @@ function Update-Buttons {
     if ($script:OverBandCounts -and $script:OverBandCounts.ContainsKey($overId)) { $overCount = [int]$script:OverBandCounts[$overId] }
     if ($script:OverPick) { $script:OverPick.Enabled = -not $busy }
     if ($script:SelectOverButton) { $script:SelectOverButton.Enabled = ((-not $busy) -and $overCount -gt 0) }
-    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
+    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:RecycleCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
         if ($chk) { $chk.Enabled = -not $busy }
     }
     foreach ($box in @($script:BudgetBoxes)) {
@@ -3021,7 +3033,7 @@ function Start-Convert {
         Save-Settings
     }
     if ($script:AutoCheck.Checked) {
-        $answer = [Windows.Forms.MessageBox]::Show($script:Form, "Auto is on.`r`n`r`nAfter each file checks out, its original is deleted. The new file stays in the original's place. There will be nothing left to compare. On a shared drive, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder.", 'Video Dehydrator', 'OKCancel', 'Warning')
+        $answer = [Windows.Forms.MessageBox]::Show($script:Form, "Auto is on.`r`n`r`nAfter each file checks out, its original is deleted. The new file stays in the original's place. There will be nothing left to compare. When Clear the drive recycle copy is on, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder.", 'Video Dehydrator', 'OKCancel', 'Warning')
         if ($answer -ne [Windows.Forms.DialogResult]::OK) { return }
     }
     Stop-Playback
@@ -3125,7 +3137,8 @@ function New-RecycleProblemForm($Problems) {
     $form.MinimizeBox = $false
     $form.ShowInTaskbar = $false
     $form.KeyPreview = $true
-    $form.ClientSize = New-Object Drawing.Size(560, 420)
+    $form.ClientSize = New-Object Drawing.Size(560, 500)
+    $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
     $form.Font = $script:FontUi
     $form.BackColor = [Drawing.Color]::White
     $icon = Get-AppIcon
@@ -3134,14 +3147,14 @@ function New-RecycleProblemForm($Problems) {
     $intro.Font = $script:FontUi
     $intro.ForeColor = $script:ColorInk
     $intro.BackColor = [Drawing.Color]::White
-    $intro.SetBounds(24, 16, 512, 118)
-    $intro.Text = "The original is already deleted from the library. The drive recycle bin may still have a copy, and the program could not remove it.`r`n`r`nThe link below opens the manual steps. Those steps remove only .vd-originals folders inside #recycle. A share that does not keep a recycle bin can show this same window, and then there is nothing to remove."
+    $intro.SetBounds(24, 16, 512, 210)
+    $intro.Text = "The original is already deleted from the library. The drive recycle bin may still have a copy, and the program could not remove it.`r`n`r`nThe link below opens the manual steps. Those steps remove only .vd-originals folders inside #recycle. A share that does not keep a recycle bin can show this same window, and then there is nothing to remove.`r`n`r`nMute hides this window after this one time. The activity list still records a later failure, and the steps stay in How this works."
     $detail = New-Object Windows.Forms.TextBox
     $detail.Multiline = $true
     $detail.ReadOnly = $true
     $detail.ScrollBars = 'Vertical'
     $detail.Font = $script:FontUi
-    $detail.SetBounds(24, 142, 512, 176)
+    $detail.SetBounds(24, 234, 512, 128)
     $detail.Text = Format-RecycleProblemText $Problems
     $link = New-Object Windows.Forms.LinkLabel
     $link.Text = 'Show the manual deletion steps'
@@ -3149,15 +3162,19 @@ function New-RecycleProblemForm($Problems) {
     $link.LinkColor = [Drawing.Color]::FromArgb(37, 99, 235)
     $link.ActiveLinkColor = [Drawing.Color]::FromArgb(29, 78, 216)
     $link.AutoSize = $true
-    $link.Location = New-Object Drawing.Point(24, 332)
+    $link.Location = New-Object Drawing.Point(24, 374)
+    $mute = New-Button 'Mute' 'secondary' 110 34
+    $mute.SetBounds(308, 446, 110, 34)
     $close = New-Button 'Close' 'secondary' 110 34
-    $close.SetBounds(426, 368, 110, 34)
-    Set-Tip $close 'Close this list. The computer stays on if shutdown was waiting.'
+    $close.SetBounds(426, 446, 110, 34)
+    Set-Tip $mute 'Hide this window after this one time.'
+    Set-Tip $close 'Close this list. It opens again next time.'
     $form.Controls.Add($intro)
     $form.Controls.Add($detail)
     $form.Controls.Add($link)
+    $form.Controls.Add($mute)
     $form.Controls.Add($close)
-    $state = [pscustomobject]@{ OpenHelp = $false }
+    $state = [pscustomobject]@{ OpenHelp = $false; Mute = $false }
     $form.Tag = $state
     $close.DialogResult = [Windows.Forms.DialogResult]::Cancel
     $form.CancelButton = $close
@@ -3165,7 +3182,17 @@ function New-RecycleProblemForm($Problems) {
         $state.OpenHelp = $true
         $form.Close()
     }.GetNewClosure())
+    $mute.Add_Click({
+        $state.Mute = $true
+        $form.Close()
+    }.GetNewClosure())
     return $form
+}
+
+function Complete-RecycleMute([bool]$Mute) {
+    if (-not $Mute) { return }
+    $script:RecycleAlertMuted = $true
+    Save-Settings
 }
 
 function Show-PendingRecycleProblems {
@@ -3175,10 +3202,12 @@ function Show-PendingRecycleProblems {
     $problems = @(Get-UnshownRecycleProblems)
     if ($problems.Count -eq 0) { return }
     foreach ($row in $problems) { $row.Shown = $true }
+    if ($script:RecycleAlertMuted) { return }
     $form = New-RecycleProblemForm $problems
     $state = $form.Tag
     try { [void]$form.ShowDialog($script:Form) }
     finally { if (-not $form.IsDisposed) { $form.Dispose() } }
+    if ($state.Mute) { Complete-RecycleMute $true }
     if ($state.OpenHelp) {
         $script:HoldShutdownForRecycle = $true
         Show-Help -Section 'Drive recycle bin'
@@ -3222,7 +3251,7 @@ function New-DeleteConfirmForm([int]$Count) {
     $label.ForeColor = $script:ColorInk
     $label.BackColor = [Drawing.Color]::White
     $label.SetBounds(24, 16, 492, 168)
-    $label.Text = "Delete $Count $word?`r`n`r`nThe new smaller files stay where the originals were. On a shared drive, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder."
+    $label.Text = "Delete $Count $word?`r`n`r`nThe new smaller files stay where the originals were. When Clear the drive recycle copy is on, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder."
     $hide = New-Check "Don't show this in the future"
     $hide.SetBounds(24, 196, 492, 24)
     $hint = New-Object Windows.Forms.Label
@@ -3904,7 +3933,7 @@ function Update-BudgetTips {
         }
         $numbers = Get-AnchorBudget -Anchor $anchor -PickId $pick
         $hevc = Format-BudgetGiB $numbers.HevcGiBph
-        $text = "$($anchor.Name) budget, $($box.Text). Files with this color in Dimensions follow this choice. The new file is encoded at $($numbers.Kbps) kbps. HEVC and AV1 use a higher line, $hevc. A file under that line is still listed when its picture is above the target rate. A nearby picture size follows this choice. The choice is remembered."
+        $text = "$($anchor.Name): $($box.Text). Encode at $($numbers.Kbps) kbps. HEVC and AV1 use $hevc."
         Set-Tip $box $text
     }
 }
@@ -4023,7 +4052,7 @@ function Layout-Options {
     if ($null -eq $card -or $card.ClientSize.Width -lt 20) { return }
     $script:OptionsTitle.SetBounds(16, 8, 200, 22)
     $y = 36
-    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
+    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:RecycleCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
         if (-not $chk) { continue }
         $chk.Location = New-Object Drawing.Point(16, $y)
         $y += 28
@@ -4191,16 +4220,18 @@ function Get-HelpSections {
         },
         @{
             Title = 'Auto'
-            Body = "Delete originals automatically does the deletion as soon as a file checks out. The check looks at size, length, picture size, audio, subtitles, and whether the start and end play. It does not judge how the picture looks. The first time Auto is turned on, the program explains that Compare and Undo cannot bring the original back. You can hide that explanation. The program still asks before every convert with Auto turned on. With Auto off, every original stays until you press Delete originals. On a shared drive, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder. When that removal fails, a window opens with a link to the manual steps."
+            Body = "Delete originals automatically does the deletion as soon as a file checks out. The check looks at size, length, picture size, audio, subtitles, and whether the start and end play. It does not judge how the picture looks. The first time Auto is turned on, the program explains that Compare and Undo cannot bring the original back. You can hide that explanation. The program still asks before every convert with Auto turned on. With Auto off, every original stays until you press Delete originals. Clear the drive recycle copy is separate. With that box on, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder. When that removal fails, a window opens with a link to the manual steps. Mute on that window hides it after this one time."
         },
         @{
             Title = 'Drive recycle bin'
             Body = @'
 A shared drive can keep its own copy of a file after Video Dehydrator deletes it. The copy goes in a folder named #recycle at the top of the share. The folders underneath stay the same, including .vd-originals. That folder is on the drive. It is separate from the recycle bin Windows keeps on this PC.
 
-After Delete originals, or after Delete originals automatically removes a file, the program looks for that one copy. It builds the path from the share, then #recycle, then the same folders. The file has to sit directly inside .vd-originals, and the size has to match the file that was just deleted. When both match, that copy is deleted. The .plexignore from that convert is removed too, when the recycled copy contains only the lines that hide .vd-originals. A .plexignore that lists anything else stays. Empty folders left behind are removed, and the folders above them are removed when those are empty too. A folder that still contains another file or folder is left, so another computer can finish its own delete. Removal stops at the #recycle folder. Anything else in the bin stays, including a file you deleted yourself. A temporary encode file inside .vd-originals is removed the same way. The new video that stays in the library is left alone.
+Clear the drive recycle copy starts off. With that box off, the program leaves #recycle alone. The copy stays on the drive until you remove it with the steps below.
 
-When this step cannot remove the copy, a window opens. The link in that window opens this section. The original is already gone from the library. The copy in the bin is the leftover. A share with a #recycle folder and no matching file shows the same window. When the share does not keep deleted files, there is nothing to remove.
+With that box on, after Delete originals, after Delete originals automatically removes a file, after undo discards a new file, or after a temporary encode file is removed, the program looks for that one copy. It builds the path from the share, then #recycle, then the same folders. The file has to sit directly inside .vd-originals, and the size has to match the file that was just deleted. When both match, that copy is deleted. The .plexignore from that convert is removed too, when the recycled copy contains only the lines that hide .vd-originals. A .plexignore that lists anything else stays. Empty folders left behind are removed, and the folders above them are removed when those are empty too. A folder that still contains another file or folder is left, so another computer can finish its own delete. Removal stops at the #recycle folder. Anything else in the bin stays, including a file you deleted yourself. The new video that stays in the library is left alone.
+
+When this step cannot remove the copy, a window opens. The link in that window opens this section. Mute hides that window after this one time. Later failures are still written in the activity list, and these steps stay here. Shutdown still runs when that box is on, because Mute does not open this section. The original is already gone from the library. The copy in the bin is the leftover. A share with a #recycle folder and no matching file shows the same window. When the share does not keep deleted files, there is nothing to remove.
 
 To remove a leftover yourself:
 
@@ -4412,6 +4443,8 @@ $settings = Load-Settings
 $script:AutoWarnAccepted = [bool]$settings.AutoWarnAccepted
 $script:UpdatePrompt = [string]$settings.UpdatePrompt
 $script:DeleteConfirmVersion = [string]$settings.DeleteConfirmVersion
+$script:RecycleAlertMuted = [bool]$settings.RecycleAlertMuted
+$script:RecyclePurgeEnabled = [bool]$settings.PurgeRecycle
 $script:AutoWarnShown = $false
 $script:AutoWarnBusy = $false
 Set-BudgetPicks ([string]$settings.Budgets)
@@ -4427,7 +4460,7 @@ $script:Form.KeyPreview = $true
 $script:Form.AllowDrop = $true
 $area = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $wantW = 1120
-$wantH = 920
+$wantH = 948
 if ($wantW -gt ($area.Width - 24)) { $wantW = [Math]::Max(860, $area.Width - 24) }
 if ($wantH -gt ($area.Height - 24)) { $wantH = [Math]::Max(680, $area.Height - 24) }
 $script:Form.ClientSize = New-Object Drawing.Size($wantW, $wantH)
@@ -4510,7 +4543,7 @@ $table.GrowStyle = 'FixedSize'
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 40)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 70)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Percent, 58)))
-[void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 252)))
+[void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 280)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 92)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Absolute, 26)))
 [void]$table.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Percent, 42)))
@@ -4797,17 +4830,20 @@ $script:OptionsTitle.BackColor = [Drawing.Color]::White
 $script:SubfoldersCheck = New-Check 'Include subfolders'
 $script:AutoCheck = New-Check 'Delete originals automatically'
 $script:AutoCheck.AutoCheck = $false
+$script:RecycleCheck = New-Check 'Clear the drive recycle copy'
 $script:ReencodeCheck = New-Check 'Re-encode audio that cannot be copied'
 $script:DetailedCheck = New-Check 'Show detailed activity'
 $script:ShutdownCheck = New-Check 'Shutdown computer upon completion'
 $script:SubfoldersCheck.Checked = [bool]$settings.IncludeSubfolders
 $script:AutoCheck.Checked = [bool]$settings.AutoDelete
+$script:RecycleCheck.Checked = [bool]$settings.PurgeRecycle
 $script:ReencodeCheck.Checked = [bool]$settings.ReencodeAudio
 $script:DetailedCheck.Checked = [bool]$settings.Detailed
 $script:ShutdownCheck.Checked = [bool]$settings.Shutdown
 $script:OptionsCard.Controls.Add($script:OptionsTitle)
 $script:OptionsCard.Controls.Add($script:SubfoldersCheck)
 $script:OptionsCard.Controls.Add($script:AutoCheck)
+$script:OptionsCard.Controls.Add($script:RecycleCheck)
 $script:OptionsCard.Controls.Add($script:ReencodeCheck)
 $script:OptionsCard.Controls.Add($script:DetailedCheck)
 $script:OptionsCard.Controls.Add($script:ShutdownCheck)
@@ -4874,6 +4910,11 @@ $script:OptionsCard.Add_Paint({
 foreach ($chk in @($script:SubfoldersCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
     $chk.Add_CheckedChanged({ if (-not $script:Loading) { Save-Settings } })
 }
+$script:RecycleCheck.Add_CheckedChanged({
+    if ($script:Loading) { return }
+    Sync-RecyclePurge
+    Save-Settings
+})
 $script:AutoCheck.Add_Click({
     if ($script:Loading -or $script:AutoWarnBusy) { return }
     $script:AutoCheck.Checked = -not $script:AutoCheck.Checked
@@ -4964,40 +5005,41 @@ $script:Form.Controls.Add($table)
 $script:Form.Controls.Add($script:StatusPanel)
 $script:Form.Controls.Add($script:Header)
 
-Set-Tip $script:FolderBox 'The folder Scan will look through. Drop a folder here, or click Browse. The choice is remembered.'
-Set-Tip $script:SavingsLabel 'Current size minus the New size column, for the checked files Convert will shrink. A New size that starts with ~ had no picture rate, so that guess can run high. It changes as you check and uncheck rows.'
+Set-Tip $script:FolderBox 'Folder to scan. Drop a folder here, or click Browse.'
+Set-Tip $script:SavingsLabel 'Current size minus New size, for the checked files. A ~ means the picture rate was missing.'
 Set-Tip $script:BrowseButton 'Choose the folder to scan.'
-Set-Tip $script:SubfoldersCheck 'Look inside folders within the chosen folder. Turn this off to scan only the files sitting directly in that folder.'
-Set-Tip $script:AutoCheck 'After a new file checks out, delete the original. The first time, the program explains what you give up. On a shared drive, the matching #recycle copy is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder, and empty folders from the delete are removed when nothing else is in them. Leave this off to compare first and delete with the Delete originals button.'
-Set-Tip $script:ReencodeCheck 'Some audio, such as Windows Media Audio, cannot be copied into the new file. With this on, that audio is re-encoded to AAC and the convert can finish. With this off, the convert stops and the original stays. Audio that can be copied is still copied either way.'
-Set-Tip $script:DetailedCheck 'List each encode step in the activity box. The running percent stays on the bar, not as a new line.'
-Set-Tip $script:ShutdownCheck 'After Convert finishes, turn the computer off. A one-minute countdown lets you cancel. The computer stays on if you stop the convert. A scan does not turn it off.'
-Set-Tip $script:ClearSkipsButton 'Forget files that were left off later scans because the new copy was larger. Scan again after this to list them. A smaller budget lists them again without clearing.'
-Set-Tip $script:BudgetTitle 'The size line for each picture. Recommended is where the program starts. Scan again after you change one.'
+Set-Tip $script:SubfoldersCheck 'Also scan the folders inside the chosen folder.'
+Set-Tip $script:AutoCheck 'Delete each original as soon as the new file checks out. The #recycle copy is removed only when Clear the drive recycle copy is on.'
+Set-Tip $script:RecycleCheck 'Remove the matching #recycle copy after a delete. Mute hides the failure window after one time.'
+Set-Tip $script:ReencodeCheck 'Turn audio that cannot be copied, such as Windows Media Audio, into AAC.'
+Set-Tip $script:DetailedCheck 'List each encode step. The percent stays on the bar.'
+Set-Tip $script:ShutdownCheck 'Turn the computer off after Convert finishes. You get one minute to cancel.'
+Set-Tip $script:ClearSkipsButton 'Forget files skipped because the new copy was larger. Scan again to list them.'
+Set-Tip $script:BudgetTitle 'Size line for each picture. Recommended is the starting choice.'
 Update-BudgetTips
-Set-Tip $script:ScanButton 'Read the videos in the folder and list the ones that are too big for their picture size.'
-Set-Tip $script:ConvertButton 'Shrink every checked video that is bloated, can shrink, failed, or skipped earlier. The new file takes the original place. A file marked Skipped was left alone because the new copy was not smaller.'
+Set-Tip $script:ScanButton 'List videos that are too big for their picture size.'
+Set-Tip $script:ConvertButton 'Shrink the checked bloated, can-shrink, failed, and skipped files.'
 Set-Tip $script:CancelButton 'Stop the scan or the file that is converting. Esc does this too.'
-Set-Tip $script:StopAfterButton 'Let the file that is converting finish, then stop the batch. The files still waiting stay checked.'
+Set-Tip $script:StopAfterButton 'Finish this file, then stop. The rest stay checked.'
 Set-Tip $script:ContinueButton 'Keep converting the rest of the batch.'
-Set-Tip $script:CompareButton 'Play the original and the new file side by side. The sound will not stay in sync with the picture. Go to the file on disk to confirm the audio.'
-Set-Tip $script:UndoButton 'Put the originals from the last conversion back, and delete the new files. The program asks first.'
-Set-Tip $script:DeleteButton 'Delete the checked originals that are waiting in .vd-originals. The new files stay. On a shared drive, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder, and empty folders from the delete are removed when nothing else is in them.'
-Set-Tip $script:HelpButton 'Open a short guide to the size rule, comparing, and what each part of this folder is for. The guide includes the steps to clear a drive recycle bin by hand.'
-Set-Tip $script:CheckUpdateButton 'Look on GitHub for a newer version of Video Dehydrator. A window opens the first time a newer version is found. The status line keeps saying that version is available.'
+Set-Tip $script:CompareButton 'Play both files side by side. The sound will not stay in sync.'
+Set-Tip $script:UndoButton 'Put the last conversion back. The program asks first.'
+Set-Tip $script:DeleteButton 'Delete the checked originals in .vd-originals. The #recycle copy is removed only when that box is on.'
+Set-Tip $script:HelpButton 'Open the guide, including how to clear a drive recycle bin by hand.'
+Set-Tip $script:CheckUpdateButton 'Look on GitHub for a newer version.'
 Set-Tip $script:DonateButton 'Free forever. Tips of $5 or more can include a feature suggestion.'
-Set-Tip $script:ReportBugButton 'Open a GitHub bug report with this version and the Windows version filled in. Include latest activity is optional. Leave it unchecked and nothing else is added.'
-Set-Tip $script:UpdateButton 'Download the newer version and open its setup program. This window closes while that setup runs.'
-Set-Tip $script:FolderPick 'Folders that have bloated or can-shrink files. A show is listed with the folders inside it. Pick one to make a smaller convert job.'
-Set-Tip $script:SelectFolderButton 'Check the bloated and can-shrink files in the folder shown here, and clear the other checks.'
-Set-Tip $script:OverPick 'Ratio groups. Slight is under 1.5 times the budget, Heavy is under 3 times, and Extreme is 3 times or more.'
-Set-Tip $script:SelectOverButton 'Check the files in the group shown here, and clear the other checks. Convert then shrinks that group.'
+Set-Tip $script:ReportBugButton 'Open a GitHub bug report with this version filled in.'
+Set-Tip $script:UpdateButton 'Download the newer version and open its setup. This window closes while that runs.'
+Set-Tip $script:FolderPick 'Folders with files to shrink. Pick one for a smaller job.'
+Set-Tip $script:SelectFolderButton 'Check the files in this folder and clear the other checks.'
+Set-Tip $script:OverPick 'Slight is under 1.5x, Heavy is under 3x, and Extreme is 3x or more.'
+Set-Tip $script:SelectOverButton 'Check this ratio group and clear the other checks.'
 Set-Tip $script:SelectAllButton 'Check every row.'
 Set-Tip $script:SelectNoneButton 'Clear every check.'
-Set-Tip $script:ClearButton 'Remove the scanned files from the list. Files still waiting in .vd-originals stay.'
-Set-Tip $script:ShowButton 'With no box checked, every row stays. Check a group to show only those rows. Check more groups to add them. A checked box is on screen. Hidden rows are unchecked, so Convert leaves them out.'
-Set-Tip $script:SelectShownButton 'Check the rows still on screen that Convert can take, and clear every other check.'
-Set-Tip $script:Files 'Bloated videos and Can shrink videos are checked. Can shrink means the file is under the budget line and the picture is still above the target rate. Ratio shows how many times the budget each file uses. 1.00x is on the line, and 1.04x is just over it. A ratio under 1.00x is not colored. ~Savings is the current size minus New size, so you can sort the largest estimates first. Space Saved is the original size minus the converted file, filled in after a convert finishes. ~Savings clears then. Click a heading to sort. Drag a heading sideways to move that column. The order is remembered. Right-click a row to select that folder or that overage. Double-click a file that is ready to delete to compare it.'
+Set-Tip $script:ClearButton 'Remove scanned files from the list. Files in .vd-originals stay.'
+Set-Tip $script:ShowButton 'Check a group to show only those rows. Hidden rows stay unchecked.'
+Set-Tip $script:SelectShownButton 'Check the visible rows Convert can take.'
+Set-Tip $script:Files 'Checked rows are ready to shrink. Click a heading to sort, or drag it to move that column.'
 Set-Tip $script:Log 'Saved space, skipped videos, and problems are listed here.'
 Set-Tip $script:ProgressTrack 'How far the current file has been encoded.'
 Set-Tip $script:StatusLabel 'What the program is doing right now.'
@@ -5013,6 +5055,7 @@ if (-not (Restore-ColumnOrder @($settings.ColumnOrder))) {
 }
 Install-ColumnDrag
 $script:Loading = $false
+Sync-RecyclePurge
 
 $script:Form.Add_KeyDown({
     if ($_.KeyCode -eq [Windows.Forms.Keys]::Escape -and $script:Work -ne 'idle') {
@@ -5671,7 +5714,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.7.1') 'Version file was not 1.0.7.1'
+    Assert-True ((Get-AppVersion) -eq '1.0.7.2') 'Version file was not 1.0.7.2'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -5944,6 +5987,21 @@ function Invoke-SmokeTest {
     Assert-True ($script:ClearSkipsButton.Right -lt $script:BudgetTitle.Left) 'Clear skips overlaps the budgets'
     Assert-True (-not $script:ShutdownCheck.Checked) 'Shutdown started checked'
     Assert-True ($script:ShutdownCheck.Text -eq 'Shutdown computer upon completion') 'Shutdown label'
+    Assert-True ($script:RecycleCheck.Text -eq 'Clear the drive recycle copy') 'Recycle checkbox label'
+    Assert-True ($script:Tips.GetToolTip($script:RecycleCheck) -match '#recycle') 'Recycle checkbox tooltip'
+    Assert-True ($script:Tips.GetToolTip($script:RecycleCheck) -match 'Mute') 'Recycle checkbox tooltip skipped Mute'
+    Assert-True ($script:RecycleCheck.Bottom -le $script:OptionsCard.ClientSize.Height) 'Recycle checkbox sits outside the options card'
+    Assert-True ($script:RecycleCheck.Right -lt $script:BudgetTitle.Left) 'Recycle checkbox overlaps the budgets'
+    Assert-True ($script:ClearSkipsButton.Top -gt $script:RecycleCheck.Bottom) 'Clear skips covers the recycle checkbox'
+    $keptRecycle = [bool]$script:RecycleCheck.Checked
+    $script:RecycleCheck.Checked = $false
+    Sync-RecyclePurge
+    Assert-True (-not (Test-RecyclePurgeEnabled)) 'An unchecked recycle box still purged'
+    $script:RecycleCheck.Checked = $true
+    Sync-RecyclePurge
+    Assert-True (Test-RecyclePurgeEnabled) 'A checked recycle box did not purge'
+    $script:RecycleCheck.Checked = $keptRecycle
+    Sync-RecyclePurge
     $script:ShutdownRequested = $false
     $script:ShutdownCheck.Checked = $true
     Offer-Shutdown
@@ -5961,6 +6019,16 @@ function Invoke-SmokeTest {
         Assert-True ($recycleForm.Tag.OpenHelp -eq $false) 'The recycle link started open'
         $recycleDetail = @($recycleForm.Controls) | Where-Object { $_ -is [Windows.Forms.TextBox] } | Select-Object -First 1
         Assert-True ($null -ne $recycleDetail -and $recycleDetail.Text -match 'Episode\.avi') 'The recycle window hid the file'
+        $recycleIntro = @($recycleForm.Controls) | Where-Object { $_ -is [Windows.Forms.Label] } | Select-Object -First 1
+        $introNeed = $recycleIntro.GetPreferredSize((New-Object Drawing.Size($recycleIntro.Width, 0))).Height
+        Assert-True ($introNeed -le $recycleIntro.Height) ("The recycle intro is clipped (" + $introNeed + " in " + $recycleIntro.Height + ", width " + $recycleIntro.Width + ")")
+        Assert-True ($recycleDetail.Top -ge $recycleIntro.Bottom) 'The recycle list covers the intro'
+        $muteBtn = @($recycleForm.Controls) | Where-Object { $_.Text -eq 'Mute' } | Select-Object -First 1
+        Assert-True ($null -ne $muteBtn) 'The recycle window has no Mute button'
+        Assert-True ($muteBtn.Bottom -le $recycleForm.ClientSize.Height) 'Mute sits outside the recycle window'
+        Assert-True ($muteBtn.Top -gt $recycleLink.Bottom) 'Mute covers the manual-steps link'
+        Assert-True ($script:Tips.GetToolTip($muteBtn) -match 'one time') 'Mute tooltip'
+        Assert-True (-not $recycleForm.Tag.Mute) 'Mute started on'
         $clicked = New-Object Windows.Forms.LinkLabelLinkClickedEventArgs($recycleLink.Links[0])
         $clicked = $clicked.psobject.BaseObject
         $flags = [Reflection.BindingFlags]::Instance -bor [Reflection.BindingFlags]::NonPublic
@@ -5968,6 +6036,23 @@ function Invoke-SmokeTest {
         Assert-True ($recycleForm.Tag.OpenHelp) 'The recycle link did not open the steps'
     }
     finally { if (-not $recycleForm.IsDisposed) { $recycleForm.Dispose() } }
+    $muteForm = New-RecycleProblemForm @($recycleProblem)
+    try {
+        $muteForm.StartPosition = 'Manual'
+        $muteForm.Location = New-Object Drawing.Point(-32000, -32000)
+        $muteForm.Show()
+        $muteClick = @($muteForm.Controls) | Where-Object { $_.Text -eq 'Mute' } | Select-Object -First 1
+        $muteClick.PerformClick()
+        Assert-True ($muteForm.Tag.Mute) 'Mute did not remember the click'
+        Assert-True (-not $muteForm.Tag.OpenHelp) 'Mute opened the manual steps'
+    }
+    finally { if (-not $muteForm.IsDisposed) { $muteForm.Dispose() } }
+    $keptMuted = [bool]$script:RecycleAlertMuted
+    Complete-RecycleMute $true
+    Assert-True ($script:RecycleAlertMuted) 'Mute was not remembered'
+    $script:RecycleAlertMuted = $false
+    Assert-True (-not $script:RecycleAlertMuted) 'Mute could not be cleared in the test'
+    $script:RecycleAlertMuted = $keptMuted
     Clear-RecycleResults
     $script:RecycleResults.Add($recycleProblem)
     Show-PendingRecycleProblems
