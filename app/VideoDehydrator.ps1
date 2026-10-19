@@ -341,7 +341,7 @@ $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.7.2'
+$script:UpdateFallback = '1.0.7.3'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -545,6 +545,17 @@ $script:StopAfterFile = $false
 $script:ToolsOk = $false
 $script:Loading = $false
 $script:ProgressValue = 0
+$script:EtaRates8 = New-Object System.Collections.Generic.List[double]
+$script:EtaRates10 = New-Object System.Collections.Generic.List[double]
+$script:EtaRatios = New-Object System.Collections.Generic.List[double]
+$script:EtaPassStart = $null
+$script:EtaPass1Sec = 0
+$script:EtaTask = 0
+$script:EtaProgress = $null
+$script:EtaChecking = $false
+$script:EtaRemembered = $false
+$script:EtaTenBit = $false
+$script:EtaPixels = 0
 $script:InTick = $false
 $script:Awake = $false
 $script:LastAwake = [datetime]::MinValue
@@ -853,6 +864,7 @@ function Load-Settings {
         IncludeSubfolders = $true
         AutoDelete = $false
         AutoWarnAccepted = $false
+        AutoAsk = $true
         ReencodeAudio = $false
         Detailed = $false
         Budgets = ''
@@ -870,6 +882,7 @@ function Load-Settings {
         if ($null -ne $json.includeSubfolders) { $defaults.IncludeSubfolders = [bool]$json.includeSubfolders }
         if ($null -ne $json.autoDelete) { $defaults.AutoDelete = [bool]$json.autoDelete }
         if ($null -ne $json.autoWarnAccepted) { $defaults.AutoWarnAccepted = [bool]$json.autoWarnAccepted }
+        if ($null -ne $json.autoAsk) { $defaults.AutoAsk = [bool]$json.autoAsk }
         if ($null -ne $json.reencodeAudio) { $defaults.ReencodeAudio = [bool]$json.reencodeAudio }
         if ($null -ne $json.detailed) { $defaults.Detailed = [bool]$json.detailed }
         if ($json.budgets) { $defaults.Budgets = [string]$json.budgets }
@@ -919,6 +932,7 @@ function Save-Settings {
         includeSubfolders = [bool]$script:SubfoldersCheck.Checked
         autoDelete = [bool]$script:AutoCheck.Checked
         autoWarnAccepted = [bool]$script:AutoWarnAccepted
+        autoAsk = [bool]$script:AutoAsk
         reencodeAudio = [bool]$script:ReencodeCheck.Checked
         detailed = [bool]$script:DetailedCheck.Checked
         budgets = (Get-SelectedBudgetPack)
@@ -2424,6 +2438,7 @@ function Read-ScanQueue {
                 PendingId = ''
                 Reason = [string]$msg.Reason
             }
+            if ($msg.PSObject.Properties.Name -contains 'TenBit') { $tag.TenBit = [bool]$msg.TenBit }
             Add-ResultRow $tag | Out-Null
         }
         elseif ($msg.Kind -eq 'done') {
@@ -2512,6 +2527,10 @@ function Start-EncodeProcess {
         Write-Activity (ConvertTo-ArgumentLine (@($script:HandBrake) + $arguments)) 'dim'
     }
     [VideoDehydrator.LinePump]::Start($script:HandBrake, (ConvertTo-ArgumentLine $arguments))
+    Reset-EncodeEtaClock
+    $script:EtaTenBit = ($encoder -eq 'x265_10bit')
+    $script:EtaPixels = Get-PixelSeconds ([int]$Probe.Width) ([int]$Probe.Height) ([double]$Probe.DurationSec)
+    Update-EtaLine
     Start-ActivityPulse
 }
 
@@ -2523,6 +2542,9 @@ function Start-NextEncode {
         $script:EncodeIndex++
         $number = $script:EncodeIndex
         $total = $script:EncodeItems.Count
+        $script:EtaProgress = $null
+        $script:EtaChecking = $false
+        Update-EtaLine
         $source = [string]$item.Tag.Source
         if (-not $source) { $source = [string]$item.Tag.Path }
         Set-Status ("File $number of $total - " + [IO.Path]::GetFileName($source)) 'busy'
@@ -2666,6 +2688,9 @@ function Complete-ActiveEncode {
         Start-NextEncode
         return
     }
+    Remember-FinishedEncode
+    $script:EtaChecking = $true
+    Update-EtaLine
     if ($item) {
         $item.Tag.Status = 'Checking'
         Update-ResultRow $item
@@ -2732,6 +2757,139 @@ function Complete-ActiveEncode {
     Start-NextEncode
 }
 
+function Get-CurrentPassElapsed {
+    if ($null -eq $script:EtaPassStart) { return 0 }
+    $elapsed = ([datetime]::UtcNow - $script:EtaPassStart).TotalSeconds
+    if ($elapsed -lt 0 -or [double]::IsNaN($elapsed)) { return 0 }
+    return [double]$elapsed
+}
+
+function Reset-EncodeEtaClock {
+    $script:EtaPassStart = [datetime]::UtcNow
+    $script:EtaPass1Sec = 0
+    $script:EtaTask = 0
+    $script:EtaProgress = $null
+    $script:EtaChecking = $false
+    $script:EtaRemembered = $false
+}
+
+function Add-EtaSample($List, [double]$Value) {
+    if ($null -eq $List) { return }
+    if ($Value -le 0 -or [double]::IsNaN($Value) -or [double]::IsInfinity($Value)) { return }
+    [void]$List.Add($Value)
+    while ($List.Count -gt 8) { $List.RemoveAt(0) }
+}
+
+function Remember-FinishedEncode {
+    if ($script:EtaRemembered) { return }
+    if ([int]$script:EtaTask -lt 2) { return }
+    if ([double]$script:EtaPass1Sec -lt 1) { return }
+    $pass2 = Get-CurrentPassElapsed
+    if ($pass2 -lt 1) { return }
+    $pixels = [double]$script:EtaPixels
+    if ($pixels -le 0) { return }
+    $rate = ([double]$script:EtaPass1Sec + $pass2) / $pixels
+    $ratio = $pass2 / [double]$script:EtaPass1Sec
+    if ([bool]$script:EtaTenBit) { Add-EtaSample $script:EtaRates10 $rate }
+    else { Add-EtaSample $script:EtaRates8 $rate }
+    Add-EtaSample $script:EtaRatios $ratio
+    $script:EtaRemembered = $true
+}
+
+function Sync-EncodePass($Progress) {
+    if ($null -eq $Progress) { return }
+    $task = [int]$Progress.Task
+    if ([int]$script:EtaTask -ge 1 -and $task -gt [int]$script:EtaTask) {
+        if ([int]$script:EtaTask -eq 1 -and $task -ge 2) {
+            $script:EtaPass1Sec = Get-CurrentPassElapsed
+        }
+        $script:EtaPassStart = [datetime]::UtcNow
+    }
+    if ($task -gt [int]$script:EtaTask) { $script:EtaTask = $task }
+    $script:EtaProgress = $Progress
+}
+
+function Get-ChosenEncodeRate([string]$Class) {
+    $finished = @()
+    if ($Class -eq '10') { $finished = @($script:EtaRates10) }
+    elseif ($Class -eq '8') { $finished = @($script:EtaRates8) }
+    else { return 0 }
+    $live = 0.0
+    $progress = $script:EtaProgress
+    $onLastPass = ($null -ne $progress -and [int]$progress.Task -ge [int]$progress.Tasks -and [int]$script:EtaTask -ge 2)
+    $same = (($Class -eq '10') -eq [bool]$script:EtaTenBit)
+    if ($onLastPass -and $same -and -not $script:EtaChecking) {
+        $part = 0.0
+        if ([double]$progress.Part -gt 0) { $part = [double]$progress.Part / 100.0 }
+        $live = Get-LiveEncodeRate -Pass1Sec ([double]$script:EtaPass1Sec) -PassElapsedSec (Get-CurrentPassElapsed) -PassFraction $part -PixelSeconds ([double]$script:EtaPixels)
+    }
+    return (Get-EncodeRate -LiveRate $live -FinishedRates $finished)
+}
+
+function Get-WaitingEncodeRows {
+    if ($script:StopAfterFile -or -not $script:EncodeItems) { return @() }
+    $list = New-Object System.Collections.Generic.List[object]
+    for ($i = [int]$script:EncodeIndex; $i -lt $script:EncodeItems.Count; $i++) {
+        $item = $script:EncodeItems[$i]
+        $tag = $null
+        if ($item) { $tag = $item.Tag }
+        $known = $false
+        $ten = $false
+        $pixels = 0.0
+        if ($tag -and ($tag -is [System.Collections.IDictionary]) -and $tag.Contains('TenBit')) {
+            $width = 0
+            $height = 0
+            [void][int]::TryParse([string]$tag['Width'], [ref]$width)
+            [void][int]::TryParse([string]$tag['Height'], [ref]$height)
+            $duration = 0.0
+            [void][double]::TryParse([string]$tag['DurationSec'], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$duration)
+            $pixels = Get-PixelSeconds $width $height $duration
+            $ten = [bool]$tag['TenBit']
+            $known = ($pixels -gt 0)
+        }
+        [void]$list.Add([pscustomobject]@{ PixelSeconds = $pixels; TenBit = $ten; Known = $known })
+    }
+    return @($list.ToArray())
+}
+
+function Set-EtaText([string]$text) {
+    if ($null -eq $script:EtaLabel -or $null -eq $script:StatusPanel) { return }
+    if ($null -eq $text) { $text = '' }
+    $show = -not [string]::IsNullOrWhiteSpace($text)
+    $want = 58
+    if ($show) { $want = 78 }
+    $textSame = ([string]$script:EtaLabel.Text -eq $text)
+    $heightSame = ($script:StatusPanel.Height -eq $want)
+    if ($textSame -and $heightSame) { return }
+    $script:EtaLabel.Text = $text
+    if ($script:Tips) {
+        $tip = 'This file is the encode in progress. Estimated time remaining is the rest of the batch.'
+        if ($show) { $tip = $text }
+        $script:Tips.SetToolTip($script:EtaLabel, $tip)
+    }
+    if (-not $heightSame) {
+        $script:StatusPanel.Height = $want
+        Update-ChromeLayout
+    }
+}
+
+function Update-EtaLine {
+    if ($script:Work -ne 'encode') {
+        Set-EtaText ''
+        return
+    }
+    $phase = 'encode'
+    if ($script:EtaChecking) { $phase = 'check' }
+    $estimate = Get-RemainingEstimate -Progress $script:EtaProgress -PassElapsedSec (Get-CurrentPassElapsed) -Pass1Sec ([double]$script:EtaPass1Sec) -PassRatio (Get-MeanSample @($script:EtaRatios)) -Rate8 (Get-ChosenEncodeRate '8') -Rate10 (Get-ChosenEncodeRate '10') -Waiting (Get-WaitingEncodeRows) -Phase $phase
+    Set-EtaText ([string]$estimate.Text)
+}
+
+function Clear-EtaLine {
+    $script:EtaProgress = $null
+    $script:EtaChecking = $false
+    Set-EtaText ''
+}
+
 function Test-EncodeProgressLine([string]$Line) {
     if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
     if ($null -ne (Get-HandBrakeFraction $Line)) { return $true }
@@ -2744,16 +2902,18 @@ function Read-EncodeLines {
         if (-not $line) { continue }
         $script:HbLines.Add($line)
         if ($script:HbLines.Count -gt 500) { $script:HbLines.RemoveAt(0) }
-        $fraction = Get-HandBrakeFraction $line
-        if ($null -ne $fraction) {
-            Set-Progress $fraction
+        $progress = Get-HandBrakeProgress $line
+        if ($null -ne $progress) {
+            Sync-EncodePass $progress
+            Set-Progress ([double]$progress.Overall)
             $name = ''
             if ($script:ActivePlan) { $name = [IO.Path]::GetFileName($script:ActivePlan.Source) }
             $number = $script:EncodeIndex
             $total = $script:EncodeItems.Count
-            $fileStatus = "File $number of $total - $name - " + ('{0:0}%' -f $fraction)
+            $fileStatus = "File $number of $total - $name - " + ('{0:0}%' -f $progress.Overall)
             if ($script:StopAfterFile) { $fileStatus += ' - stopping after the current file' }
             Set-Status $fileStatus 'busy'
+            Update-EtaLine
         }
         if ((Test-EncodeProgressLine $line)) { continue }
         if ($script:DetailedCheck.Checked) { Write-Activity $line 'dim' }
@@ -2764,6 +2924,7 @@ function Finish-Batch {
     param([string]$How)
     Stop-ActivityPulse
     $script:Work = 'idle'
+    Clear-EtaLine
     $script:Cancel = $false
     $script:StopAfterFile = $false
     Disable-KeepAwake
@@ -3033,8 +3194,7 @@ function Start-Convert {
         Save-Settings
     }
     if ($script:AutoCheck.Checked) {
-        $answer = [Windows.Forms.MessageBox]::Show($script:Form, "Auto is on.`r`n`r`nAfter each file checks out, its original is deleted. The new file stays in the original's place. There will be nothing left to compare. When Clear the drive recycle copy is on, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder.", 'Video Dehydrator', 'OKCancel', 'Warning')
-        if ($answer -ne [Windows.Forms.DialogResult]::OK) { return }
+        if (-not (Show-AutoAsk)) { return }
     }
     Stop-Playback
     Save-Settings
@@ -3076,6 +3236,7 @@ function Request-StopAfterFile {
     $script:StopAfterFile = $true
     Write-Activity 'This file will finish. The batch will stop after that.' 'warn'
     Set-Status 'Stopping after the current file' 'busy'
+    Update-EtaLine
     Update-Buttons
 }
 
@@ -3084,6 +3245,7 @@ function Request-ContinueBatch {
     $script:StopAfterFile = $false
     Write-Activity 'The batch will keep going.' 'text'
     Set-Status 'Converting' 'busy'
+    Update-EtaLine
     Update-Buttons
 }
 
@@ -3212,6 +3374,78 @@ function Show-PendingRecycleProblems {
         $script:HoldShutdownForRecycle = $true
         Show-Help -Section 'Drive recycle bin'
     }
+}
+
+function Test-AutoAskHidden {
+    return (-not [bool]$script:AutoAsk)
+}
+
+function Complete-AutoAsk([bool]$Convert, [bool]$Hide) {
+    if (-not $Convert) { return $false }
+    if ($Hide) {
+        $script:AutoAsk = $false
+        Save-Settings
+    }
+    return $true
+}
+
+function New-AutoAskForm {
+    $form = New-Object Windows.Forms.Form
+    $form.Text = 'Video Dehydrator'
+    $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.StartPosition = 'CenterParent'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $false
+    $form.KeyPreview = $true
+    $form.ClientSize = New-Object Drawing.Size(540, 326)
+    $form.Font = $script:FontUi
+    $form.BackColor = [Drawing.Color]::White
+    $icon = Get-AppIcon
+    if ($icon) { $form.Icon = $icon }
+    $label = New-Object Windows.Forms.Label
+    $label.Font = $script:FontUi
+    $label.ForeColor = $script:ColorInk
+    $label.BackColor = [Drawing.Color]::White
+    $label.SetBounds(24, 16, 492, 176)
+    $label.Text = "Auto is on.`r`n`r`nAfter each file checks out, its original is deleted. The new file stays in the original's place. There will be nothing left to compare. When Clear the drive recycle copy is on, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder."
+    $hide = New-Check 'Stop asking'
+    $hide.SetBounds(24, 204, 492, 24)
+    $convert = New-Button 'Convert' 'primary' 140 34
+    $cancel = New-Button 'Cancel' 'secondary' 110 34
+    $convert.SetBounds(258, 268, 140, 34)
+    $cancel.SetBounds(406, 268, 110, 34)
+    Set-Tip $convert 'Convert, and delete each original after it checks out.'
+    Set-Tip $cancel 'Leave the files alone.'
+    Set-Tip $hide 'Stop opening this warning. Cancel leaves it on.'
+    $form.Controls.Add($label)
+    $form.Controls.Add($hide)
+    $form.Controls.Add($convert)
+    $form.Controls.Add($cancel)
+    $state = [pscustomobject]@{ Convert = $false; Hide = $false }
+    $form.Tag = $state
+    $convert.DialogResult = [Windows.Forms.DialogResult]::OK
+    $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $form.AcceptButton = $convert
+    $form.CancelButton = $cancel
+    $convert.Add_Click({
+        $state.Convert = $true
+        $state.Hide = [bool]$hide.Checked
+    }.GetNewClosure())
+    $cancel.Add_Click({
+        $state.Convert = $false
+        $state.Hide = $false
+    }.GetNewClosure())
+    return $form
+}
+
+function Show-AutoAsk {
+    if (Test-AutoAskHidden) { return $true }
+    $form = New-AutoAskForm
+    $state = $form.Tag
+    try { [void]$form.ShowDialog($script:Form) }
+    finally { if (-not $form.IsDisposed) { $form.Dispose() } }
+    return (Complete-AutoAsk ([bool]$state.Convert) ([bool]$state.Hide))
 }
 
 function Test-DeleteConfirmHidden {
@@ -4176,7 +4410,16 @@ function Update-ChromeLayout {
             $versionGap = $vw + 12
         }
         $script:StatusLabel.SetBounds(24, 8, ([Math]::Max(80, $status.ClientSize.Width - 48 - $versionGap)), 22)
-        $script:ProgressTrack.SetBounds(24, 36, ([Math]::Max(0, $status.ClientSize.Width - 48)), 8)
+        $trackY = 36
+        if ($script:EtaLabel) {
+            $showEta = -not [string]::IsNullOrWhiteSpace([string]$script:EtaLabel.Text)
+            $script:EtaLabel.Visible = $showEta
+            if ($showEta) {
+                $script:EtaLabel.SetBounds(24, 32, ([Math]::Max(80, $status.ClientSize.Width - 48)), 22)
+                $trackY = 56
+            }
+        }
+        $script:ProgressTrack.SetBounds(24, $trackY, ([Math]::Max(0, $status.ClientSize.Width - 48)), 8)
         Set-Progress $script:ProgressValue
     }
     Layout-Folder
@@ -4208,7 +4451,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Converting'
-            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. One file is encoded at a time. The bar is that file. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
+            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. One file is encoded at a time. The bar is that file. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
         },
         @{
             Title = 'Checking the picture'
@@ -4220,7 +4463,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Auto'
-            Body = "Delete originals automatically does the deletion as soon as a file checks out. The check looks at size, length, picture size, audio, subtitles, and whether the start and end play. It does not judge how the picture looks. The first time Auto is turned on, the program explains that Compare and Undo cannot bring the original back. You can hide that explanation. The program still asks before every convert with Auto turned on. With Auto off, every original stays until you press Delete originals. Clear the drive recycle copy is separate. With that box on, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder. When that removal fails, a window opens with a link to the manual steps. Mute on that window hides it after this one time."
+            Body = "Delete originals automatically does the deletion as soon as a file checks out. The check looks at size, length, picture size, audio, subtitles, and whether the start and end play. It does not judge how the picture looks. The first time Auto is turned on, the program explains that Compare and Undo cannot bring the original back. You can hide that explanation. The program still asks before every convert with Auto turned on. Stop asking on that window hides it from then on. Cancel leaves the warning on. With Auto off, every original stays until you press Delete originals. Clear the drive recycle copy is separate. With that box on, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder. When that removal fails, a window opens with a link to the manual steps. Mute on that window hides it after this one time."
         },
         @{
             Title = 'Drive recycle bin'
@@ -4441,6 +4684,7 @@ $script:Tips.ShowAlways = $true
 
 $settings = Load-Settings
 $script:AutoWarnAccepted = [bool]$settings.AutoWarnAccepted
+$script:AutoAsk = [bool]$settings.AutoAsk
 $script:UpdatePrompt = [string]$settings.UpdatePrompt
 $script:DeleteConfirmVersion = [string]$settings.DeleteConfirmVersion
 $script:RecycleAlertMuted = [bool]$settings.RecycleAlertMuted
@@ -4505,6 +4749,13 @@ $script:StatusLabel.Font = $script:FontUi
 $script:StatusLabel.ForeColor = $script:ColorMuted
 $script:StatusLabel.AutoEllipsis = $true
 $script:StatusLabel.BackColor = [Drawing.Color]::White
+$script:EtaLabel = New-Object Windows.Forms.Label
+$script:EtaLabel.Text = ''
+$script:EtaLabel.Font = $script:FontUi
+$script:EtaLabel.ForeColor = $script:ColorInk
+$script:EtaLabel.AutoEllipsis = $true
+$script:EtaLabel.BackColor = [Drawing.Color]::White
+$script:EtaLabel.Visible = $false
 $script:VersionLabel = New-Object Windows.Forms.Label
 $script:VersionLabel.Text = Get-AppVersion
 $script:VersionLabel.Font = $script:FontHint
@@ -4521,6 +4772,7 @@ $script:ProgressFill.Height = 8
 $script:ProgressFill.Width = 0
 $script:ProgressTrack.Controls.Add($script:ProgressFill)
 $script:StatusPanel.Controls.Add($script:StatusLabel)
+$script:StatusPanel.Controls.Add($script:EtaLabel)
 $script:StatusPanel.Controls.Add($script:VersionLabel)
 $script:StatusPanel.Controls.Add($script:ProgressTrack)
 $script:StatusPanel.Add_Paint({
@@ -5041,7 +5293,8 @@ Set-Tip $script:ShowButton 'Check a group to show only those rows. Hidden rows s
 Set-Tip $script:SelectShownButton 'Check the visible rows Convert can take.'
 Set-Tip $script:Files 'Checked rows are ready to shrink. Click a heading to sort, or drag it to move that column.'
 Set-Tip $script:Log 'Saved space, skipped videos, and problems are listed here.'
-Set-Tip $script:ProgressTrack 'How far the current file has been encoded.'
+Set-Tip $script:ProgressTrack 'How far the current file has been encoded. The two passes share the bar evenly.'
+Set-Tip $script:EtaLabel 'This file is the encode in progress. Estimated time remaining is the rest of the batch.'
 Set-Tip $script:StatusLabel 'What the program is doing right now.'
 Set-Tip $script:VersionLabel 'This copy of Video Dehydrator.'
 foreach ($panel in @($script:Header, $script:FolderCard, $script:ListHeader, $script:OptionsCard, $script:ActionPanel)) {
@@ -5629,6 +5882,78 @@ function Invoke-ShowCheck {
     }
 }
 
+function Invoke-EtaCheck {
+    Assert-True ($null -ne $script:EtaLabel) 'The time line is missing'
+    Assert-True ($script:EtaLabel.Parent -eq $script:StatusPanel) 'The time line is not in the status bar'
+    Assert-True ([string]::IsNullOrWhiteSpace($script:EtaLabel.Text)) 'The time line started with text'
+    Assert-True ($script:StatusPanel.Height -eq 58) 'The status bar started tall'
+    Assert-True ($script:Tips.GetToolTip($script:EtaLabel) -match 'Estimated time remaining') 'The time line tip omitted the batch label'
+    $keptWork = [string]$script:Work
+    $keptStop = [bool]$script:StopAfterFile
+    $keptItems = $script:EncodeItems
+    $keptIndex = $script:EncodeIndex
+    $keptRates8 = @($script:EtaRates8)
+    $keptRates10 = @($script:EtaRates10)
+    $keptRatios = @($script:EtaRatios)
+    try {
+        $script:EtaRates8.Clear()
+        $script:EtaRates10.Clear()
+        $script:EtaRatios.Clear()
+        $script:Work = 'encode'
+        $script:StopAfterFile = $false
+        $script:EtaChecking = $false
+        $script:EtaRemembered = $false
+        $script:EtaTenBit = $false
+        $script:EtaPass1Sec = 20
+        $script:EtaTask = 2
+        $script:EtaPixels = 1000
+        $script:EtaPassStart = [datetime]::UtcNow.AddSeconds(-60)
+        $script:EtaProgress = Get-HandBrakeProgress 'Encoding: task 2 of 2, 50.00 % (8.00 fps, avg 8.00 fps, ETA 00h01m00s)'
+        $later = New-Object Windows.Forms.ListViewItem 'later.mkv'
+        $later.Tag = @{ Width = 100; Height = 100; DurationSec = 12; TenBit = $false }
+        $script:EncodeItems = @($later)
+        $script:EncodeIndex = 0
+        Update-EtaLine
+        Assert-True ($script:EtaLabel.Text -match 'Estimated time remaining: ') ("The batch line omitted its label: $($script:EtaLabel.Text)")
+        Assert-True ($script:EtaLabel.Text -notmatch 'Estimated time remaining: estimating') ("A measured batch stayed on estimating: $($script:EtaLabel.Text)")
+        Assert-True ($script:EtaLabel.Visible) 'The time line stayed hidden'
+        Assert-True ($script:StatusPanel.Height -eq 78) 'The status bar did not grow for the time line'
+        Assert-True ($script:ProgressTrack.Top -gt $script:EtaLabel.Top) 'The bar covered the time line'
+        Assert-True ($script:EtaLabel.Right -le ($script:StatusPanel.ClientSize.Width - 8)) 'The time line sits outside the status bar'
+        $script:StopAfterFile = $true
+        Update-EtaLine
+        Assert-True ($script:EtaLabel.Text -eq 'This file: about 2 min left. Estimated time remaining: about 2 min') ("Stop after left the batch on $($script:EtaLabel.Text)")
+        $script:StopAfterFile = $false
+        $script:EtaTask = 1
+        $script:EtaPass1Sec = 0
+        $script:EtaRatios.Clear()
+        $script:EtaProgress = Get-HandBrakeProgress 'Encoding: task 1 of 2, 10.00 % (avg 20.00 fps, ETA 00h02m00s)'
+        Update-EtaLine
+        Assert-True ($script:EtaLabel.Text -match 'first pass') ("The first pass was labeled as the whole file: $($script:EtaLabel.Text)")
+        Assert-True ($script:EtaLabel.Text -match 'Estimated time remaining: estimating') ("The first pass invented a batch time: $($script:EtaLabel.Text)")
+    }
+    finally {
+        $script:Work = $keptWork
+        $script:StopAfterFile = $keptStop
+        $script:EncodeItems = $keptItems
+        $script:EncodeIndex = $keptIndex
+        $script:EtaRates8.Clear()
+        $script:EtaRates10.Clear()
+        $script:EtaRatios.Clear()
+        foreach ($rate in @($keptRates8)) { if ($rate -gt 0) { [void]$script:EtaRates8.Add([double]$rate) } }
+        foreach ($rate in @($keptRates10)) { if ($rate -gt 0) { [void]$script:EtaRates10.Add([double]$rate) } }
+        foreach ($ratio in @($keptRatios)) { if ($ratio -gt 0) { [void]$script:EtaRatios.Add([double]$ratio) } }
+        $script:EtaPassStart = $null
+        $script:EtaPass1Sec = 0
+        $script:EtaTask = 0
+        $script:EtaPixels = 0
+        $script:EtaTenBit = $false
+        $script:EtaRemembered = $false
+        $script:EtaChecking = $false
+        Clear-EtaLine
+    }
+}
+
 function Invoke-SmokeTest {
     $missing = @(Get-MissingTools)
     Assert-True ($missing.Count -eq 0) ("Missing tools: " + ($missing -join ', '))
@@ -5640,6 +5965,7 @@ function Invoke-SmokeTest {
     [Windows.Forms.Application]::DoEvents()
     Start-Sleep -Milliseconds 200
     [Windows.Forms.Application]::DoEvents()
+    Invoke-EtaCheck
     Invoke-FolderSelectCheck
     Invoke-OverCheck
     Invoke-ShowCheck
@@ -5681,7 +6007,9 @@ function Invoke-SmokeTest {
     Assert-True ($script:HelpBox.Text -match 'starts with a tilde') 'The guide was missing the rough new size'
     Assert-True ($script:HelpBox.Text -match 'does not judge how the picture looks') 'The guide was missing the auto warning'
     Assert-True ($script:HelpBox.Text -match 'asks before every convert') 'The guide was missing the convert warning'
+    Assert-True ($script:HelpBox.Text -match 'Stop asking on that window hides it from then on') 'The guide was missing Stop asking'
     Assert-True ($script:HelpBox.Text -match 'does not add a line for each percent') 'The guide was missing the activity percent note'
+    Assert-True ($script:HelpBox.Text -match 'Estimated time remaining is the rest of the batch') 'The guide was missing the batch time'
     Assert-True ($script:HelpBox.Text -match 'will not stay in sync with the picture') 'The guide was missing the compare sync note'
     Assert-True ($script:HelpBox.Text -match 'Go to the file on disk to confirm the audio') 'The guide was missing the disk audio note'
     Assert-True ($script:HelpBox.Text -match 'checks for updates when it opens') 'The guide was missing the startup update check'
@@ -5714,7 +6042,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.7.2') 'Version file was not 1.0.7.2'
+    Assert-True ((Get-AppVersion) -eq '1.0.7.3') 'Version file was not 1.0.7.3'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -5965,6 +6293,52 @@ function Invoke-SmokeTest {
         if (-not $cancelForm.IsDisposed) { $cancelForm.Close() }
     }
     finally { if (-not $cancelForm.IsDisposed) { $cancelForm.Dispose() } }
+    $keptAutoAsk = [bool]$script:AutoAsk
+    $script:AutoAsk = $true
+    Assert-True (-not (Test-AutoAskHidden)) 'The convert warning started hidden'
+    Assert-True (-not (Complete-AutoAsk $false $true)) 'Cancel hid the convert warning'
+    Assert-True ($script:AutoAsk) 'Cancel stored Stop asking'
+    Assert-True (Complete-AutoAsk $true $false) 'Convert was refused'
+    Assert-True ($script:AutoAsk) 'Convert without Stop asking hid the warning'
+    Assert-True (Complete-AutoAsk $true $true) 'Convert with Stop asking was refused'
+    Assert-True (-not $script:AutoAsk) 'Stop asking was not remembered'
+    Assert-True (Test-AutoAskHidden) 'The convert warning stayed after Stop asking'
+    Assert-True (Show-AutoAsk) 'A hidden convert warning was shown'
+    $script:AutoAsk = $keptAutoAsk
+    $askForm = New-AutoAskForm
+    try {
+        $askForm.StartPosition = 'Manual'
+        $askForm.Location = New-Object Drawing.Point(-32000, -32000)
+        $askForm.Show()
+        $askLabel = @($askForm.Controls) | Where-Object { $_ -is [Windows.Forms.Label] } | Select-Object -First 1
+        $askNeed = $askLabel.GetPreferredSize((New-Object Drawing.Size($askLabel.Width, 0))).Height
+        Assert-True ($askNeed -le $askLabel.Height) ("The convert warning is clipped (" + $askNeed + " in " + $askLabel.Height + ")")
+        $askBox = @($askForm.Controls) | Where-Object { $_ -is [Windows.Forms.CheckBox] } | Select-Object -First 1
+        Assert-True ($null -ne $askBox -and $askBox.Text -eq 'Stop asking') 'The convert warning has no Stop asking box'
+        $askConvert = @($askForm.Controls) | Where-Object { $_.Text -eq 'Convert' } | Select-Object -First 1
+        Assert-True ($null -ne $askConvert) 'The convert warning has no Convert button'
+        Assert-True ($askBox.Bottom -lt $askConvert.Top) 'Stop asking overlaps Convert'
+        Assert-True ($askConvert.Bottom -le $askForm.ClientSize.Height) 'Convert sits outside the warning'
+        Assert-True (-not $askForm.Tag.Convert) 'The convert warning started confirmed'
+        $askBox.Checked = $true
+        $askConvert.PerformClick()
+        Assert-True ($askForm.Tag.Convert -and $askForm.Tag.Hide) 'Convert did not remember Stop asking'
+        if (-not $askForm.IsDisposed) { $askForm.Close() }
+    }
+    finally { if (-not $askForm.IsDisposed) { $askForm.Dispose() } }
+    $askCancel = New-AutoAskForm
+    try {
+        $askCancel.StartPosition = 'Manual'
+        $askCancel.Location = New-Object Drawing.Point(-32000, -32000)
+        $askCancel.Show()
+        $askCancelBox = @($askCancel.Controls) | Where-Object { $_ -is [Windows.Forms.CheckBox] } | Select-Object -First 1
+        $askCancelBox.Checked = $true
+        $askCancelBtn = @($askCancel.Controls) | Where-Object { $_.Text -eq 'Cancel' } | Select-Object -First 1
+        $askCancelBtn.PerformClick()
+        Assert-True (-not $askCancel.Tag.Convert -and -not $askCancel.Tag.Hide) 'Cancel remembered Stop asking'
+        if (-not $askCancel.IsDisposed) { $askCancel.Close() }
+    }
+    finally { if (-not $askCancel.IsDisposed) { $askCancel.Dispose() } }
     Assert-True (-not $script:AutoCheck.AutoCheck) 'Auto would turn itself off after the warning'
     $warnForm = New-AutoWarnForm
     try {

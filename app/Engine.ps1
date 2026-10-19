@@ -337,7 +337,7 @@ function Format-OverRatio($Ratio) {
     return ($text + 'x')
 }
 
-function Get-HandBrakeFraction {
+function Get-HandBrakeProgress {
     param([string]$Line)
     if ($Line -notmatch 'Encoding:\s*task\s+(\d+)\s+of\s+(\d+),\s*([\d.]+)\s*%') { return $null }
     $task = [int]$Matches[1]
@@ -350,7 +350,180 @@ function Get-HandBrakeFraction {
     $overall = (($task - 1) + ($part / 100.0)) / $tasks * 100.0
     if ($overall -lt 0) { $overall = 0 }
     if ($overall -gt 100) { $overall = 100 }
-    return $overall
+    $avg = 0.0
+    $eta = -1.0
+    if ($Line -match 'avg\s+([\d.]+)\s+fps') {
+        [void][double]::TryParse($Matches[1], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$avg)
+    }
+    if ($Line -match 'ETA\s+(\d+)h(\d+)m(\d+)s') {
+        $eta = ([int]$Matches[1] * 3600) + ([int]$Matches[2] * 60) + [int]$Matches[3]
+    }
+    return [pscustomobject]@{
+        Task       = $task
+        Tasks      = $tasks
+        Part       = $part
+        Overall    = $overall
+        AvgFps     = $avg
+        EtaSeconds = $eta
+    }
+}
+
+function Get-HandBrakeFraction {
+    param([string]$Line)
+    $progress = Get-HandBrakeProgress $Line
+    if ($null -eq $progress) { return $null }
+    return [double]$progress.Overall
+}
+
+function Get-PixelSeconds {
+    param([int]$Width, [int]$Height, [double]$DurationSec)
+    if ($Width -le 0 -or $Height -le 0 -or $DurationSec -le 0) { return 0 }
+    if ([double]::IsNaN($DurationSec) -or [double]::IsInfinity($DurationSec)) { return 0 }
+    return ([double]$Width * [double]$Height * $DurationSec)
+}
+
+function Get-EncodeCushionSeconds { return 30 }
+
+function Format-RemainingTime {
+    param([double]$Seconds)
+    if ($Seconds -lt 0 -or [double]::IsNaN($Seconds) -or [double]::IsInfinity($Seconds)) { return '' }
+    $rounded = [int][math]::Round($Seconds, [MidpointRounding]::AwayFromZero)
+    if ($rounded -lt 60) {
+        if ($rounded -lt 1) { $rounded = 1 }
+        return "about $rounded sec"
+    }
+    $minutes = [int][math]::Round($Seconds / 60.0, [MidpointRounding]::AwayFromZero)
+    if ($minutes -lt 90) {
+        if ($minutes -lt 1) { $minutes = 1 }
+        return "about $minutes min"
+    }
+    $hours = [int][math]::Floor($minutes / 60)
+    $mins = $minutes % 60
+    if ($mins -eq 0) { return "about $hours hr" }
+    return "about $hours hr $mins min"
+}
+
+function Get-MeanSample {
+    param([double[]]$Values)
+    if ($null -eq $Values -or $Values.Count -eq 0) { return 0 }
+    $sum = 0.0
+    $count = 0
+    foreach ($value in $Values) {
+        if ($value -le 0 -or [double]::IsNaN($value) -or [double]::IsInfinity($value)) { continue }
+        $sum += [double]$value
+        $count++
+    }
+    if ($count -eq 0) { return 0 }
+    return ($sum / $count)
+}
+
+function Get-EncodeRate {
+    param([double]$LiveRate, [double[]]$FinishedRates)
+    if ($LiveRate -gt 0 -and -not [double]::IsNaN($LiveRate) -and -not [double]::IsInfinity($LiveRate)) { return $LiveRate }
+    return (Get-MeanSample $FinishedRates)
+}
+
+# Seconds of encode time per pixel-second. Pass 1 has to be finished, and
+# the second pass has to be far enough along that a short sample is not the whole answer.
+function Get-LiveEncodeRate {
+    param(
+        [double]$Pass1Sec,
+        [double]$PassElapsedSec,
+        [double]$PassFraction,
+        [double]$PixelSeconds
+    )
+    if ($Pass1Sec -le 0 -or $PixelSeconds -le 0) { return 0 }
+    if ($PassElapsedSec -lt 8 -or $PassFraction -lt 0.05) { return 0 }
+    if ($PassFraction -gt 1) { $PassFraction = 1 }
+    $pass2 = $PassElapsedSec / $PassFraction
+    $encode = $Pass1Sec + $pass2
+    if ($encode -le 0 -or [double]::IsNaN($encode) -or [double]::IsInfinity($encode)) { return 0 }
+    return ($encode / $PixelSeconds)
+}
+
+# The first pass is the fast turbo pass, so its own ETA is not the file.
+# A learned pass ratio (second pass / first pass) fills that in. Until then
+# the batch stays on estimating. 8-bit and 10-bit rates are separate.
+function Get-RemainingEstimate {
+    param(
+        $Progress,
+        [double]$PassElapsedSec = 0,
+        [double]$Pass1Sec = 0,
+        [double]$PassRatio = 0,
+        [double]$Rate8 = 0,
+        [double]$Rate10 = 0,
+        $Waiting,
+        [ValidateSet('encode', 'check')]
+        [string]$Phase = 'encode'
+    )
+    $cushion = [double](Get-EncodeCushionSeconds)
+    $fileKind = 'none'
+    $fileSeconds = 0.0
+    if ($Phase -eq 'check') {
+        $fileKind = 'check'
+        $fileSeconds = $cushion
+    }
+    elseif ($null -ne $Progress -and [double]$Progress.EtaSeconds -ge 0) {
+        $lastPass = ([int]$Progress.Task -ge [int]$Progress.Tasks)
+        if ($lastPass) {
+            $fileKind = 'full'
+            $fileSeconds = [double]$Progress.EtaSeconds + $cushion
+        }
+        elseif ($PassRatio -gt 0) {
+            $soFar = $PassElapsedSec
+            if ($soFar -lt 0) { $soFar = 0 }
+            $totalPass1 = $soFar + [double]$Progress.EtaSeconds
+            $fileKind = 'full'
+            $fileSeconds = [double]$Progress.EtaSeconds + ($totalPass1 * $PassRatio) + $cushion
+        }
+        else {
+            $fileKind = 'pass'
+            $fileSeconds = [double]$Progress.EtaSeconds
+        }
+    }
+
+    $haveBatch = $false
+    $batchSeconds = 0.0
+    if ($fileKind -eq 'full' -or $fileKind -eq 'check') {
+        $haveBatch = $true
+        $batchSeconds = $fileSeconds
+        $pending = @()
+        if ($null -ne $Waiting) { $pending = @($Waiting) }
+        foreach ($item in $pending) {
+            if ($null -eq $item) { continue }
+            $known = $true
+            if ($item.PSObject.Properties.Name -contains 'Known') { $known = [bool]$item.Known }
+            $pixels = 0.0
+            if ($item.PSObject.Properties.Name -contains 'PixelSeconds') { $pixels = [double]$item.PixelSeconds }
+            if (-not $known -or $pixels -le 0) { $haveBatch = $false; break }
+            $rate = $Rate8
+            if ([bool]$item.TenBit) { $rate = $Rate10 }
+            if ($rate -le 0 -or [double]::IsNaN($rate) -or [double]::IsInfinity($rate)) { $haveBatch = $false; break }
+            $batchSeconds += ($pixels * $rate) + $cushion
+        }
+    }
+
+    $fileText = 'estimating'
+    if ($fileKind -eq 'pass') {
+        $passNo = 1
+        if ($null -ne $Progress) { $passNo = [int]$Progress.Task }
+        $passName = 'first pass'
+        if ($passNo -ge 2) { $passName = "pass $passNo" }
+        $fileText = "$passName, $(Format-RemainingTime $fileSeconds) left"
+    }
+    elseif ($fileKind -eq 'full' -or $fileKind -eq 'check') {
+        $fileText = "$((Format-RemainingTime $fileSeconds)) left"
+    }
+    $batchText = 'estimating'
+    if ($haveBatch) { $batchText = Format-RemainingTime $batchSeconds }
+    $text = "This file: $fileText. Estimated time remaining: $batchText"
+    return [pscustomobject]@{
+        FileKind     = $fileKind
+        FileSeconds  = $fileSeconds
+        BatchSeconds = $(if ($haveBatch) { $batchSeconds } else { 0 })
+        HaveBatch    = [bool]$haveBatch
+        Text         = $text
+    }
 }
 
 function Get-MediaProbe {
@@ -2212,6 +2385,7 @@ function Add-ScanDirectory {
                     EstimateRough = [bool]$decision.EstimateRough
                     VideoBitrate  = $probe.VideoBitrate
                     Reason        = $decision.Reason
+                    TenBit        = ([string](Get-EncoderName -Probe $probe) -eq 'x265_10bit')
                 }
             }
             elseif ($decision.Decision -eq 'dv') { $State.Dv++ }
@@ -2817,6 +2991,37 @@ function Invoke-EngineSelfTest {
     $fraction2 = Get-HandBrakeFraction 'Encoding: task 2 of 2, 50.00 %'
     Assert-Engine ([math]::Abs($fraction2 - 75) -lt 0.01) 'pass 2 progress'
     Assert-Engine ($null -eq (Get-HandBrakeFraction 'nothing to see')) 'non progress line'
+    $parsed = Get-HandBrakeProgress 'Encoding: task 1 of 2, 50.00 % (12.00 fps, avg 10.00 fps, ETA 00h00m10s)'
+    Assert-Engine ($null -ne $parsed -and $parsed.Task -eq 1 -and [math]::Abs($parsed.AvgFps - 10) -lt 0.01 -and $parsed.EtaSeconds -eq 10) 'pass 1 ETA'
+    $parsedLate = Get-HandBrakeProgress 'Encoding: task 2 of 2, 100 % (ETA 01h02m03s)'
+    Assert-Engine ($null -ne $parsedLate -and $parsedLate.EtaSeconds -eq 3723) 'a long ETA'
+    Assert-Engine ((Get-HandBrakeProgress 'Encoding: task 2 of 2, 50.00 %').EtaSeconds -lt 0) 'a line without an ETA'
+    Assert-Engine ((Get-PixelSeconds 1920 1080 60) -eq 124416000) 'pixel-seconds'
+    Assert-Engine ((Get-PixelSeconds 0 1080 60) -eq 0) 'a missing width has no pixel-seconds'
+    Assert-Engine ((Format-RemainingTime 10) -eq 'about 10 sec') 'a short remaining time'
+    Assert-Engine ((Format-RemainingTime 360) -eq 'about 6 min') 'a minute remaining time'
+    Assert-Engine ((Format-RemainingTime 15000) -eq 'about 4 hr 10 min') 'an hour remaining time'
+    Assert-Engine ((Format-RemainingTime 7200) -eq 'about 2 hr') 'a whole-hour remaining time'
+    Assert-Engine ([math]::Abs((Get-LiveEncodeRate -Pass1Sec 10 -PassElapsedSec 10 -PassFraction 0.5 -PixelSeconds 1000) - 0.03) -lt 0.000001) 'live encode rate'
+    Assert-Engine ((Get-LiveEncodeRate -Pass1Sec 10 -PassElapsedSec 7 -PassFraction 0.5 -PixelSeconds 1000) -eq 0) 'a short sample is not a rate'
+    Assert-Engine ((Get-LiveEncodeRate -Pass1Sec 0 -PassElapsedSec 30 -PassFraction 0.5 -PixelSeconds 1000) -eq 0) 'a missing first pass is not a rate'
+    $passOnly = Get-RemainingEstimate -Progress $parsed -PassElapsedSec 5 -PassRatio 0 -Waiting @() -Phase 'encode'
+    Assert-Engine ($passOnly.FileKind -eq 'pass' -and -not $passOnly.HaveBatch) 'the first pass is not a batch time'
+    Assert-Engine ($passOnly.Text -eq 'This file: first pass, about 10 sec left. Estimated time remaining: estimating') 'the first pass says it is estimating the batch'
+    $withRatio = Get-RemainingEstimate -Progress $parsed -PassElapsedSec 20 -Pass1Sec 0 -PassRatio 3 -Waiting @() -Phase 'encode'
+    Assert-Engine ($withRatio.FileKind -eq 'full' -and $withRatio.HaveBatch -and [math]::Abs($withRatio.FileSeconds - 130) -lt 0.01) 'a learned ratio fills in the second pass'
+    Assert-Engine ($withRatio.Text -match 'Estimated time remaining: about 2 min') 'one file still labels the batch'
+    $pass2 = Get-HandBrakeProgress 'Encoding: task 2 of 2, 50.00 % (8.00 fps, avg 8.00 fps, ETA 00h01m00s)'
+    $waiting = @([pscustomobject]@{ PixelSeconds = 120; TenBit = $false; Known = $true })
+    $batch = Get-RemainingEstimate -Progress $pass2 -PassElapsedSec 60 -Pass1Sec 20 -Rate8 1 -Rate10 0 -Waiting $waiting -Phase 'encode'
+    Assert-Engine ($batch.HaveBatch -and [math]::Abs($batch.FileSeconds - 90) -lt 0.01 -and [math]::Abs($batch.BatchSeconds - 240) -lt 0.01) 'the batch adds the files still waiting'
+    Assert-Engine ($batch.Text -match '^This file: about 2 min left\. Estimated time remaining: about 4 min$') 'the batch line is labeled'
+    $tenOnly = Get-RemainingEstimate -Progress $pass2 -Rate8 1 -Rate10 0 -Waiting @([pscustomobject]@{ PixelSeconds = 1000; TenBit = $true; Known = $true }) -Phase 'encode'
+    Assert-Engine (-not $tenOnly.HaveBatch -and $tenOnly.Text -match 'Estimated time remaining: estimating') 'a 10-bit file does not use the 8-bit speed'
+    $unknown = Get-RemainingEstimate -Progress $pass2 -Rate8 1 -Waiting @([pscustomobject]@{ PixelSeconds = 0; TenBit = $false; Known = $false }) -Phase 'encode'
+    Assert-Engine (-not $unknown.HaveBatch) 'a file without a length stays on estimating'
+    $checking = Get-RemainingEstimate -Phase 'check' -Waiting @()
+    Assert-Engine ($checking.FileKind -eq 'check' -and $checking.HaveBatch -and $checking.Text -eq 'This file: about 30 sec left. Estimated time remaining: about 30 sec') 'the check is the short tail'
 
     $frame = Get-CompareFrameInfo
     Assert-Engine ($frame.Width -eq 1920 -and $frame.Height -eq 540 -and $frame.Bytes -eq (1920 * 540 * 3)) 'compare frame size'
@@ -2992,7 +3197,11 @@ function Invoke-PipelineTest {
             $line = $null
             if (-not $queue.TryDequeue([ref]$line)) { break }
             $msg = $line | ConvertFrom-Json
-            if ($msg.Kind -eq 'hit') { $hits++ }
+            if ($msg.Kind -eq 'hit') {
+                $hits++
+                if (-not ($msg.PSObject.Properties.Name -contains 'TenBit')) { throw 'Scan hit omitted TenBit' }
+                if ([bool]$msg.TenBit) { throw 'The 8-bit test video was marked 10-bit' }
+            }
             if ($msg.Kind -eq 'done') { $done = $msg }
         }
         if ($hits -ne 1) { throw "Scan found $hits bloated files, expected 1." }
