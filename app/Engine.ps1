@@ -745,6 +745,305 @@ function Get-BloatDecision {
     }
 }
 
+function Test-ForceConvertible {
+    param($Decision)
+    if ($null -eq $Decision) { return $false }
+    $id = [string]$Decision.Decision
+    if ($id -eq 'dv' -or $id -eq 'nodur' -or $id -eq 'nopicture') { return $false }
+    if ($null -eq $Decision.TargetKbps) { return $false }
+    $kbps = 0
+    [void][int]::TryParse([string]$Decision.TargetKbps, [ref]$kbps)
+    return ($kbps -gt 0)
+}
+
+function Add-ForceDirectory {
+    param(
+        [string]$Directory,
+        [bool]$Recurse,
+        $List
+    )
+    $leaf = [IO.Path]::GetFileName($Directory.TrimEnd('\', '/'))
+    if ($leaf -eq '.vd-originals') { return }
+    $files = $null
+    try { $files = @([IO.Directory]::EnumerateFiles($Directory)) } catch { return }
+    foreach ($file in $files) {
+        if (-not (Test-VideoFileName $file)) { continue }
+        [void]$List.Add($file)
+    }
+    if (-not $Recurse) { return }
+    $dirs = $null
+    try { $dirs = @([IO.Directory]::EnumerateDirectories($Directory)) } catch { return }
+    foreach ($sub in $dirs) { Add-ForceDirectory -Directory $sub -Recurse $true -List $List }
+}
+
+function Get-ForceVideoPaths {
+    param(
+        [string]$Path,
+        [bool]$Recurse
+    )
+    $list = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        if (Test-VideoFileName $Path) {
+            try { [void]$list.Add((Get-Item -LiteralPath $Path).FullName) } catch { }
+        }
+        return $list.ToArray()
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    Add-ForceDirectory -Directory $Path -Recurse $Recurse -List $list
+    return $list.ToArray()
+}
+
+function Format-ForceReport {
+    param($Files)
+    $ready = 0
+    $blocked = 0
+    $knownNow = [int64]0
+    $knownNext = [int64]0
+    $rough = $false
+    $unknown = 0
+    $grows = 0
+    $lines = New-Object System.Collections.Generic.List[string]
+    $shown = 0
+    # @() around a generic list of JSON objects throws "Argument types do not match" in Windows PowerShell 5.1.
+    $pending = New-Object System.Collections.ArrayList
+    if ($null -eq $Files) { }
+    elseif (($Files -is [System.Collections.IEnumerable]) -and -not ($Files -is [string])) {
+        foreach ($row in $Files) { if ($null -ne $row) { [void]$pending.Add($row) } }
+    }
+    else { [void]$pending.Add($Files) }
+    foreach ($file in $pending) {
+        if ($null -eq $file) { continue }
+        $name = [string]$file.Name
+        if (-not $name) { $name = [IO.Path]::GetFileName([string]$file.Path) }
+        if (-not [bool]$file.CanConvert) {
+            $blocked++
+            if ($shown -lt 8) {
+                [void]$lines.Add($name + ' is left alone. ' + [string]$file.Reason)
+                $shown++
+            }
+            continue
+        }
+        $ready++
+        $size = [int64]0
+        if ($null -ne $file.SizeBytes -and [string]$file.SizeBytes -ne '') { $size = [int64]$file.SizeBytes }
+        $estimate = [int64]0
+        $hasEstimate = $false
+        if ($null -ne $file.EstimateBytes -and [string]$file.EstimateBytes -ne '') {
+            $estimate = [int64]$file.EstimateBytes
+            if ($estimate -gt 0) { $hasEstimate = $true }
+        }
+        if ([bool]$file.EstimateRough) { $rough = $true }
+        $note = $name
+        if (-not $hasEstimate -or $size -le 0) {
+            $unknown++
+            $note += ' has no size estimate.'
+        }
+        else {
+            $knownNow += $size
+            $knownNext += $estimate
+            if ($estimate -ge $size) {
+                $grows++
+                $note += ' may not get smaller.'
+            }
+            else {
+                $note += ' could save about ' + (Format-ByteSize ($size - $estimate)) + '.'
+                if ([bool]$file.EstimateRough) { $note += ' That guess can run high.' }
+            }
+        }
+        if ($shown -lt 8) {
+            [void]$lines.Add($note)
+            $shown++
+        }
+    }
+    $total = $ready + $blocked
+    if ($total -eq 0) { return 'No video files were found.' }
+    $word = if ($ready -eq 1) { 'file' } else { 'files' }
+    $text = "$ready $word can be converted."
+    if ($knownNow -gt 0 -and $knownNext -gt 0) {
+        $text += ' They are ' + (Format-ByteSize $knownNow) + ' now. The estimate is ' + (Format-ByteSize $knownNext) + '.'
+        if ($knownNext -lt $knownNow) { $text += ' About ' + (Format-ByteSize ($knownNow - $knownNext)) + ' smaller.' }
+        else { $text += ' The estimate is not smaller.' }
+    }
+    if ($unknown -eq 1) { $text += ' 1 file has no size estimate.' }
+    elseif ($unknown -gt 1) { $text += " $unknown files have no size estimate." }
+    if ($grows -eq 1) { $text += ' 1 file may not get smaller. A larger result is thrown away.' }
+    elseif ($grows -gt 1) { $text += " $grows files may not get smaller. A larger result is thrown away." }
+    if ($rough) { $text += ' A guess with no picture rate can run high.' }
+    if ($blocked -eq 1) { $text += ' 1 file will be left alone.' }
+    elseif ($blocked -gt 1) { $text += " $blocked files will be left alone." }
+    $text += ' This test reads the files. It does not encode.'
+    $hidden = $total - $shown
+    if ($lines.Count -gt 0) { $text += "`r`n`r`n" + ($lines -join "`r`n") }
+    if ($hidden -gt 0) { $text += "`r`n" + "and $hidden more." }
+    return $text
+}
+
+function Send-ForceFile {
+    param($Queue, $Probe, $Decision, [string]$Path)
+    $can = Test-ForceConvertible $Decision
+    $estimate = $null
+    $rough = $false
+    $grows = $false
+    if ($null -ne $Decision) {
+        if ($null -ne $Decision.EstimateBytes -and [string]$Decision.EstimateBytes -ne '') { $estimate = [int64]$Decision.EstimateBytes }
+        $rough = [bool]$Decision.EstimateRough
+    }
+    if ($can -and $null -ne $estimate -and $estimate -gt 0 -and $null -ne $Probe -and [int64]$Probe.SizeBytes -gt 0 -and $estimate -ge [int64]$Probe.SizeBytes) {
+        $grows = $true
+    }
+    $ten = $false
+    if ($null -ne $Probe) { $ten = ([string](Get-EncoderName -Probe $Probe) -eq 'x265_10bit') }
+    Send-ScanMessage $Queue @{
+        Kind           = 'file'
+        Path           = $Path
+        Name           = [IO.Path]::GetFileName($Path)
+        CanConvert     = [bool]$can
+        Decision       = $(if ($Decision) { [string]$Decision.Decision } else { '' })
+        Reason         = $(if ($Decision) { [string]$Decision.Reason } else { '' })
+        Width          = $(if ($Probe) { [int]$Probe.Width } else { 0 })
+        Height         = $(if ($Probe) { [int]$Probe.Height } else { 0 })
+        DurationSec    = $(if ($Probe) { [double]$Probe.DurationSec } else { 0 })
+        SizeBytes      = $(if ($Probe) { [int64]$Probe.SizeBytes } else { [int64]0 })
+        GiBph          = $(if ($Decision) { $Decision.GiBph } else { $null })
+        BudgetGiBph    = $(if ($Decision) { $Decision.BudgetGiBph } else { $null })
+        TargetKbps     = $(if ($Decision) { [int]$Decision.TargetKbps } else { 0 })
+        EstimateBytes  = $estimate
+        EstimateRough  = [bool]$rough
+        Grows          = [bool]$grows
+        VideoBitrate   = $(if ($Probe) { [int64]$Probe.VideoBitrate } else { [int64]0 })
+        Codec          = $(if ($Probe) { [string]$Probe.VideoCodec } else { '' })
+        TenBit         = [bool]$ten
+    }
+}
+
+function Add-ForceWalkDirectory {
+    param(
+        [string]$Directory,
+        [bool]$Recurse,
+        [bool]$ProbeFiles,
+        [string]$Ffprobe,
+        $Queue,
+        $Cancel,
+        $State
+    )
+    if ($Cancel.Stop) { $State.Cancelled = $true; return }
+    $leaf = [IO.Path]::GetFileName($Directory.TrimEnd('\', '/'))
+    if ($leaf -eq '.vd-originals') { return }
+    $files = $null
+    try { $files = @([IO.Directory]::EnumerateFiles($Directory)) }
+    catch {
+        $State.Errors++
+        if ($State.Samples.Count -lt 8) { [void]$State.Samples.Add($_.Exception.Message) }
+        return
+    }
+    foreach ($file in $files) {
+        if ($Cancel.Stop) { $State.Cancelled = $true; return }
+        if (-not (Test-VideoFileName $file)) { continue }
+        $State.Seen++
+        $name = [IO.Path]::GetFileName($file)
+        Send-ScanMessage $Queue @{ Kind = 'progress'; Seen = $State.Seen; Name = $name }
+        if (-not $ProbeFiles) {
+            $length = [int64]0
+            try { $length = [int64](Get-Item -LiteralPath $file).Length } catch { }
+            Send-ScanMessage $Queue @{
+                Kind = 'file'; Path = $file; Name = $name; CanConvert = $true
+                Decision = ''; Reason = ''; Width = 0; Height = 0; DurationSec = 0
+                SizeBytes = $length; TargetKbps = 0; EstimateBytes = $null
+                EstimateRough = $false; Grows = $false; VideoBitrate = 0; Codec = ''; TenBit = $false
+            }
+            $State.Ready++
+            continue
+        }
+        try {
+            $probed = Get-MediaProbe -Ffprobe $Ffprobe -File $file
+            $decision = Get-BloatDecision -Probe $probed
+            if (Test-ForceConvertible $decision) { $State.Ready++ } else { $State.Blocked++ }
+            Send-ForceFile -Queue $Queue -Probe $probed -Decision $decision -Path $file
+        }
+        catch {
+            $State.Errors++
+            $State.Blocked++
+            if ($State.Samples.Count -lt 8) { [void]$State.Samples.Add("$name`: $($_.Exception.Message)") }
+            Send-ScanMessage $Queue @{
+                Kind = 'file'; Path = $file; Name = $name; CanConvert = $false
+                Decision = 'error'; Reason = $_.Exception.Message
+                Width = 0; Height = 0; DurationSec = 0; SizeBytes = 0; TargetKbps = 0
+                EstimateBytes = $null; EstimateRough = $false; Grows = $false
+                VideoBitrate = 0; Codec = ''; TenBit = $false
+            }
+        }
+    }
+    if (-not $Recurse) { return }
+    $dirs = $null
+    try { $dirs = @([IO.Directory]::EnumerateDirectories($Directory)) }
+    catch {
+        $State.Errors++
+        if ($State.Samples.Count -lt 8) { [void]$State.Samples.Add($_.Exception.Message) }
+        return
+    }
+    foreach ($sub in $dirs) {
+        if ($Cancel.Stop) { $State.Cancelled = $true; return }
+        Add-ForceWalkDirectory -Directory $sub -Recurse $true -ProbeFiles $ProbeFiles -Ffprobe $Ffprobe -Queue $Queue -Cancel $Cancel -State $State
+    }
+}
+
+function Invoke-ForceWalk {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [bool]$Recurse,
+        [bool]$ProbeFiles,
+        [string]$Ffprobe,
+        $Queue,
+        $Cancel
+    )
+    $samples = New-Object System.Collections.Generic.List[string]
+    $state = @{ Seen = 0; Ready = 0; Blocked = 0; Errors = 0; Cancelled = $false; Samples = $samples }
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            if (-not (Test-VideoFileName $Path)) { throw 'That file is not a video this program can convert.' }
+            $full = (Get-Item -LiteralPath $Path).FullName
+            $state.Seen = 1
+            Send-ScanMessage $Queue @{ Kind = 'progress'; Seen = 1; Name = [IO.Path]::GetFileName($full) }
+            if (-not $ProbeFiles) {
+                $length = [int64](Get-Item -LiteralPath $full).Length
+                Send-ScanMessage $Queue @{
+                    Kind = 'file'; Path = $full; Name = [IO.Path]::GetFileName($full); CanConvert = $true
+                    Decision = ''; Reason = ''; Width = 0; Height = 0; DurationSec = 0
+                    SizeBytes = $length; TargetKbps = 0; EstimateBytes = $null
+                    EstimateRough = $false; Grows = $false; VideoBitrate = 0; Codec = ''; TenBit = $false
+                }
+                $state.Ready = 1
+            }
+            else {
+                $probed = Get-MediaProbe -Ffprobe $Ffprobe -File $full
+                $decision = Get-BloatDecision -Probe $probed
+                if (Test-ForceConvertible $decision) { $state.Ready = 1 } else { $state.Blocked = 1 }
+                Send-ForceFile -Queue $Queue -Probe $probed -Decision $decision -Path $full
+            }
+        }
+        elseif (Test-Path -LiteralPath $Path -PathType Container) {
+            Add-ForceWalkDirectory -Directory $Path -Recurse $Recurse -ProbeFiles $ProbeFiles -Ffprobe $Ffprobe -Queue $Queue -Cancel $Cancel -State $state
+        }
+        else { throw "That path was not found: $Path" }
+    }
+    catch {
+        $state.Errors++
+        if ($state.Samples.Count -lt 8) { [void]$state.Samples.Add($_.Exception.Message) }
+    }
+    finally {
+        Send-ScanMessage $Queue @{
+            Kind      = 'done'
+            Seen      = $state.Seen
+            Ready     = $state.Ready
+            Blocked   = $state.Blocked
+            Errors    = $state.Errors
+            Samples   = ($state.Samples -join ' | ')
+            Cancelled = [bool]$state.Cancelled
+        }
+    }
+}
+
 function Get-EncoderName {
     param($Probe)
     if ($Probe.Is10Bit -or $Probe.IsHdr10 -or $Probe.IsHdr10Plus -or $Probe.IsHlg) { return 'x265_10bit' }
@@ -2903,6 +3202,46 @@ function Invoke-EngineSelfTest {
 
     $dv = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]8GB) -DurationSec $hour -Dolby $true)
     Assert-Engine ($dv.Decision -eq 'dv') 'Dolby Vision is left alone'
+    $leanForce = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]1GB) -DurationSec $hour -VideoBitrate 1000000)
+    Assert-Engine ($leanForce.Decision -eq 'lean') 'a small file was treated as bloated'
+    Assert-Engine (Test-ForceConvertible $leanForce) 'Force refused a file under the budget'
+    Assert-Engine (Test-ForceConvertible $withAudio) 'Force refused a bloated file'
+    Assert-Engine (-not (Test-ForceConvertible $dv)) 'Force converted Dolby Vision'
+    $noDurForce = Get-BloatDecision -Probe (New-FakeProbe -Width 1920 -Height 1080 -SizeBytes ([int64]2GB) -DurationSec 0)
+    Assert-Engine (-not (Test-ForceConvertible $noDurForce)) 'Force converted a file with no duration'
+    $forceReport = Format-ForceReport @(
+        [pscustomobject]@{ Name = 'movie.mkv'; CanConvert = $true; SizeBytes = 4000MB; EstimateBytes = 1000MB; EstimateRough = $false; Reason = '' },
+        [pscustomobject]@{ Name = 'tiny.mkv'; CanConvert = $true; SizeBytes = 100MB; EstimateBytes = 200MB; EstimateRough = $false; Reason = '' },
+        [pscustomobject]@{ Name = 'vision.mkv'; CanConvert = $false; SizeBytes = 8GB; EstimateBytes = $null; Reason = 'Dolby Vision is left alone.' }
+    )
+    Assert-Engine ($forceReport -match '2 files can be converted') 'the force report missed the convertible files'
+    Assert-Engine ($forceReport -match 'may not get smaller') 'the force report hid a file that may grow'
+    Assert-Engine ($forceReport -match '1 file will be left alone') 'the force report missed a file left alone'
+    Assert-Engine ($forceReport -match 'does not encode') 'the force report claimed it encoded'
+    Assert-Engine ((Format-ForceReport @()) -eq 'No video files were found.') 'an empty force report was not empty'
+    $forceRoot = Join-Path $env:TEMP ('vdh-force-' + [guid]::NewGuid().ToString('n'))
+    New-Item -ItemType Directory -Force -Path $forceRoot | Out-Null
+    try {
+        $forceSub = Join-Path $forceRoot 'Season'
+        $forceHold = Join-Path $forceRoot '.vd-originals'
+        New-Item -ItemType Directory -Force -Path $forceSub, $forceHold | Out-Null
+        [IO.File]::WriteAllText((Join-Path $forceRoot 'show.mkv'), 'a')
+        [IO.File]::WriteAllText((Join-Path $forceRoot 'notes.txt'), 'b')
+        [IO.File]::WriteAllText((Join-Path $forceSub 'episode.mp4'), 'c')
+        [IO.File]::WriteAllText((Join-Path $forceHold 'kept.mkv'), 'd')
+        $forceOne = @(Get-ForceVideoPaths -Path (Join-Path $forceRoot 'show.mkv') -Recurse $true)
+        Assert-Engine ($forceOne.Count -eq 1 -and $forceOne[0] -match 'show\.mkv$') 'Force did not keep the picked file'
+        $forceFlat = @(Get-ForceVideoPaths -Path $forceRoot -Recurse $false)
+        Assert-Engine ($forceFlat.Count -eq 1 -and ($forceFlat -join '|') -notmatch 'episode') 'Force included a subfolder when it was off'
+        $forceDeep = @(Get-ForceVideoPaths -Path $forceRoot -Recurse $true)
+        Assert-Engine ($forceDeep.Count -eq 2) 'Force missed a video in a subfolder'
+        Assert-Engine (($forceDeep -join '|') -notmatch '\.vd-originals') 'Force included a held original'
+        Assert-Engine (($forceDeep -join '|') -notmatch 'notes\.txt') 'Force included a text file'
+    }
+    finally {
+        if (Test-Path -LiteralPath $forceRoot) { Remove-Item -LiteralPath $forceRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
 
     $sameStamp = '[null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 10 | [null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 18 >= 18'
     Assert-Engine (Test-HarmlessDecodeNote $sameStamp) 'equal timestamp notes are harmless'
