@@ -341,7 +341,7 @@ $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.7.4'
+$script:UpdateFallback = '1.0.8'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -548,7 +548,13 @@ $script:Loading = $false
 $script:ProgressValue = 0
 $script:EtaRates8 = New-Object System.Collections.Generic.List[double]
 $script:EtaRates10 = New-Object System.Collections.Generic.List[double]
+$script:EtaLive8 = New-Object System.Collections.Generic.List[double]
+$script:EtaLive10 = New-Object System.Collections.Generic.List[double]
 $script:EtaRatios = New-Object System.Collections.Generic.List[double]
+$script:EtaFileSamples = New-Object System.Collections.Generic.List[double]
+$script:EtaBatchSamples = New-Object System.Collections.Generic.List[double]
+$script:EtaShownAt = $null
+$script:EtaShownKey = ''
 $script:EtaPassStart = $null
 $script:EtaPass1Sec = 0
 $script:EtaTask = 0
@@ -2789,6 +2795,9 @@ function Reset-EncodeEtaClock {
     $script:EtaProgress = $null
     $script:EtaChecking = $false
     $script:EtaRemembered = $false
+    if ($script:EtaLive8) { $script:EtaLive8.Clear() }
+    if ($script:EtaLive10) { $script:EtaLive10.Clear() }
+    Clear-EtaWindow
 }
 
 function Add-EtaSample($List, [double]$Value) {
@@ -2823,7 +2832,11 @@ function Sync-EncodePass($Progress) {
         }
         $script:EtaPassStart = [datetime]::UtcNow
     }
-    if ($task -gt [int]$script:EtaTask) { $script:EtaTask = $task }
+    if ($task -gt [int]$script:EtaTask) {
+        if ($script:EtaLive8) { $script:EtaLive8.Clear() }
+        if ($script:EtaLive10) { $script:EtaLive10.Clear() }
+        $script:EtaTask = $task
+    }
     $script:EtaProgress = $Progress
 }
 
@@ -2836,12 +2849,18 @@ function Get-ChosenEncodeRate([string]$Class) {
     $progress = $script:EtaProgress
     $onLastPass = ($null -ne $progress -and [int]$progress.Task -ge [int]$progress.Tasks -and [int]$script:EtaTask -ge 2)
     $same = (($Class -eq '10') -eq [bool]$script:EtaTenBit)
+    $part = 0.0
     if ($onLastPass -and $same -and -not $script:EtaChecking) {
-        $part = 0.0
         if ([double]$progress.Part -gt 0) { $part = [double]$progress.Part / 100.0 }
         $live = Get-LiveEncodeRate -Pass1Sec ([double]$script:EtaPass1Sec) -PassElapsedSec (Get-CurrentPassElapsed) -PassFraction $part -PixelSeconds ([double]$script:EtaPixels)
+        if ($live -gt 0) {
+            $bucket = $script:EtaLive8
+            if ($Class -eq '10') { $bucket = $script:EtaLive10 }
+            Add-EtaSample $bucket $live
+            $live = Get-MedianSample @($bucket)
+        }
     }
-    return (Get-EncodeRate -LiveRate $live -FinishedRates $finished)
+    return (Get-EncodeRate -LiveRate $live -FinishedRates $finished -PassFraction $part)
 }
 
 function Get-WaitingEncodeRows {
@@ -2891,20 +2910,76 @@ function Set-EtaText([string]$text) {
     }
 }
 
+function Add-EtaWindow($List, [double]$Value) {
+    if ($null -eq $List) { return }
+    if ($Value -le 0 -or [double]::IsNaN($Value) -or [double]::IsInfinity($Value)) { return }
+    [void]$List.Add($Value)
+    while ($List.Count -gt 160) { $List.RemoveAt(0) }
+}
+
+function Clear-EtaWindow {
+    if ($script:EtaFileSamples) { $script:EtaFileSamples.Clear() }
+    if ($script:EtaBatchSamples) { $script:EtaBatchSamples.Clear() }
+    $script:EtaShownAt = $null
+    $script:EtaShownKey = ''
+}
+
+function Get-EtaPublishKey([string]$Phase, $Estimate) {
+    $task = 0
+    if ($script:EtaProgress) { $task = [int]$script:EtaProgress.Task }
+    $stop = 'run'
+    if ($script:StopAfterFile) { $stop = 'stop' }
+    $batch = 'wait'
+    if ($Estimate -and [bool]$Estimate.HaveBatch) { $batch = 'ready' }
+    $kind = 'none'
+    if ($Estimate) { $kind = [string]$Estimate.FileKind }
+    return ($Phase + '|' + $kind + '|' + $batch + '|' + $stop + '|' + $task)
+}
+
 function Update-EtaLine {
     if ($script:Work -ne 'encode') {
+        Clear-EtaWindow
         Set-EtaText ''
         return
     }
     $phase = 'encode'
     if ($script:EtaChecking) { $phase = 'check' }
     $estimate = Get-RemainingEstimate -Progress $script:EtaProgress -PassElapsedSec (Get-CurrentPassElapsed) -Pass1Sec ([double]$script:EtaPass1Sec) -PassRatio (Get-MeanSample @($script:EtaRatios)) -Rate8 (Get-ChosenEncodeRate '8') -Rate10 (Get-ChosenEncodeRate '10') -Waiting (Get-WaitingEncodeRows) -Phase $phase
-    Set-EtaText ([string]$estimate.Text)
+    $key = Get-EtaPublishKey $phase $estimate
+    $keyChanged = ($key -ne [string]$script:EtaShownKey)
+    if ($keyChanged) {
+        if ($script:EtaFileSamples) { $script:EtaFileSamples.Clear() }
+        if ($script:EtaBatchSamples) { $script:EtaBatchSamples.Clear() }
+    }
+    if ([double]$estimate.FileSeconds -gt 0) { Add-EtaWindow $script:EtaFileSamples ([double]$estimate.FileSeconds) }
+    if ($estimate.HaveBatch -and [double]$estimate.BatchSeconds -gt 0) { Add-EtaWindow $script:EtaBatchSamples ([double]$estimate.BatchSeconds) }
+    $fileSeconds = Get-MedianSample @($script:EtaFileSamples)
+    if ($fileSeconds -le 0) { $fileSeconds = [double]$estimate.FileSeconds }
+    $batchSeconds = [double]$estimate.BatchSeconds
+    if ($estimate.HaveBatch) {
+        $medianBatch = Get-MedianSample @($script:EtaBatchSamples)
+        if ($medianBatch -gt 0) { $batchSeconds = $medianBatch }
+    }
+    $text = Format-EtaText -Progress $script:EtaProgress -FileKind ([string]$estimate.FileKind) -FileSeconds $fileSeconds -BatchSeconds $batchSeconds -HaveBatch ([bool]$estimate.HaveBatch)
+    $sinceShown = 999.0
+    if ($null -ne $script:EtaShownAt) { $sinceShown = ([datetime]::UtcNow - $script:EtaShownAt).TotalSeconds }
+    if ($keyChanged -or $sinceShown -ge 30) {
+        Set-EtaText $text
+        $script:EtaShownAt = [datetime]::UtcNow
+        $script:EtaShownKey = $key
+        if (-not $keyChanged) {
+            if ($script:EtaFileSamples) { $script:EtaFileSamples.Clear() }
+            if ($script:EtaBatchSamples) { $script:EtaBatchSamples.Clear() }
+            if ($fileSeconds -gt 0) { Add-EtaWindow $script:EtaFileSamples $fileSeconds }
+            if ($estimate.HaveBatch -and $batchSeconds -gt 0) { Add-EtaWindow $script:EtaBatchSamples $batchSeconds }
+        }
+    }
 }
 
 function Clear-EtaLine {
     $script:EtaProgress = $null
     $script:EtaChecking = $false
+    Clear-EtaWindow
     Set-EtaText ''
 }
 
@@ -4891,7 +4966,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Converting'
-            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. One file is encoded at a time. The bar is that file. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
+            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. One file is encoded at a time. The bar is that file. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
         },
         @{
             Title = 'Checking the picture'
@@ -6422,7 +6497,10 @@ function Invoke-EtaCheck {
     try {
         $script:EtaRates8.Clear()
         $script:EtaRates10.Clear()
+        $script:EtaLive8.Clear()
+        $script:EtaLive10.Clear()
         $script:EtaRatios.Clear()
+        Clear-EtaWindow
         $script:Work = 'encode'
         $script:StopAfterFile = $false
         $script:EtaChecking = $false
@@ -6440,6 +6518,14 @@ function Invoke-EtaCheck {
         Update-EtaLine
         Assert-True ($script:EtaLabel.Text -match 'Estimated time remaining: ') ("The batch line omitted its label: $($script:EtaLabel.Text)")
         Assert-True ($script:EtaLabel.Text -notmatch 'Estimated time remaining: estimating') ("A measured batch stayed on estimating: $($script:EtaLabel.Text)")
+        $held = [string]$script:EtaLabel.Text
+        $script:EtaProgress = Get-HandBrakeProgress 'Encoding: task 2 of 2, 50.00 % (8.00 fps, avg 8.00 fps, ETA 00h05m00s)'
+        Update-EtaLine
+        Assert-True ($script:EtaLabel.Text -eq $held) ("The time line moved before 30 seconds: $($script:EtaLabel.Text)")
+        $script:EtaShownAt = [datetime]::UtcNow.AddSeconds(-31)
+        Update-EtaLine
+        Assert-True ($script:EtaLabel.Text -ne $held) ("The time line stayed after 30 seconds: $($script:EtaLabel.Text)")
+        $script:EtaProgress = Get-HandBrakeProgress 'Encoding: task 2 of 2, 50.00 % (8.00 fps, avg 8.00 fps, ETA 00h01m00s)'
         Assert-True ($script:EtaLabel.Visible) 'The time line stayed hidden'
         Assert-True ($script:StatusPanel.Height -eq 78) 'The status bar did not grow for the time line'
         Assert-True ($script:ProgressTrack.Top -gt $script:EtaLabel.Top) 'The bar covered the time line'
@@ -6463,7 +6549,10 @@ function Invoke-EtaCheck {
         $script:EncodeIndex = $keptIndex
         $script:EtaRates8.Clear()
         $script:EtaRates10.Clear()
+        $script:EtaLive8.Clear()
+        $script:EtaLive10.Clear()
         $script:EtaRatios.Clear()
+        Clear-EtaWindow
         foreach ($rate in @($keptRates8)) { if ($rate -gt 0) { [void]$script:EtaRates8.Add([double]$rate) } }
         foreach ($rate in @($keptRates10)) { if ($rate -gt 0) { [void]$script:EtaRates10.Add([double]$rate) } }
         foreach ($ratio in @($keptRatios)) { if ($ratio -gt 0) { [void]$script:EtaRatios.Add([double]$ratio) } }
@@ -6575,6 +6664,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:HelpBox.Text -match 'Stop asking on that window hides it from then on') 'The guide was missing Stop asking'
     Assert-True ($script:HelpBox.Text -match 'does not add a line for each percent') 'The guide was missing the activity percent note'
     Assert-True ($script:HelpBox.Text -match 'Estimated time remaining is the rest of the batch') 'The guide was missing the batch time'
+    Assert-True ($script:HelpBox.Text -match 'changes about every 30 seconds') 'The guide was missing the steady time line'
     Assert-True ($script:HelpBox.Text -match 'will not stay in sync with the picture') 'The guide was missing the compare sync note'
     Assert-True ($script:HelpBox.Text -match 'Go to the file on disk to confirm the audio') 'The guide was missing the disk audio note'
     Assert-True ($script:HelpBox.Text -match 'checks for updates when it opens') 'The guide was missing the startup update check'
@@ -6607,7 +6697,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.7.4') 'Version file was not 1.0.7.4'
+    Assert-True ((Get-AppVersion) -eq '1.0.8') 'Version file was not 1.0.8'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -6618,7 +6708,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.0\.7') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.0\.8') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'

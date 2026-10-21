@@ -417,10 +417,43 @@ function Get-MeanSample {
     return ($sum / $count)
 }
 
+function Get-MedianSample {
+    param([double[]]$Values)
+    $kept = New-Object System.Collections.Generic.List[double]
+    foreach ($value in @($Values)) {
+        if ($null -eq $value) { continue }
+        $number = 0.0
+        if (-not [double]::TryParse([string]$value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number)) { continue }
+        if ($number -le 0 -or [double]::IsNaN($number) -or [double]::IsInfinity($number)) { continue }
+        [void]$kept.Add($number)
+    }
+    if ($kept.Count -eq 0) { return 0 }
+    $sorted = @($kept | Sort-Object)
+    $mid = [int][math]::Floor($sorted.Count / 2)
+    if (($sorted.Count % 2) -eq 1) { return [double]$sorted[$mid] }
+    return (([double]$sorted[$mid - 1] + [double]$sorted[$mid]) / 2.0)
+}
+
+# A live rate is one noisy pass. Finished files are the steadier speed.
+# Early in the pass they count for more. With only one of the two, that one is the answer.
 function Get-EncodeRate {
-    param([double]$LiveRate, [double[]]$FinishedRates)
-    if ($LiveRate -gt 0 -and -not [double]::IsNaN($LiveRate) -and -not [double]::IsInfinity($LiveRate)) { return $LiveRate }
-    return (Get-MeanSample $FinishedRates)
+    param(
+        [double]$LiveRate,
+        [double[]]$FinishedRates,
+        [double]$PassFraction = 1
+    )
+    $finished = Get-MeanSample $FinishedRates
+    $live = 0.0
+    if ($LiveRate -gt 0 -and -not [double]::IsNaN($LiveRate) -and -not [double]::IsInfinity($LiveRate)) {
+        $live = [double]$LiveRate
+    }
+    if ($live -le 0) { return $finished }
+    if ($finished -le 0) { return $live }
+    if ($PassFraction -lt 0 -or [double]::IsNaN($PassFraction)) { $PassFraction = 0 }
+    if ($PassFraction -gt 1) { $PassFraction = 1 }
+    $liveWeight = 0.5
+    if ($PassFraction -lt 0.15) { $liveWeight = 0.25 }
+    return ($live * $liveWeight) + ($finished * (1.0 - $liveWeight))
 }
 
 # Seconds of encode time per pixel-second. Pass 1 has to be finished, and
@@ -503,20 +536,7 @@ function Get-RemainingEstimate {
         }
     }
 
-    $fileText = 'estimating'
-    if ($fileKind -eq 'pass') {
-        $passNo = 1
-        if ($null -ne $Progress) { $passNo = [int]$Progress.Task }
-        $passName = 'first pass'
-        if ($passNo -ge 2) { $passName = "pass $passNo" }
-        $fileText = "$passName, $(Format-RemainingTime $fileSeconds) left"
-    }
-    elseif ($fileKind -eq 'full' -or $fileKind -eq 'check') {
-        $fileText = "$((Format-RemainingTime $fileSeconds)) left"
-    }
-    $batchText = 'estimating'
-    if ($haveBatch) { $batchText = Format-RemainingTime $batchSeconds }
-    $text = "This file: $fileText. Estimated time remaining: $batchText"
+    $text = Format-EtaText -Progress $Progress -FileKind $fileKind -FileSeconds $fileSeconds -BatchSeconds $batchSeconds -HaveBatch $haveBatch
     return [pscustomobject]@{
         FileKind     = $fileKind
         FileSeconds  = $fileSeconds
@@ -524,6 +544,30 @@ function Get-RemainingEstimate {
         HaveBatch    = [bool]$haveBatch
         Text         = $text
     }
+}
+
+function Format-EtaText {
+    param(
+        $Progress,
+        [string]$FileKind,
+        [double]$FileSeconds,
+        [double]$BatchSeconds,
+        [bool]$HaveBatch
+    )
+    $fileText = 'estimating'
+    if ($FileKind -eq 'pass') {
+        $passNo = 1
+        if ($null -ne $Progress) { $passNo = [int]$Progress.Task }
+        $passName = 'first pass'
+        if ($passNo -ge 2) { $passName = "pass $passNo" }
+        $fileText = "$passName, $(Format-RemainingTime $FileSeconds) left"
+    }
+    elseif ($FileKind -eq 'full' -or $FileKind -eq 'check') {
+        $fileText = "$((Format-RemainingTime $FileSeconds)) left"
+    }
+    $batchText = 'estimating'
+    if ($HaveBatch) { $batchText = Format-RemainingTime $BatchSeconds }
+    return "This file: $fileText. Estimated time remaining: $batchText"
 }
 
 function Get-MediaProbe {
@@ -3344,6 +3388,11 @@ function Invoke-EngineSelfTest {
     Assert-Engine ([math]::Abs((Get-LiveEncodeRate -Pass1Sec 10 -PassElapsedSec 10 -PassFraction 0.5 -PixelSeconds 1000) - 0.03) -lt 0.000001) 'live encode rate'
     Assert-Engine ((Get-LiveEncodeRate -Pass1Sec 10 -PassElapsedSec 7 -PassFraction 0.5 -PixelSeconds 1000) -eq 0) 'a short sample is not a rate'
     Assert-Engine ((Get-LiveEncodeRate -Pass1Sec 0 -PassElapsedSec 30 -PassFraction 0.5 -PixelSeconds 1000) -eq 0) 'a missing first pass is not a rate'
+    Assert-Engine ((Get-MedianSample @(10, 40, 12)) -eq 12) 'a spike does not move the median'
+    Assert-Engine ([math]::Abs((Get-EncodeRate -LiveRate 4 -FinishedRates @(2) -PassFraction 0.05) - 2.5) -lt 0.001) 'an early live rate is a quarter of the blend'
+    Assert-Engine ([math]::Abs((Get-EncodeRate -LiveRate 4 -FinishedRates @(2) -PassFraction 0.5) - 3) -lt 0.001) 'a later live rate shares the blend'
+    Assert-Engine ((Get-EncodeRate -LiveRate 0 -FinishedRates @(2, 4)) -eq 3) 'no live rate uses the finished average'
+    Assert-Engine ((Get-EncodeRate -LiveRate 4 -FinishedRates @()) -eq 4) 'no finished rate uses the live rate'
     $passOnly = Get-RemainingEstimate -Progress $parsed -PassElapsedSec 5 -PassRatio 0 -Waiting @() -Phase 'encode'
     Assert-Engine ($passOnly.FileKind -eq 'pass' -and -not $passOnly.HaveBatch) 'the first pass is not a batch time'
     Assert-Engine ($passOnly.Text -eq 'This file: first pass, about 10 sec left. Estimated time remaining: estimating') 'the first pass says it is estimating the batch'
