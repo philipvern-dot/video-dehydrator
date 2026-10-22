@@ -1101,7 +1101,8 @@ function Get-HandBrakeArguments {
         $Probe,
         [Parameter(Mandatory)][int]$VideoKbps,
         [Parameter(Mandatory)][string]$Encoder,
-        [switch]$ReencodeAudio
+        [switch]$ReencodeAudio,
+        [int]$ThreadPool = 0
     )
     $fallback = 'none'
     if ($ReencodeAudio) { $fallback = 'av_aac' }
@@ -1144,6 +1145,9 @@ function Get-HandBrakeArguments {
     }
     else {
         $arguments += @('--no-comb-detect', '--no-deinterlace', '--no-decomb', '--no-bwdif')
+    }
+    if ($ThreadPool -gt 0) {
+        $arguments += @('--encopts', ('pools=' + $ThreadPool))
     }
     return $arguments
 }
