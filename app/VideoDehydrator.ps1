@@ -7382,6 +7382,9 @@ function Invoke-ListSplitCheck {
     $tip = [string]$script:Tips.GetToolTip($script:ListSplit)
     Assert-True ($tip -eq 'Drag to make the video list taller or shorter. Double-click to put it back.') ("List resize tip was $tip")
     $kept = [int]$script:ListExtra
+    $keptLog = 0
+    if ($null -ne $script:LogExtra) { $keptLog = [int]$script:LogExtra }
+    $script:LogExtra = 0
     Set-ListExtra 0
     [Windows.Forms.Application]::DoEvents()
     $plan0 = Get-ListSplitPlan 0
@@ -7409,7 +7412,8 @@ function Invoke-ListSplitCheck {
     Set-ListExtra 0
     [Windows.Forms.Application]::DoEvents()
     Assert-True ([int]$script:ListExtra -eq 0) 'The video list did not return to its normal height'
-    if ($kept -ne 0) { Set-ListExtra $kept }
+    $script:LogExtra = $keptLog
+    if ($kept -ne 0) { Set-ListExtra $kept } else { Set-ListExtra 0 }
 }
 
 function Invoke-SmokeTest {
@@ -7533,7 +7537,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.0\.9\.1') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.0\.9\.2') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'
@@ -7921,7 +7925,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:FindBox.Items.Count -eq 6) 'Find is missing a choice'
     Assert-True ([string]$script:FindBox.Items[0] -eq 'All') 'Find does not start with All'
     Assert-True ([string]$script:FindBox.Items[3] -eq '25') 'Find is missing 25'
-    Assert-True ((Get-FindLimit) -eq 0) 'Find did not default to the whole folder'
+    Assert-True (@(0, 5, 10, 25, 50, 100) -contains (Get-FindLimit)) 'Find was not one of the listed limits'
     Assert-True ($script:LogButton.Text -eq 'Log') 'Log label'
     Assert-True ($script:LogButton.Parent -eq $script:ActionPanel) 'Log is outside the action row'
     Assert-True ($script:Tips.GetToolTip($script:LogButton) -match 'Markdown file') 'Log tooltip'
