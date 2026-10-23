@@ -447,10 +447,11 @@ $script:PendingPath = Join-Path $script:AppDir 'pending.json'
 $script:SkipPath = Join-Path $script:AppDir 'skipped.json'
 $script:SkipRows = @()
 $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
+$script:ConversionLogPath = Join-Path $script:AppDir 'conversion-log.md'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.9.1'
+$script:UpdateFallback = '1.0.9.2'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -857,6 +858,7 @@ function Set-BarFill($Track, $Fill, [double]$percent) {
     if ($span -lt 0) { $span = 0 }
     if ($percent -gt 0 -and $span -lt 6 -and $width -gt 0) { $span = 6 }
     if ($span -gt $width) { $span = $width }
+    if ($Fill.Width -eq $span -and $Fill.Height -eq $Track.ClientSize.Height) { return }
     $Fill.Width = $span
     $Fill.Height = $Track.ClientSize.Height
 }
@@ -868,9 +870,45 @@ function Set-Progress([double]$percent) {
     Set-BarFill $script:ProgressTrack $script:ProgressFill $percent
 }
 
-function Test-ParallelJobs {
-    if ($script:ParallelCheck) { return [bool]$script:ParallelCheck.Checked }
-    return [bool]$script:ParallelJobs
+function Get-FindLimit {
+    if (-not $script:FindBox -or $script:FindBox.SelectedIndex -lt 0) { return [int]$script:FindLimit }
+    $text = [string]$script:FindBox.SelectedItem
+    if ($text -eq 'All') { return 0 }
+    $number = 0
+    if (-not [int]::TryParse($text, [ref]$number)) { return 0 }
+    if ($number -lt 0) { return 0 }
+    return $number
+}
+
+function Get-JobTip {
+    return "How many files encode at the same time. Each file uses about 8 cores.`r`n`r`n1 is right for most computers.`r`n2 needs about 16 cores, in two groups of 8.`r`n3 needs about 24 cores.`r`n4 needs about 32 cores.`r`n5 needs about 40 cores.`r`n6 needs about 48 cores.`r`n`r`nOn fewer cores the files share the processor and the batch does not finish sooner. On a laptop, leave this at 1 unless it is plugged in."
+}
+
+function Get-JobCount {
+    $count = 1
+    if ($script:JobBox -and $script:JobBox.SelectedIndex -ge 0) {
+        $parsed = 0
+        if ([int]::TryParse([string]$script:JobBox.SelectedItem, [ref]$parsed)) { $count = $parsed }
+    }
+    elseif ($null -ne $script:JobCount) { $count = [int]$script:JobCount }
+    if ($count -lt 1) { $count = 1 }
+    if ($count -gt 6) { $count = 6 }
+    return $count
+}
+
+function Get-OpenLane {
+    if (-not $script:Lanes) { return $null }
+    $limit = Get-JobCount
+    $lanes = @($script:Lanes)
+    for ($i = 0; $i -lt $limit -and $i -lt $lanes.Count; $i++) {
+        if (-not $lanes[$i].Item) { return $lanes[$i] }
+    }
+    return $null
+}
+
+function Test-ProgressPaintDue {
+    if ($null -eq $script:ProgressPaintAt) { return $true }
+    return (([datetime]::UtcNow - $script:ProgressPaintAt).TotalMilliseconds -ge 500)
 }
 
 function Set-JobBar($Row, [string]$Name, [double]$Percent, [string]$PassName) {
@@ -1017,6 +1055,8 @@ function Load-Settings {
         ListExtra = 0
         LogExtra = 0
         ParallelJobs = $false
+        JobCount = 1
+        FindLimit = 0
     }
     if (-not (Test-Path -LiteralPath $script:SettingsPath)) { return $defaults }
     try {
@@ -1055,6 +1095,21 @@ function Load-Settings {
             $defaults.ColumnOrder = $names
         }
         if ($null -ne $json.parallelJobs) { $defaults.ParallelJobs = [bool]$json.parallelJobs }
+        if ($null -ne $json.jobCount) {
+            $rawJobs = [string]$json.jobCount
+            if ($rawJobs -match '^\d+$') {
+                $jobCount = [int]$rawJobs
+                if ($jobCount -ge 1 -and $jobCount -le 6) { $defaults.JobCount = $jobCount }
+            }
+        }
+        elseif ($defaults.ParallelJobs) { $defaults.JobCount = 2 }
+        if ($null -ne $json.findLimit) {
+            $rawFind = [string]$json.findLimit
+            if ($rawFind -match '^\d+$') {
+                $findLimit = [int]$rawFind
+                if (@(0, 5, 10, 25, 50, 100) -contains $findLimit) { $defaults.FindLimit = $findLimit }
+            }
+        }
         if ($null -ne $json.logExtra) {
             $rawLog = [string]$json.logExtra
             if ($rawLog -match '^-?\d+$') {
@@ -1106,7 +1161,9 @@ function Save-Settings {
         columnOrder = @($script:ColumnOrder)
         listExtra = [int]$script:ListExtra
         logExtra = [int]$script:LogExtra
-        parallelJobs = $(if ($script:ParallelCheck) { [bool]$script:ParallelCheck.Checked } else { [bool]$script:ParallelJobs })
+        jobCount = (Get-JobCount)
+        parallelJobs = ((Get-JobCount) -gt 1)
+        findLimit = (Get-FindLimit)
     }
     $json = $obj | ConvertTo-Json
     $utf8 = New-Object System.Text.UTF8Encoding $true
@@ -1240,6 +1297,130 @@ function Add-RunLog {
         $oldGiB, $newGiB, $oldText, $newText, $Width, $Height, $Kbps
     ) -join "`t"
     Add-Content -LiteralPath $script:ConvertLogPath -Value $row -Encoding UTF8
+    try { Write-ConversionLog } catch { }
+}
+
+function Escape-LogCell([string]$Text) {
+    $value = ([string]$Text) -replace '[\r\n]+', ' '
+    $value = $value -replace '\|', '\|'
+    return $value.Trim()
+}
+
+function Get-LogResultText([string]$Status, [string]$Reason) {
+    $name = switch ($Status) {
+        'REPLACED' { 'Replaced the original' }
+        'KEPT' { 'Kept the original' }
+        'UNDONE' { 'Undone' }
+        'FAIL' { 'Failed' }
+        'SKIP' { 'Skipped' }
+        default { $Status }
+    }
+    $note = ([string]$Reason).Trim()
+    if ($note -and $note -ne 'ok') {
+        if ($note.Length -gt 120) { $note = $note.Substring(0, 117) + '...' }
+        return "$name. $note"
+    }
+    return $name
+}
+
+function Format-ConversionLogMarkdown($Rows) {
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.AppendLine('# Video Dehydrator conversions')
+    [void]$builder.AppendLine('')
+    [void]$builder.AppendLine('Each conversion is listed under the day and time it finished. Updating the program keeps this file.')
+    [void]$builder.AppendLine('')
+    # @() around a generic List throws "Argument types do not match" in Windows PowerShell 5.1.
+    $items = New-Object System.Collections.ArrayList
+    if ($null -eq $Rows) { }
+    elseif (($Rows -is [System.Collections.IEnumerable]) -and -not ($Rows -is [string])) {
+        foreach ($row in $Rows) { if ($null -ne $row) { [void]$items.Add($row) } }
+    }
+    else { [void]$items.Add($Rows) }
+    if ($items.Count -eq 0) {
+        [void]$builder.AppendLine('No conversions are recorded yet.')
+        [void]$builder.AppendLine('')
+        return $builder.ToString()
+    }
+    $ordered = foreach ($row in $items) {
+        $when = [datetime]::MinValue
+        $text = [string]$row.Timestamp
+        if (-not [datetime]::TryParse($text, [ref]$when)) { $when = [datetime]::MinValue }
+        [pscustomobject]@{ When = $when; Row = $row }
+    }
+    $ordered = @($ordered | Sort-Object When, { $_.Row.Source })
+    $day = ''
+    $minute = ''
+    foreach ($item in $ordered) {
+        $nextDay = $item.When.ToString('MMMM d, yyyy')
+        $nextMinute = $item.When.ToString('h:mm tt')
+        if ($nextDay -ne $day) {
+            if ($day) { [void]$builder.AppendLine('') }
+            [void]$builder.AppendLine("## $nextDay")
+            [void]$builder.AppendLine('')
+            $day = $nextDay
+            $minute = ''
+        }
+        if ($nextMinute -ne $minute) {
+            [void]$builder.AppendLine("### $nextMinute")
+            [void]$builder.AppendLine('')
+            [void]$builder.AppendLine('| File | Result | Size | Picture | Rate |')
+            [void]$builder.AppendLine('| --- | --- | --- | --- | --- |')
+            $minute = $nextMinute
+        }
+        $row = $item.Row
+        $file = Escape-LogCell ([string]$row.Source)
+        if (-not $file) { $file = 'Unknown file' }
+        $result = Escape-LogCell (Get-LogResultText $row.Status $row.Reason)
+        $size = ''
+        if ($row.OldGiB -and $row.NewGiB) { $size = "$($row.OldGiB) GiB to $($row.NewGiB) GiB" }
+        elseif ($row.OldGiB) { $size = "$($row.OldGiB) GiB" }
+        $picture = ''
+        if ($row.Width -and $row.Height) { $picture = "$($row.Width) x $($row.Height)" }
+        $rate = ''
+        if ($row.Kbps) { $rate = "$($row.Kbps) kbps" }
+        elseif ($row.OldGiBph -and $row.NewGiBph) { $rate = "$($row.OldGiBph) to $($row.NewGiBph) GiB/h" }
+        [void]$builder.AppendLine("| ``$file`` | $result | $(Escape-LogCell $size) | $(Escape-LogCell $picture) | $(Escape-LogCell $rate) |")
+    }
+    [void]$builder.AppendLine('')
+    return $builder.ToString()
+}
+
+function Read-ConvertLogRows {
+    if (-not (Test-Path -LiteralPath $script:ConvertLogPath)) { return @() }
+    $lines = @(Get-Content -LiteralPath $script:ConvertLogPath -Encoding UTF8)
+    if ($lines.Count -lt 2) { return @() }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($line in ($lines | Select-Object -Skip 1)) {
+        if (-not $line) { continue }
+        $part = $line -split "`t", -1
+        while ($part.Count -lt 13) { $part += '' }
+        $rows.Add([pscustomobject]@{
+            Timestamp = $part[0]; Status = $part[1]; Reason = $part[2]; Source = $part[3]
+            New = $part[4]; Kept = $part[5]; OldGiB = $part[6]; NewGiB = $part[7]
+            OldGiBph = $part[8]; NewGiBph = $part[9]; Width = $part[10]; Height = $part[11]; Kbps = $part[12]
+        })
+    }
+    return $rows.ToArray()
+}
+
+function Write-ConversionLog {
+    $text = Format-ConversionLogMarkdown (Read-ConvertLogRows)
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($script:ConversionLogPath, $text, $utf8)
+}
+
+function Open-ConversionLog {
+    try { Write-ConversionLog } catch { }
+    $path = $script:ConversionLogPath
+    if (-not (Test-Path -LiteralPath $path)) {
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($path, "# Video Dehydrator conversions`r`n`r`nNo conversions are recorded yet.`r`n", $utf8)
+    }
+    try {
+        Start-Process -FilePath $path
+    } catch {
+        Start-Process -FilePath notepad.exe -ArgumentList $path
+    }
 }
 
 function Enable-KeepAwake {
@@ -2123,9 +2304,11 @@ function Update-Buttons {
     if ($script:OverBandCounts -and $script:OverBandCounts.ContainsKey($overId)) { $overCount = [int]$script:OverBandCounts[$overId] }
     if ($script:OverPick) { $script:OverPick.Enabled = -not $busy }
     if ($script:SelectOverButton) { $script:SelectOverButton.Enabled = ((-not $busy) -and $overCount -gt 0) }
-    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:RecycleCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck, $script:ParallelCheck)) {
+    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:RecycleCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
         if ($chk) { $chk.Enabled = -not $busy }
     }
+    if ($script:JobBox) { $script:JobBox.Enabled = -not $busy }
+    if ($script:FindBox) { $script:FindBox.Enabled = -not $busy }
     foreach ($box in @($script:BudgetBoxes)) {
         if ($box) { $box.Enabled = -not $busy }
     }
@@ -2507,6 +2690,13 @@ function Remove-TempQuiet {
     if ($Path) { Remove-EmptyDirectory (Split-Path -Parent $Path) }
 }
 
+function Release-EncodeHold {
+    param($Plan)
+    if (-not $Plan) { return }
+    Remove-HoldBusyMarker -Plan $Plan
+    if ($Plan.Temp) { Remove-TempQuiet $Plan.Temp }
+}
+
 function Complete-ScanRuntime {
     param([string]$Label = 'Scan')
     if ($script:ScanPower) {
@@ -2553,11 +2743,11 @@ function Start-Scan {
     $script:ScanRunspace = $rs
     $script:ScanPower = $ps
     $null = $ps.AddScript({
-        param($EnginePath, $Root, $Recurse, $Ffprobe, $Queue, $Cancel, $Budgets, $SkipJson)
+        param($EnginePath, $Root, $Recurse, $Ffprobe, $Queue, $Cancel, $Budgets, $SkipJson, $Limit)
         . $EnginePath
         Set-BudgetPicks $Budgets
-        Invoke-ScanFolder -Root $Root -Recurse $Recurse -Ffprobe $Ffprobe -Queue $Queue -Cancel $Cancel -Skips @(Convert-SkipRows $SkipJson)
-    }).AddArgument($script:EnginePath).AddArgument($folder).AddArgument([bool]$script:SubfoldersCheck.Checked).AddArgument($script:Ffprobe).AddArgument($script:ScanQueue).AddArgument($script:ScanCancel).AddArgument((Get-SelectedBudgetPack)).AddArgument((Format-SkipJson $script:SkipRows))
+        Invoke-ScanFolder -Root $Root -Recurse $Recurse -Ffprobe $Ffprobe -Queue $Queue -Cancel $Cancel -Skips @(Convert-SkipRows $SkipJson) -Limit $Limit
+    }).AddArgument($script:EnginePath).AddArgument($folder).AddArgument([bool]$script:SubfoldersCheck.Checked).AddArgument($script:Ffprobe).AddArgument($script:ScanQueue).AddArgument($script:ScanCancel).AddArgument((Get-SelectedBudgetPack)).AddArgument((Format-SkipJson $script:SkipRows)).AddArgument((Get-FindLimit))
     $script:ScanHandle = $ps.BeginInvoke()
 }
 
@@ -2670,64 +2860,106 @@ function Finish-Scan {
     elseif ($ignored -gt 1) { $extra += "$ignored files left off the list because an earlier convert was not smaller. A smaller budget lists them again. Clear skips forgets those marks" }
     if ($extra.Count -gt 0) { Write-Activity ($extra -join '. ') 'dim' }
     if ($summary -and $summary.Samples) { Write-Activity ([string]$summary.Samples) 'warn' }
-    if ($hits -eq 0 -and $shrink -eq 0 -and $seen -gt 0 -and $ignored -eq 0) { Write-Activity 'Nothing in this folder is over the budget for its picture size.' 'text' }
+    if ($summary -and [bool]$summary.Limited) {
+        $found = $hits + $shrink
+        $word = if ($found -eq 1) { 'file' } else { 'files' }
+        Write-Activity "Stopped scanning after $found $word that can be reduced." 'text'
+    }
+    elseif ($hits -eq 0 -and $shrink -eq 0 -and $seen -gt 0 -and $ignored -eq 0) { Write-Activity 'Nothing in this folder is over the budget for its picture size.' 'text' }
     Update-Buttons
 }
 
+function Test-PassTwoDidNotStart($Lines) {
+    $text = (@($Lines) -join "`n")
+    if ($text -match 'encoded 0 frames' -and $text -match 'task 2 of 2') { return $true }
+    if ($text -match 'x265_encoder_open failed|Failure to initialise thread|can''t open stats file') { return $true }
+    return $false
+}
+
+function Test-OutputPathMissing($Lines) {
+    $text = (@($Lines) -join "`n")
+    return ($text -match 'avio_open2 failed' -and $text -match 'errno -2')
+}
+
+function Get-EncodeFailureText($Lines) {
+    $picked = New-Object System.Collections.Generic.List[string]
+    foreach ($line in @($Lines)) {
+        if (-not $line) { continue }
+        if ($line -match 'error|Error|fail|Fail|result =') {
+            [void]$picked.Add(($line -replace '\s+', ' ').Trim())
+        }
+    }
+    if ($picked.Count -eq 0) { $picked = @($Lines | Select-Object -Last 6) }
+    $keep = New-Object System.Collections.Generic.List[string]
+    foreach ($line in @($picked)) {
+        if ($line -match 'avio_open2 failed') { [void]$keep.Add($line) }
+    }
+    foreach ($line in @($picked | Select-Object -Last 4)) {
+        if (-not $line) { continue }
+        $seen = $false
+        foreach ($have in $keep) {
+            if ($have -eq $line) { $seen = $true; break }
+        }
+        if (-not $seen) { [void]$keep.Add($line) }
+    }
+    $tail = @($keep) -join ' | '
+    if ($tail.Length -gt 500) {
+        if ($tail -match 'avio_open2 failed') { $tail = $tail.Substring(0, 500) }
+        else { $tail = $tail.Substring($tail.Length - 500) }
+    }
+    return $tail
+}
+
 function Start-EncodeProcess {
-    param($Item, $Plan, $Probe, $Decision, [switch]$Second)
+    param($Item, $Plan, $Probe, $Decision, $Lane, [switch]$SinglePass, [switch]$KeepTwoPass)
+    if (-not $Lane) { return }
     $tag = $Item.Tag
     $tag.Status = 'Converting'
     $tag.Reason = ''
     Update-ResultRow $Item
+    # The analysis pass does not create the output file. The marker keeps
+    # .vd-originals in place until this encode exits.
+    Add-HoldBusyMarker -Plan $Plan
+    if (-not $KeepTwoPass) { $Lane.OutputRetries = 0 }
     $encoder = Get-EncoderName -Probe $Probe
     $reencode = $false
     if ($script:ReencodeCheck) { $reencode = [bool]$script:ReencodeCheck.Checked }
     $pool = 0
-    if (Test-ParallelJobs) { $pool = 8 }
-    $arguments = Get-HandBrakeArguments -Source $Plan.Source -Temp $Plan.Temp -Probe $Probe -VideoKbps $Decision.TargetKbps -Encoder $encoder -ReencodeAudio:$reencode -ThreadPool $pool
-    $fileName = [IO.Path]::GetFileName($Plan.Source)
-    if ($Second) {
-        $script:SecondReencodeAudio = $reencode
-        $script:SecondLines = New-Object System.Collections.Generic.List[string]
-        $script:SecondItem = $Item
-        $script:SecondPlan = $Plan
-        $script:SecondProbe = $Probe
-        $script:SecondDecision = $Decision
-        $script:SecondEncoder = $encoder
-        $script:SecondPercent = 0
-        $script:SecondPass = ''
-        if ($script:DetailedCheck.Checked) {
-            Write-Activity (ConvertTo-ArgumentLine (@($script:HandBrake) + $arguments)) 'dim'
-        }
-        if ($null -eq $script:SecondPump) { $script:SecondPump = New-Object VideoDehydrator.JobPump }
-        $script:SecondPump.Start($script:HandBrake, (ConvertTo-ArgumentLine $arguments))
-        Update-JobBars
-        return
-    }
-    $script:ActiveReencodeAudio = $reencode
-    $script:HbLines = New-Object System.Collections.Generic.List[string]
-    $script:ActiveItem = $Item
-    $script:ActivePlan = $Plan
-    $script:ActiveProbe = $Probe
-    $script:ActiveDecision = $Decision
-    $script:ActiveEncoder = $encoder
-    $script:ActivePercent = 0
-    $script:ActivePass = ''
+    if ((Get-JobCount) -gt 1) { $pool = 8 }
+    $arguments = Get-HandBrakeArguments -Source $Plan.Source -Temp $Plan.Temp -Probe $Probe -VideoKbps $Decision.TargetKbps -Encoder $encoder -ReencodeAudio:$reencode -ThreadPool $pool -SinglePass:$SinglePass
+    $Lane.ReencodeAudio = $reencode
+    $Lane.Lines = New-Object System.Collections.Generic.List[string]
+    $Lane.Item = $Item
+    $Lane.Plan = $Plan
+    $Lane.Probe = $Probe
+    $Lane.Decision = $Decision
+    $Lane.Encoder = $encoder
+    $Lane.Percent = 0
+    $Lane.Pass = ''
+    $Lane.SinglePass = [bool]$SinglePass
     if ($script:DetailedCheck.Checked) {
-        Write-Activity (ConvertTo-ArgumentLine (@($script:HandBrake) + $arguments)) 'dim'
+        $shown = [IO.Path]::GetFileName($Plan.Source) + '  ' + (ConvertTo-ArgumentLine (@($script:HandBrake) + $arguments))
+        if ((Get-JobCount) -le 1) { $shown = ConvertTo-ArgumentLine (@($script:HandBrake) + $arguments) }
+        Write-Activity $shown 'dim'
     }
-    [VideoDehydrator.LinePump]::Start($script:HandBrake, (ConvertTo-ArgumentLine $arguments))
-    Reset-EncodeEtaClock
-    $script:EtaTenBit = ($encoder -eq 'x265_10bit')
-    $script:EtaPixels = Get-PixelSeconds ([int]$Probe.Width) ([int]$Probe.Height) ([double]$Probe.DurationSec)
-    Update-EtaLine
-    Update-JobBars
-    Start-ActivityPulse
+    if ($null -eq $Lane.Pump) { $Lane.Pump = New-Object VideoDehydrator.JobPump }
+    $Lane.Pump.Start($script:HandBrake, (ConvertTo-ArgumentLine $arguments))
+    if ([int]$Lane.Index -eq 0) {
+        Reset-EncodeEtaClock
+        $script:EtaTenBit = ($encoder -eq 'x265_10bit')
+        $script:EtaPixels = Get-PixelSeconds ([int]$Probe.Width) ([int]$Probe.Height) ([double]$Probe.DurationSec)
+        Update-EtaLine
+    }
+    Paint-EncodeProgress
+    if (-not $script:PulseWanted) { Start-ActivityPulse }
 }
 
 function Test-EncodeBusy {
-    return (($null -ne $script:ActiveItem) -or ($null -ne $script:SecondItem))
+    if (-not $script:Lanes) { return $false }
+    foreach ($lane in @($script:Lanes)) {
+        if ($lane.Item) { return $true }
+    }
+    return $false
 }
 
 function Start-NextEncode {
@@ -2740,8 +2972,8 @@ function Start-NextEncode {
             if (-not (Test-EncodeBusy)) { Finish-Batch 'after' }
             return
         }
-        $laneOpen = (-not $script:ActiveItem) -or ((Test-ParallelJobs) -and -not $script:SecondItem)
-        if (-not $laneOpen) { return }
+        $lane = Get-OpenLane
+        if (-not $lane) { return }
         $item = $script:EncodeItems[$script:EncodeIndex]
         $script:EncodeIndex++
         $number = $script:EncodeIndex
@@ -2802,9 +3034,8 @@ function Start-NextEncode {
         $item.Tag.Width = $probe.Width
         $item.Tag.Height = $probe.Height
         Write-Activity ("Converting  " + [IO.Path]::GetFileName($source) + "  at $($decision.TargetKbps) kbps") 'text'
-        $useSecond = ($null -ne $script:ActiveItem)
-        Start-EncodeProcess -Item $item -Plan $plan -Probe $probe -Decision $decision -Second:$useSecond
-        if ((Test-ParallelJobs) -and -not $script:SecondItem -and -not $script:StopAfterFile -and -not $script:Cancel) { continue }
+        Start-EncodeProcess -Item $item -Plan $plan -Probe $probe -Decision $decision -Lane $lane
+        if ((Get-JobCount) -gt 1 -and (Get-OpenLane) -and -not $script:StopAfterFile -and -not $script:Cancel) { continue }
         return
     }
     if (-not (Test-EncodeBusy)) { Finish-Batch 'done' }
@@ -2814,13 +3045,18 @@ function Fail-Active {
     param(
         [string]$Reason,
         $Verify,
-        [switch]$Second
+        $Lane
     )
-    Stop-ActivityPulse
-    $item = $(if ($Second) { $script:SecondItem } else { $script:ActiveItem })
-    $plan = $(if ($Second) { $script:SecondPlan } else { $script:ActivePlan })
-    $laneProbe = $(if ($Second) { $script:SecondProbe } else { $script:ActiveProbe })
-    $laneDecision = $(if ($Second) { $script:SecondDecision } else { $script:ActiveDecision })
+    $item = $null
+    $plan = $null
+    $laneProbe = $null
+    $laneDecision = $null
+    if ($Lane) {
+        $item = $Lane.Item
+        $plan = $Lane.Plan
+        $laneProbe = $Lane.Probe
+        $laneDecision = $Lane.Decision
+    }
     $newBytes = [int64]0
     $sourceBytes = [int64]0
     $targetKbps = 0
@@ -2848,7 +3084,7 @@ function Fail-Active {
             Remember-SizeSkip -Path $skipPath -SizeBytes $sourceBytes -TargetKbps $targetKbps
         }
     }
-    if ($plan) { Remove-TempQuiet $plan.Temp }
+    Release-EncodeHold $plan
     Write-NewRecycleActivity
     if ($item) {
         if ($sizeSkip) {
@@ -2874,19 +3110,23 @@ function Fail-Active {
         if ($note) { Write-Activity $note 'warn' }
         Add-RunLog -Status 'FAIL' -Reason $Reason -Source $(if ($plan) { $plan.Source } else { '' }) -NewPath '' -Kept '' -Width $(if ($laneProbe) { $laneProbe.Width } else { '' }) -Height $(if ($laneProbe) { $laneProbe.Height } else { '' }) -Kbps $(if ($laneDecision) { $laneDecision.TargetKbps } else { '' })
     }
-    if ($Second) { $script:SecondItem = $null } else { $script:ActiveItem = $null }
+    if ($Lane) {
+        $Lane.Item = $null
+        $Lane.Plan = $null
+    }
+    if (Test-EncodeBusy) { Paint-EncodeProgress } else { Stop-ActivityPulse }
     Update-JobBars
 }
 
-function Read-SecondLines {
-    if ($null -eq $script:SecondPump -or $null -eq $script:SecondItem) { return }
-    if ($null -eq $script:SecondLines) { $script:SecondLines = New-Object System.Collections.Generic.List[string] }
-    $batch = @($script:SecondPump.Drain())
+function Read-LaneLines($Lane) {
+    if (-not $Lane -or -not $Lane.Item -or -not $Lane.Pump) { return }
+    if ($null -eq $Lane.Lines) { $Lane.Lines = New-Object System.Collections.Generic.List[string] }
+    $batch = @($Lane.Pump.Drain())
     $latest = $null
     foreach ($line in $batch) {
         if (-not $line) { continue }
-        $script:SecondLines.Add($line)
-        if ($script:SecondLines.Count -gt 500) { $script:SecondLines.RemoveAt(0) }
+        $Lane.Lines.Add($line)
+        if ($Lane.Lines.Count -gt 500) { $Lane.Lines.RemoveAt(0) }
         $progress = Get-HandBrakeProgress $line
         if ($null -ne $progress) {
             $latest = $progress
@@ -2894,41 +3134,74 @@ function Read-SecondLines {
         }
         if ((Test-EncodeProgressLine $line)) { continue }
         if ($script:DetailedCheck.Checked) {
-            $name = ''
-            if ($script:SecondPlan) { $name = [IO.Path]::GetFileName($script:SecondPlan.Source) }
-            Write-Activity ("$name  $line") 'dim'
+            $prefix = ''
+            if ((Get-JobCount) -gt 1 -and $Lane.Plan) { $prefix = [IO.Path]::GetFileName($Lane.Plan.Source) + '  ' }
+            Write-Activity ($prefix + $line) 'dim'
         }
     }
     if ($null -eq $latest) { return }
-    $script:SecondPercent = [double]$latest.Overall
-    if ([int]$latest.Task -ge 2) { $script:SecondPass = 'pass ' + [int]$latest.Task }
-    else { $script:SecondPass = 'first pass' }
+    $Lane.Percent = [double]$latest.Overall
+    $pass = 'first pass'
+    if ([int]$latest.Task -ge 2) { $pass = 'pass ' + [int]$latest.Task }
+    $passChanged = ($pass -ne [string]$Lane.Pass)
+    $Lane.Pass = $pass
+    if ([int]$Lane.Index -eq 0) { Sync-EncodePass $latest }
+    if ($passChanged -or (Test-ProgressPaintDue)) { Paint-EncodeProgress }
+}
+
+function Paint-EncodeProgress {
+    $script:ProgressPaintAt = [datetime]::UtcNow
+    $statusLane = $null
+    if ($script:Lanes) {
+        foreach ($lane in @($script:Lanes)) {
+            if ($lane.Item) { $statusLane = $lane; break }
+        }
+    }
+    if ($statusLane) {
+        Set-Progress ([double]$statusLane.Percent)
+        $name = ''
+        if ($statusLane.Plan) { $name = [IO.Path]::GetFileName($statusLane.Plan.Source) }
+        $number = $script:EncodeIndex
+        $total = 0
+        if ($script:EncodeItems) { $total = $script:EncodeItems.Count }
+        $fileStatus = "File $number of $total - $name - " + ('{0:0}%' -f [double]$statusLane.Percent)
+        if ((Get-JobCount) -gt 1) {
+            $running = 0
+            foreach ($lane in @($script:Lanes)) { if ($lane.Item) { $running++ } }
+            $fileStatus = "$running files at once - $name - " + ('{0:0}%' -f [double]$statusLane.Percent)
+        }
+        if ($script:StopAfterFile) { $fileStatus += ' - stopping after the current file' }
+        Set-Status $fileStatus 'busy'
+    }
     Update-JobBars
+    Update-EtaLine
 }
 
 function Update-JobBars {
-    $show = (Test-ParallelJobs) -and (($null -ne $script:ActiveItem) -or ($null -ne $script:SecondItem))
+    $running = 0
+    if ($script:Lanes) {
+        foreach ($lane in @($script:Lanes)) { if ($lane.Item) { $running++ } }
+    }
+    $show = ((Get-JobCount) -gt 1) -and ($running -gt 0)
     if ($script:JobHost) { $script:JobHost.Visible = $show }
     if ($script:ProgressTrack) { $script:ProgressTrack.Visible = -not $show }
     if (-not $show) {
         if ($script:JobHost) { $script:JobHost.Height = 0 }
     } else {
     $rows = @($script:JobRows)
-    $activeName = ''
-    if ($script:ActivePlan) { $activeName = [IO.Path]::GetFileName($script:ActivePlan.Source) }
-    $secondName = ''
-    if ($script:SecondPlan) { $secondName = [IO.Path]::GetFileName($script:SecondPlan.Source) }
-    if ($rows.Count -ge 1) {
-        $rows[0].Panel.Visible = ($null -ne $script:ActiveItem)
-        Set-JobBar $rows[0] $activeName ([double]$script:ActivePercent) ([string]$script:ActivePass)
-    }
-    if ($rows.Count -ge 2) {
-        $rows[1].Panel.Visible = ($null -ne $script:SecondItem)
-        Set-JobBar $rows[1] $secondName ([double]$script:SecondPercent) ([string]$script:SecondPass)
-    }
+    $limit = Get-JobCount
     $count = 0
-    if ($null -ne $script:ActiveItem) { $count++ }
-    if ($null -ne $script:SecondItem) { $count++ }
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $lane = $null
+        if ($script:Lanes -and $i -lt @($script:Lanes).Count) { $lane = @($script:Lanes)[$i] }
+        $visible = ($i -lt $limit -and $lane -and $lane.Item)
+        $rows[$i].Panel.Visible = [bool]$visible
+        if (-not $visible) { continue }
+        $count++
+        $laneName = ''
+        if ($lane.Plan) { $laneName = [IO.Path]::GetFileName($lane.Plan.Source) }
+        Set-JobBar $rows[$i] $laneName ([double]$lane.Percent) ([string]$lane.Pass)
+    }
     if ($count -lt 1) { $count = 1 }
     if ($script:JobHost) { $script:JobHost.Height = 8 + ($count * 36) }
     }
@@ -2944,17 +3217,19 @@ function Update-JobBars {
 }
 
 function Complete-ActiveEncode {
-    param([switch]$Second)
-    if ($Second) { Read-SecondLines } else { Read-EncodeLines }
-    $exitCode = $(if ($Second) { [int]$script:SecondPump.ExitCode } else { [int][VideoDehydrator.LinePump]::ExitCode })
-    $plan = $(if ($Second) { $script:SecondPlan } else { $script:ActivePlan })
-    $item = $(if ($Second) { $script:SecondItem } else { $script:ActiveItem })
-    $laneLines = $(if ($Second) { $script:SecondLines } else { $script:HbLines })
-    $laneProbe = $(if ($Second) { $script:SecondProbe } else { $script:ActiveProbe })
-    $laneDecision = $(if ($Second) { $script:SecondDecision } else { $script:ActiveDecision })
-    $laneReencode = $(if ($Second) { [bool]$script:SecondReencodeAudio } else { [bool]$script:ActiveReencodeAudio })
+    param($Lane)
+    if (-not $Lane -or -not $Lane.Item) { return }
+    Read-LaneLines $Lane
+    $exitCode = 0
+    if ($Lane.Pump) { $exitCode = [int]$Lane.Pump.ExitCode }
+    $plan = $Lane.Plan
+    $item = $Lane.Item
+    $laneLines = $Lane.Lines
+    $laneProbe = $Lane.Probe
+    $laneDecision = $Lane.Decision
+    $laneReencode = [bool]$Lane.ReencodeAudio
     if ($script:Cancel) {
-        if ($plan) { Remove-TempQuiet $plan.Temp }
+        Release-EncodeHold $plan
         Write-NewRecycleActivity
         if ($item -and [string]$item.Tag.Status -eq 'Converting') {
             $item.Tag.Status = 'Stopped'
@@ -2966,12 +3241,32 @@ function Complete-ActiveEncode {
     }
     $log = ($(if ($laneLines) { $laneLines } else { @() }) -join "`n")
     if ($exitCode -ne 0 -or -not $plan -or -not (Test-Path -LiteralPath $plan.Temp)) {
-        $tail = @($(if ($laneLines) { $laneLines } else { @() }) | Select-Object -Last 6) -join ' | '
-        Fail-Active "HandBrake stopped ($exitCode). $tail" -Second:$Second
+        $outputRetries = [int]$Lane.OutputRetries
+        $outputMissing = Test-OutputPathMissing $laneLines
+        if (-not $script:Cancel -and $plan -and $exitCode -ne 0 -and $outputMissing -and $outputRetries -lt 2) {
+            $retryName = ''
+            if ($plan.Source) { $retryName = [IO.Path]::GetFileName($plan.Source) }
+            Write-Activity ("The output folder was missing for  $retryName. Trying the two-pass encode again.") 'warn'
+            $Lane.OutputRetries = $outputRetries + 1
+            if ($plan.Temp) { Remove-TempQuiet $plan.Temp }
+            Start-EncodeProcess -Item $item -Plan $plan -Probe $laneProbe -Decision $laneDecision -Lane $Lane -KeepTwoPass
+            return
+        }
+        $alreadySingle = [bool]$Lane.SinglePass
+        if (-not $script:Cancel -and -not $outputMissing -and -not $alreadySingle -and $exitCode -ne 0 -and (Test-PassTwoDidNotStart $laneLines)) {
+            $retryName = ''
+            if ($plan) { $retryName = [IO.Path]::GetFileName($plan.Source) }
+            Write-Activity ("The two-pass encode did not start for  $retryName. Trying one pass.") 'warn'
+            if ($plan -and $plan.Temp) { Remove-TempQuiet $plan.Temp }
+            Start-EncodeProcess -Item $item -Plan $plan -Probe $laneProbe -Decision $laneDecision -Lane $Lane -SinglePass
+            return
+        }
+        $tail = Get-EncodeFailureText $laneLines
+        Fail-Active "HandBrake stopped ($exitCode). $tail" -Lane $Lane
         Start-NextEncode
         return
     }
-    if (-not $Second) { Remember-FinishedEncode }
+    if ([int]$Lane.Index -eq 0) { Remember-FinishedEncode }
     $script:EtaChecking = $true
     Update-EtaLine
     if ($item) {
@@ -2982,15 +3277,16 @@ function Complete-ActiveEncode {
     $script:Form.Refresh()
     $verify = Test-EncodedFile -Ffmpeg $script:Ffmpeg -Ffprobe $script:Ffprobe -Temp $plan.Temp -SourceProbe $laneProbe -HandBrakeLog $log -AllowAudioReencode:$laneReencode
     if (-not $verify.Ok) {
-        Fail-Active -Reason $verify.Reason -Verify $verify -Second:$Second
+        Fail-Active -Reason $verify.Reason -Verify $verify -Lane $Lane
         Start-NextEncode
         return
     }
     try {
+        Remove-HoldBusyMarker -Plan $plan
         $swap = Invoke-ReplaceWithEncode -Source $plan.Source -TempFile $plan.Temp -DeleteOriginal:([bool]$script:AutoCheck.Checked)
     }
     catch {
-        Fail-Active $_.Exception.Message -Second:$Second
+        Fail-Active $_.Exception.Message -Lane $Lane
         Start-NextEncode
         return
     }
@@ -3003,7 +3299,6 @@ function Complete-ActiveEncode {
     $item.Tag.Path = $swap.NewPath
     $item.Tag.Kept = $swap.KeptPath
     $name = [IO.Path]::GetFileName($swap.NewPath)
-    Stop-ActivityPulse
     if ($swap.Deleted) {
         $item.Tag.Status = 'Replaced'
         $item.Tag.Reason = 'Original deleted after the check.'
@@ -3036,7 +3331,9 @@ function Complete-ActiveEncode {
     Update-ResultRow $item
     if ($plan.Source) { Forget-SizeSkipPath ([string]$plan.Source) }
     Add-RunLog -Status $(if ($swap.Deleted) { 'REPLACED' } else { 'KEPT' }) -Reason 'ok' -Source $plan.Source -NewPath $swap.NewPath -Kept $swap.KeptPath -OldBytes $swap.OldBytes -NewBytes $swap.NewBytes -OldRate $verify.OldGiBph -NewRate $verify.NewGiBph -Width $(if ($laneProbe) { $laneProbe.Width } else { '' }) -Height $(if ($laneProbe) { $laneProbe.Height } else { '' }) -Kbps $(if ($laneDecision) { $laneDecision.TargetKbps } else { '' })
-    if ($Second) { $script:SecondItem = $null } else { $script:ActiveItem = $null }
+    $Lane.Item = $null
+    $Lane.Plan = $null
+    if (-not (Test-EncodeBusy)) { Stop-ActivityPulse }
     Update-JobBars
     Start-NextEncode
 }
@@ -3251,43 +3548,22 @@ function Test-EncodeProgressLine([string]$Line) {
 }
 
 function Read-EncodeLines {
-    $batch = @([VideoDehydrator.LinePump]::Drain())
-    $latest = $null
-    foreach ($line in $batch) {
-        if (-not $line) { continue }
-        $script:HbLines.Add($line)
-        if ($script:HbLines.Count -gt 500) { $script:HbLines.RemoveAt(0) }
-        $progress = Get-HandBrakeProgress $line
-        if ($null -ne $progress) {
-            $latest = $progress
-            continue
-        }
-        if ((Test-EncodeProgressLine $line)) { continue }
-        if ($script:DetailedCheck.Checked) { Write-Activity $line 'dim' }
-    }
-    if ($null -eq $latest) { return }
-    Sync-EncodePass $latest
-    $script:ActivePercent = [double]$latest.Overall
-    if ([int]$latest.Task -ge 2) { $script:ActivePass = 'pass ' + [int]$latest.Task }
-    else { $script:ActivePass = 'first pass' }
-    Set-Progress ([double]$latest.Overall)
-    Update-JobBars
-    $name = ''
-    if ($script:ActivePlan) { $name = [IO.Path]::GetFileName($script:ActivePlan.Source) }
-    $number = $script:EncodeIndex
-    $total = $script:EncodeItems.Count
-    $fileStatus = "File $number of $total - $name - " + ('{0:0}%' -f $latest.Overall)
-    if ($script:StopAfterFile) { $fileStatus += ' - stopping after the current file' }
-    Set-Status $fileStatus 'busy'
-    Update-EtaLine
+    if (-not $script:Lanes) { return }
+    foreach ($lane in @($script:Lanes)) { Read-LaneLines $lane }
 }
 
 function Finish-Batch {
     param([string]$How)
     Stop-ActivityPulse
-    try { if ($script:SecondPump) { $script:SecondPump.Stop() } } catch {}
-    $script:SecondItem = $null
-    $script:ActiveItem = $null
+    if ($script:Lanes) {
+        foreach ($lane in @($script:Lanes)) {
+            try { if ($lane.Pump) { $lane.Pump.Stop() } } catch {}
+            if ($lane.Item) { Release-EncodeHold $lane.Plan }
+            $lane.Item = $null
+            $lane.Plan = $null
+        }
+    }
+    try { [VideoDehydrator.LinePump]::Stop() } catch {}
     Update-JobBars
     $script:Work = 'idle'
     $script:ForceEncode = $false
@@ -3582,8 +3858,11 @@ function Begin-ConvertBatch {
     $verb = 'Converting'
     if ($Force) { $verb = 'Forcing' }
     Write-Activity ("$verb $($items.Count) $word.") 'text'
-    if ((Test-ParallelJobs) -and $items.Count -gt 1) {
-        Write-Activity 'Parallel jobs is on. Two files encode at the same time.' 'text'
+    $jobCount = Get-JobCount
+    if ($jobCount -gt 1 -and $items.Count -gt 1) {
+        $running = $jobCount
+        if ($running -gt $items.Count) { $running = $items.Count }
+        Write-Activity ("Parallel jobs is $jobCount. Up to $running files encode at the same time.") 'text'
     }
     if ($Force) { Write-Activity 'The scanned list was replaced. Files still waiting in .vd-originals stay.' 'text' }
     if ($script:ReencodeCheck.Checked) {
@@ -3908,7 +4187,11 @@ function Request-Cancel {
     if (($script:Work -eq 'scan' -or $script:Work -eq 'force') -and $script:ScanCancel) { $script:ScanCancel.Stop = $true }
     if ($script:Work -eq 'encode') {
         [VideoDehydrator.LinePump]::Kill()
-        if ($script:SecondPump) { $script:SecondPump.Kill() }
+        if ($script:Lanes) {
+            foreach ($lane in @($script:Lanes)) {
+                try { if ($lane.Pump) { $lane.Pump.Kill() } } catch {}
+            }
+        }
     }
     Stop-ChildTools
     Update-Buttons
@@ -4350,13 +4633,15 @@ function Invoke-UiTick {
         }
         elseif ($script:Work -eq 'encode') {
             Read-EncodeLines
-            Read-SecondLines
             Update-ActivityPulse
-            if ($script:ActiveItem -and [VideoDehydrator.LinePump]::Exited) {
-                Complete-ActiveEncode
-            }
-            if ($script:SecondItem -and $script:SecondPump -and $script:SecondPump.Exited) {
-                Complete-ActiveEncode -Second
+            if ($script:Lanes) {
+                $finished = @()
+                foreach ($lane in @($script:Lanes)) {
+                    if ($lane.Item -and $lane.Pump -and $lane.Pump.Exited) { $finished += $lane }
+                }
+                foreach ($lane in $finished) {
+                    if ($lane.Item -and $lane.Pump -and $lane.Pump.Exited) { Complete-ActiveEncode $lane }
+                }
             }
         }
         if ($script:Playing) {
@@ -4373,7 +4658,14 @@ function Invoke-UiTick {
         Write-Activity ("Something went wrong. " + $_.Exception.Message) 'err'
         if ($script:Work -ne 'idle') {
             try { [VideoDehydrator.LinePump]::Stop() } catch {}
-            try { if ($script:SecondPump) { $script:SecondPump.Stop() } } catch {}
+            if ($script:Lanes) {
+                foreach ($lane in @($script:Lanes)) {
+                    try { if ($lane.Pump) { $lane.Pump.Stop() } } catch {}
+                    Release-EncodeHold $lane.Plan
+                    $lane.Item = $null
+                    $lane.Plan = $null
+                }
+            }
             Stop-ChildTools
             $script:Work = 'idle'
             $script:Cancel = $false
@@ -4824,6 +5116,29 @@ function Layout-Actions {
         if ($script:ContinueButton) { $forceLeft = $script:ContinueButton.Right + 8 }
         $script:ForceButton.Location = New-Object Drawing.Point($forceLeft, 44)
     }
+    if ($script:LogButton) {
+        $logLeft = 0
+        if ($script:ForceButton) { $logLeft = $script:ForceButton.Right + 8 }
+        $script:LogButton.Location = New-Object Drawing.Point($logLeft, 44)
+    }
+    if ($script:FindBox) {
+        $script:FindBox.Location = New-Object Drawing.Point(($panel.ClientSize.Width - $script:FindBox.Width), 44)
+        if ($script:FindLabel) {
+            $script:FindLabel.Location = New-Object Drawing.Point(($script:FindBox.Left - 8 - $script:FindLabel.Width), 48)
+        }
+    }
+    if ($script:JobBox) {
+        $anchor = $panel.ClientSize.Width
+        if ($script:FindLabel) { $anchor = $script:FindLabel.Left }
+        elseif ($script:FindBox) { $anchor = $script:FindBox.Left }
+        $script:JobBox.Location = New-Object Drawing.Point(($anchor - 8 - $script:JobBox.Width), 44)
+        if ($script:JobLabel) {
+            $labelWidth = $script:JobLabel.Width
+            if ($labelWidth -lt 20) { $labelWidth = $script:JobLabel.PreferredSize.Width }
+            if ($labelWidth -lt 20) { $labelWidth = 108 }
+            $script:JobLabel.Location = New-Object Drawing.Point(($script:JobBox.Left - 8 - $labelWidth), 48)
+        }
+    }
     $script:HelpButton.Location = New-Object Drawing.Point(($panel.ClientSize.Width - $script:HelpButton.Width), ($y + 2))
     $script:DeleteButton.Location = New-Object Drawing.Point(($script:HelpButton.Left - 8 - $script:DeleteButton.Width), ($y + 2))
     $undoWidth = 0
@@ -4986,7 +5301,7 @@ function Layout-Options {
     if ($null -eq $card -or $card.ClientSize.Width -lt 20) { return }
     $script:OptionsTitle.SetBounds(16, 8, 200, 22)
     $y = 36
-    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:RecycleCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck, $script:ParallelCheck)) {
+    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:RecycleCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
         if (-not $chk) { continue }
         $chk.Location = New-Object Drawing.Point(16, $y)
         $y += 28
@@ -5233,12 +5548,16 @@ function Update-ChromeLayout {
         if ($script:JobHost -and $script:JobHost.Visible) {
             $script:JobHost.SetBounds(24, ($trackY + 12), ([Math]::Max(80, $status.ClientSize.Width - 48)), $script:JobHost.Height)
             $rowTop = 0
-            foreach ($row in @($script:JobRows)) {
+            $rows = @($script:JobRows)
+            for ($i = 0; $i -lt $rows.Count; $i++) {
+                $row = $rows[$i]
                 if (-not $row -or -not $row.Panel.Visible) { continue }
                 $row.Panel.SetBounds(0, $rowTop, $script:JobHost.ClientSize.Width, 34)
                 $row.Label.SetBounds(0, 0, $row.Panel.Width, 16)
                 $row.Track.SetBounds(0, 18, $row.Panel.Width, 8)
-                Set-BarFill $row.Track $row.Fill $(if ($row -eq @($script:JobRows)[0]) { [double]$script:ActivePercent } else { [double]$script:SecondPercent })
+                $pct = 0.0
+                if ($script:Lanes -and $i -lt @($script:Lanes).Count) { $pct = [double]@($script:Lanes)[$i].Percent }
+                Set-BarFill $row.Track $row.Fill $pct
                 $rowTop += 36
             }
         }
@@ -5272,7 +5591,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Converting'
-            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. One file is encoded at a time. Parallel Jobs encodes two files at the same time. One encode already uses about 8 cores, so the second file helps when the processor has two groups of about 8 cores, which means 16 cores or more. A third file is not started. Each running file has its own bar and name. The bar is that file. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
+            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. Parallel jobs chooses how many files encode together, from 1 to 6. Each file uses about 8 cores. One is right for most computers. Two needs about 16 cores, three about 24, four about 32, five about 40, and six about 48. On fewer cores the files share the processor and the batch does not finish sooner. Log opens the conversion record, a Markdown file grouped by the day and time each file finished. Find can stop the scan after 5, 10, 25, 50, or 100 files that can be reduced. All keeps scanning the whole folder. Updating the program keeps that file. Each running file has its own bar and name. The bar is that file. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
         },
         @{
             Title = 'Checking the picture'
@@ -5512,7 +5831,9 @@ $script:RecycleAlertMuted = [bool]$settings.RecycleAlertMuted
 $script:RecyclePurgeEnabled = [bool]$settings.PurgeRecycle
 $script:ListExtra = [int]$settings.ListExtra
 $script:LogExtra = [int]$settings.LogExtra
-$script:ParallelJobs = [bool]$settings.ParallelJobs
+$script:JobCount = [int]$settings.JobCount
+if ($script:JobCount -lt 1 -or $script:JobCount -gt 6) { $script:JobCount = 1 }
+$script:FindLimit = [int]$settings.FindLimit
 $script:AutoWarnShown = $false
 $script:AutoWarnBusy = $false
 Set-BudgetPicks ([string]$settings.Budgets)
@@ -5619,8 +5940,31 @@ $script:JobHost = New-Object Windows.Forms.Panel
 $script:JobHost.BackColor = [Drawing.Color]::White
 $script:JobHost.Visible = $false
 $script:JobHost.Height = 0
-$script:JobRows = @((New-JobRow), (New-JobRow))
-foreach ($row in @($script:JobRows)) { $script:JobHost.Controls.Add($row.Panel) }
+$jobRows = @()
+$encodeLanes = @()
+for ($i = 0; $i -lt 6; $i++) {
+    $jobRow = New-JobRow
+    $jobRows += $jobRow
+    $script:JobHost.Controls.Add($jobRow.Panel)
+    $encodeLanes += [pscustomobject]@{
+        Index = $i
+        Pump = (New-Object VideoDehydrator.JobPump)
+        Item = $null
+        Plan = $null
+        Probe = $null
+        Decision = $null
+        Lines = (New-Object 'System.Collections.Generic.List[string]')
+        ReencodeAudio = $false
+        Encoder = ''
+        Percent = [double]0
+        Pass = ''
+        SinglePass = $false
+        OutputRetries = 0
+        Row = $jobRow
+    }
+}
+$script:JobRows = $jobRows
+$script:Lanes = $encodeLanes
 $script:StatusPanel.Controls.Add($script:JobHost)
 $script:StatusPanel.Controls.Add($script:StatusLabel)
 $script:StatusPanel.Controls.Add($script:EtaLabel)
@@ -5948,14 +6292,32 @@ $script:RecycleCheck = New-Check 'Clear the drive recycle copy'
 $script:ReencodeCheck = New-Check 'Re-encode audio that cannot be copied'
 $script:DetailedCheck = New-Check 'Show detailed activity'
 $script:ShutdownCheck = New-Check 'Shutdown computer upon completion'
-$script:ParallelCheck = New-Check 'Parallel Jobs'
+$script:JobLabel = New-Object Windows.Forms.Label
+$script:JobLabel.Text = 'Parallel jobs'
+$script:JobLabel.Font = $script:FontUi
+$script:JobLabel.ForeColor = $script:ColorInk
+$script:JobLabel.BackColor = $script:ColorPage
+$script:JobLabel.AutoSize = $true
+$script:JobBox = New-Object Windows.Forms.ComboBox
+$script:JobBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+$script:JobBox.FlatStyle = [Windows.Forms.FlatStyle]::Flat
+$script:JobBox.Font = $script:FontUi
+$script:JobBox.SetBounds(0, 0, 52, 28)
+for ($job = 1; $job -le 6; $job++) { [void]$script:JobBox.Items.Add([string]$job) }
+$jobPick = [int]$script:JobCount
+if ($jobPick -lt 1 -or $jobPick -gt 6) { $jobPick = 1 }
+$script:JobBox.SelectedIndex = $jobPick - 1
+$script:JobBox.Add_SelectedIndexChanged({
+    if ($script:Loading) { return }
+    $script:JobCount = Get-JobCount
+    Save-Settings
+})
 $script:SubfoldersCheck.Checked = [bool]$settings.IncludeSubfolders
 $script:AutoCheck.Checked = [bool]$settings.AutoDelete
 $script:RecycleCheck.Checked = [bool]$settings.PurgeRecycle
 $script:ReencodeCheck.Checked = [bool]$settings.ReencodeAudio
 $script:DetailedCheck.Checked = [bool]$settings.Detailed
 $script:ShutdownCheck.Checked = [bool]$settings.Shutdown
-$script:ParallelCheck.Checked = [bool]$settings.ParallelJobs
 $script:OptionsCard.Controls.Add($script:OptionsTitle)
 $script:OptionsCard.Controls.Add($script:SubfoldersCheck)
 $script:OptionsCard.Controls.Add($script:AutoCheck)
@@ -5963,7 +6325,6 @@ $script:OptionsCard.Controls.Add($script:RecycleCheck)
 $script:OptionsCard.Controls.Add($script:ReencodeCheck)
 $script:OptionsCard.Controls.Add($script:DetailedCheck)
 $script:OptionsCard.Controls.Add($script:ShutdownCheck)
-$script:OptionsCard.Controls.Add($script:ParallelCheck)
 $script:ClearSkipsButton = New-Button 'Clear skips' 'secondary' 120 28
 $script:ClearSkipsButton.Margin = New-Object Windows.Forms.Padding(0)
 $script:ClearSkipsButton.Enabled = $false
@@ -6024,7 +6385,7 @@ $script:OptionsCard.Add_Paint({
     $_.Graphics.DrawRectangle($pen, 0, 0, ($script:OptionsCard.Width - 1), ($script:OptionsCard.Height - 1))
     $pen.Dispose()
 })
-foreach ($chk in @($script:SubfoldersCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck, $script:ParallelCheck)) {
+foreach ($chk in @($script:SubfoldersCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
     $chk.Add_CheckedChanged({ if (-not $script:Loading) { Save-Settings } })
 }
 $script:RecycleCheck.Add_CheckedChanged({
@@ -6052,6 +6413,26 @@ $script:CompareButton = New-Button 'Compare' 'secondary' 110 34
 $script:UndoButton = New-Button 'Undo' 'secondary' 90 34
 $script:DeleteButton = New-Button 'Delete originals' 'secondary' 150 34
 $script:HelpButton = New-Button 'How this works' 'secondary' 148 34
+$script:LogButton = New-Button 'Log' 'secondary' 72 34
+$script:LogButton.Add_Click({ Open-ConversionLog })
+$script:FindLabel = New-Object Windows.Forms.Label
+$script:FindLabel.Text = 'Find'
+$script:FindLabel.AutoSize = $true
+$script:FindLabel.Font = $script:FontUi
+$script:FindLabel.ForeColor = $script:ColorInk
+$script:FindLabel.BackColor = [Drawing.Color]::FromArgb(244, 246, 248)
+$script:FindBox = New-Object Windows.Forms.ComboBox
+$script:FindBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+$script:FindBox.Font = $script:FontUi
+$script:FindBox.Width = 88
+$script:FindBox.IntegralHeight = $false
+$script:FindBox.DropDownHeight = 180
+[void]$script:FindBox.Items.Add('All')
+foreach ($count in @(5, 10, 25, 50, 100)) { [void]$script:FindBox.Items.Add([string]$count) }
+$findText = if ([int]$script:FindLimit -gt 0) { [string][int]$script:FindLimit } else { 'All' }
+$findIndex = $script:FindBox.Items.IndexOf($findText)
+$script:FindBox.SelectedIndex = $(if ($findIndex -ge 0) { $findIndex } else { 0 })
+$script:FindBox.Add_SelectedIndexChanged({ if (-not $script:Loading) { Save-Settings } })
 $script:CancelButton.Enabled = $false
 $script:StopAfterButton.Enabled = $false
 $script:ContinueButton.Enabled = $false
@@ -6065,6 +6446,11 @@ $script:ActionPanel.Controls.Add($script:CompareButton)
 $script:ActionPanel.Controls.Add($script:UndoButton)
 $script:ActionPanel.Controls.Add($script:DeleteButton)
 $script:ActionPanel.Controls.Add($script:HelpButton)
+$script:ActionPanel.Controls.Add($script:LogButton)
+$script:ActionPanel.Controls.Add($script:FindLabel)
+$script:ActionPanel.Controls.Add($script:FindBox)
+$script:ActionPanel.Controls.Add($script:JobLabel)
+$script:ActionPanel.Controls.Add($script:JobBox)
 $script:ScanButton.Add_Click({ Start-Scan })
 $script:ConvertButton.Add_Click({ Start-Convert })
 $script:ForceButton.Add_Click({ Start-Force })
@@ -6294,7 +6680,11 @@ Set-Tip $script:ShowButton 'Check a group to show only those rows. Hidden rows s
 Set-Tip $script:SelectShownButton 'Check the visible rows Convert can take.'
 Set-Tip $script:Files 'Checked rows are ready to shrink. Click a heading to sort, or drag it to move that column.'
 Set-Tip $script:ListSplit 'Drag to make the video list taller or shorter. Double-click to put it back.'
-Set-Tip $script:ParallelCheck 'Encode two files at the same time. One file already uses about 8 cores. A second file helps when the processor has two groups of about 8 cores, which means 16 cores or more. On a laptop, use this while plugged in. A third file is not started.'
+Set-Tip $script:JobLabel (Get-JobTip)
+Set-Tip $script:JobBox (Get-JobTip)
+Set-Tip $script:LogButton 'Open the conversion log. It is a Markdown file of every conversion, grouped by the day and time it finished. Updating the program keeps this file.'
+Set-Tip $script:FindBox 'Stop scanning after this many files that can be reduced. All keeps scanning the whole folder.'
+Set-Tip $script:FindLabel 'Stop scanning after this many files that can be reduced. All keeps scanning the whole folder.'
 Set-Tip $script:Log 'Saved space, skipped videos, and problems are listed here.'
 Set-Tip $script:LogSplit 'Drag to make the activity box taller or shorter. Double-click to put it back.'
 Set-Tip $script:ProgressTrack 'How far the current file has been encoded. The two passes share the bar evenly.'
@@ -6341,6 +6731,14 @@ $script:Form.Add_FormClosing({
 })
 $script:Form.Add_FormClosed({
     Stop-Playback
+    if ($script:Lanes) {
+        foreach ($lane in @($script:Lanes)) {
+            Release-EncodeHold $lane.Plan
+            try { if ($lane.Pump) { $lane.Pump.Stop() } } catch {}
+            $lane.Item = $null
+            $lane.Plan = $null
+        }
+    }
     try { [VideoDehydrator.LinePump]::Stop() } catch {}
     if ($script:Timer) { $script:Timer.Stop(); $script:Timer.Dispose() }
     if ($script:PlayTimer) { $script:PlayTimer.Stop(); $script:PlayTimer.Dispose() }
@@ -7038,7 +7436,26 @@ function Invoke-SmokeTest {
     [Windows.Forms.Application]::DoEvents()
     Start-Sleep -Milliseconds 200
     Save-FormImage $script:HelpForm (Join-Path $env:TEMP 'vdh-help.png')
+    Assert-True (@($script:Lanes).Count -eq 6) 'Encode lanes did not go to six'
+    Assert-True (@($script:JobRows).Count -eq 6) 'Job bars did not go to six'
+    Assert-True ($script:JobBox.Items.Count -eq 6) 'Jobs at once is missing a level'
+    Assert-True ([string]$script:JobBox.Items[0] -eq '1') 'Jobs at once does not start at one'
+    Assert-True ([string]$script:JobBox.Items[5] -eq '6') 'Jobs at once does not go to six'
+    Assert-True ((Get-JobCount) -ge 1 -and (Get-JobCount) -le 6) 'Jobs at once was out of range'
+    $jobTip = Get-JobTip
+    Assert-True ($jobTip -match '16 cores' -and $jobTip -match '48 cores' -and $jobTip -match 'does not finish sooner') 'The jobs tip skipped an efficiency level'
+    Assert-True ([string]$script:Tips.GetToolTip($script:JobBox) -eq $jobTip) 'The jobs dropdown has no efficiency tip'
+    Assert-True ($script:JobLabel.Text -eq 'Parallel jobs') 'Parallel jobs label'
+    Assert-True ($script:JobBox.Parent -eq $script:ActionPanel) 'Parallel jobs left the action row'
+    Assert-True ($script:JobBox.Right -le ($script:FindLabel.Left + 1)) 'Parallel jobs is not left of Find'
+    Assert-True ($script:JobLabel.Right -le ($script:JobBox.Left + 1)) 'Parallel jobs label overlaps its dropdown'
+    $script:ProgressPaintAt = [datetime]::UtcNow
+    Assert-True (-not (Test-ProgressPaintDue)) 'The status bar would repaint too often'
+    $script:ProgressPaintAt = [datetime]::UtcNow.AddSeconds(-2)
+    Assert-True (Test-ProgressPaintDue) 'The status bar would stay frozen'
+    $script:ProgressPaintAt = $null
     Assert-True ($script:HelpBox.Text -match '12000 kbps') 'The guide was missing the 4K rate'
+    Assert-True ($script:HelpBox.Text -match 'from 1 to 6') 'The guide was missing jobs at once'
     Assert-True ($script:HelpBox.Text -match '\.vd-originals') 'The guide was missing the holding folder'
     Assert-True ($script:HelpBox.Text -match 'Select folder') 'The guide was missing folder selection'
     Assert-True ($script:HelpBox.Text -match 'Slight' -and $script:HelpBox.Text -match 'Extreme') 'The guide was missing overage groups'
@@ -7105,7 +7522,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.9.1') 'Version file was not 1.0.9.1'
+    Assert-True ((Get-AppVersion) -eq '1.0.9.2') 'Version file was not 1.0.9.2'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -7501,6 +7918,45 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReencodeCheck) -match 'Windows Media Audio') 'Re-encode tooltip'
     Assert-True ($script:ReencodeCheck.Bottom -le $script:OptionsCard.ClientSize.Height) 'Re-encode sits outside the options card'
     Assert-True ($script:ReencodeCheck.Right -lt $script:BudgetTitle.Left) 'Re-encode overlaps the budgets'
+    Assert-True ($script:FindBox.Items.Count -eq 6) 'Find is missing a choice'
+    Assert-True ([string]$script:FindBox.Items[0] -eq 'All') 'Find does not start with All'
+    Assert-True ([string]$script:FindBox.Items[3] -eq '25') 'Find is missing 25'
+    Assert-True ((Get-FindLimit) -eq 0) 'Find did not default to the whole folder'
+    Assert-True ($script:LogButton.Text -eq 'Log') 'Log label'
+    Assert-True ($script:LogButton.Parent -eq $script:ActionPanel) 'Log is outside the action row'
+    Assert-True ($script:Tips.GetToolTip($script:LogButton) -match 'Markdown file') 'Log tooltip'
+    $sample = Format-ConversionLogMarkdown @([pscustomobject]@{
+        Timestamp = '2026-10-22T14:15:03'; Status = 'REPLACED'; Reason = 'ok'; Source = 'Show\Episode.mkv'
+        OldGiB = '1.240'; NewGiB = '0.420'; Width = '1920'; Height = '1080'; Kbps = '2250'
+    }, [pscustomobject]@{
+        Timestamp = '2026-10-22T16:02:11'; Status = 'KEPT'; Reason = 'ok'; Source = 'Movie.mkv'
+        OldGiB = '8.100'; NewGiB = '2.010'; Width = '3840'; Height = '2160'; Kbps = '8000'
+    })
+    Assert-True ($sample -match '# Video Dehydrator conversions') 'The log title was missing'
+    Assert-True ($sample -match '## October 22, 2026') 'The log day heading was missing'
+    Assert-True ($sample -match '### 2:15 PM') 'The log time heading was missing'
+    Assert-True ($sample -match '### 4:02 PM') 'A later conversion was not grouped on its own time'
+    Assert-True ($sample -match 'Episode.mkv') 'The log left out the file name'
+    Assert-True ((Format-ConversionLogMarkdown @()) -match 'No conversions are recorded yet') 'An empty log had no empty state'
+    $listed = New-Object System.Collections.Generic.List[object]
+    $listed.Add([pscustomobject]@{ Timestamp = '2026-10-22T14:15:03'; Status = 'KEPT'; Reason = 'ok'; Source = 'Listed.mkv'; OldGiB = '1'; NewGiB = '1'; Width = '1'; Height = '1'; Kbps = '1' })
+    Assert-True ((Format-ConversionLogMarkdown $listed) -match 'Listed.mkv') 'A stored list of conversions could not be formatted'
+    Assert-True (Test-PassTwoDidNotStart @('encoded 0 frames', 'Encoding: task 2 of 2, 0.00 %')) 'A second pass that never started was missed'
+    Assert-True (-not (Test-PassTwoDidNotStart @('encoded 300 frames', 'work result = 0'))) 'A finished encode looked like a failed second pass'
+    $missingOutput = @(
+        'ERROR: avio_open2 failed, errno -2: Could not write to indicated output file. Please check destination path and file permissions',
+        '[05:45:34] aac-decoder done: 0 frames, 0 decoder errors',
+        '[05:45:34] h264-decoder done: 0 frames, 0 decoder errors',
+        '[05:45:34] libhb: work result = 3',
+        'Encode failed (error 3).',
+        'encoded 0 frames',
+        'Encoding: task 2 of 2, 0.00 %'
+    )
+    Assert-True (Test-OutputPathMissing $missingOutput) 'A missing output folder was not recognized'
+    Assert-True (-not (Test-OutputPathMissing @('encoded 0 frames', 'Encoding: task 2 of 2, 0.00 %'))) 'A second pass that never started looked like a missing folder'
+    $missingText = Get-EncodeFailureText $missingOutput
+    Assert-True ($missingText -match 'avio_open2 failed, errno -2') 'The convert log dropped the missing output folder'
+    Assert-True ($missingText -match 'work result = 3') 'The convert log dropped the HandBrake result'
     Assert-True ($script:ClearSkipsButton.Text -eq 'Clear skips') 'Clear skips label'
     Assert-True ($script:Tips.GetToolTip($script:ClearSkipsButton) -match 'new copy was larger') 'Clear skips tooltip'
     Assert-True ($script:ClearSkipsButton.Bottom -le $script:OptionsCard.ClientSize.Height) 'Clear skips sits outside the options card'

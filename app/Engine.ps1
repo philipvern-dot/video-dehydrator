@@ -1102,7 +1102,8 @@ function Get-HandBrakeArguments {
         [Parameter(Mandatory)][int]$VideoKbps,
         [Parameter(Mandatory)][string]$Encoder,
         [switch]$ReencodeAudio,
-        [int]$ThreadPool = 0
+        [int]$ThreadPool = 0,
+        [switch]$SinglePass
     )
     $fallback = 'none'
     if ($ReencodeAudio) { $fallback = 'av_aac' }
@@ -1113,8 +1114,6 @@ function Get-HandBrakeArguments {
         '--encoder', $Encoder,
         '--encoder-preset', 'medium',
         '--vb', "$VideoKbps",
-        '--multi-pass',
-        '--turbo',
         '--vfr',
         '--crop-mode', 'none',
         '--crop', '0:0:0:0',
@@ -1124,6 +1123,12 @@ function Get-HandBrakeArguments {
         '--audio-copy-mask', $script:AudioCopyMask,
         '--audio-fallback', $fallback
     )
+    if ($SinglePass) {
+        $arguments += @('--no-multi-pass', '--no-turbo')
+    }
+    else {
+        $arguments += @('--multi-pass', '--turbo')
+    }
     $subCount = 0
     if ($Probe -and $null -ne $Probe.SubCount) { $subCount = [int]$Probe.SubCount }
     if ($subCount -gt 0) {
@@ -2338,10 +2343,66 @@ function Remove-RecycledHoldingFolder {
     try { Invoke-RecycleDirectoryCleanup -Plan $plan } catch { }
 }
 
+function Get-HoldBusyPath {
+    param($Plan)
+    if (-not $Plan -or -not [string]$Plan.HoldDir) { return '' }
+    $leaf = ''
+    if ($Plan.Temp) { $leaf = [IO.Path]::GetFileName([string]$Plan.Temp) }
+    if (-not $leaf -and $Plan.Source) { $leaf = [IO.Path]::GetFileName([string]$Plan.Source) }
+    if (-not $leaf) { return '' }
+    $base = [IO.Path]::GetFileNameWithoutExtension($leaf)
+    if ($base.EndsWith('.vd.tmp')) { $base = $base.Substring(0, $base.Length - 7) }
+    if (-not $base) { return '' }
+    return (Join-Path ([string]$Plan.HoldDir) ($base + '.vd.busy'))
+}
+
+function Add-HoldBusyMarker {
+    param($Plan)
+    if (-not $Plan -or -not [string]$Plan.HoldDir) { return '' }
+    New-Item -ItemType Directory -Force -Path ([string]$Plan.HoldDir) | Out-Null
+    if ($Plan.Source) {
+        $parent = Split-Path -Parent ([string]$Plan.Source)
+        if ($parent) { Add-PlexIgnore -Directory $parent }
+    }
+    $path = Get-HoldBusyPath -Plan $Plan
+    if (-not $path) { return '' }
+    [IO.File]::WriteAllText($path, ([string]$PID + "`r`n"))
+    return $path
+}
+
+function Remove-HoldBusyMarker {
+    param($Plan)
+    $path = Get-HoldBusyPath -Plan $Plan
+    if ($path -and (Test-Path -LiteralPath $path)) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-StaleBusyMarkers {
+    param([string]$Directory)
+    if (-not $Directory -or -not (Test-Path -LiteralPath $Directory)) { return }
+    foreach ($file in @(Get-ChildItem -LiteralPath $Directory -Force -Filter '*.vd.busy' -ErrorAction SilentlyContinue)) {
+        $raw = ''
+        try { $raw = [IO.File]::ReadAllText($file.FullName).Trim() } catch { $raw = '' }
+        $owner = 0
+        if ($raw -match '^\d+$') {
+            try { $owner = [int]$raw } catch { $owner = 0 }
+        }
+        $alive = $false
+        if ($owner -gt 0) {
+            try { $alive = $null -ne (Get-Process -Id $owner -ErrorAction SilentlyContinue) } catch { $alive = $false }
+        }
+        if (-not $alive) {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Remove-EmptyDirectory {
     param([string]$Directory)
     if (-not $Directory) { return }
     if (-not (Test-Path -LiteralPath $Directory)) { return }
+    Remove-StaleBusyMarkers -Directory $Directory
     $left = @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction SilentlyContinue)
     if ($left.Count -eq 0) {
         Remove-Item -LiteralPath $Directory -Force -ErrorAction SilentlyContinue
@@ -2690,6 +2751,7 @@ function Add-ScanDirectory {
         $State
     )
     if ($Cancel.Stop) { $State.Cancelled = $true; return }
+    if ($State.Limited) { return }
     $leaf = [IO.Path]::GetFileName($Directory.TrimEnd('\'))
     if ($leaf -eq '.vd-originals') { return }
     $files = $null
@@ -2716,6 +2778,7 @@ function Add-ScanDirectory {
                     continue
                 }
                 if ($decision.Decision -eq 'shrink') { $State.Shrink++ } else { $State.Hits++ }
+                if (Test-ScanLimitReached $State) { $State.Limited = $true }
                 Send-ScanMessage $Queue @{
                     Kind          = 'hit'
                     Decision      = $decision.Decision
@@ -2734,6 +2797,7 @@ function Add-ScanDirectory {
                     Reason        = $decision.Reason
                     TenBit        = ([string](Get-EncoderName -Probe $probe) -eq 'x265_10bit')
                 }
+                if ($State.Limited) { return }
             }
             elseif ($decision.Decision -eq 'dv') { $State.Dv++ }
             elseif ($decision.Decision -eq 'nodur' -or $decision.Decision -eq 'nopicture') { $State.NoDur++ }
@@ -2757,8 +2821,21 @@ function Add-ScanDirectory {
     }
     foreach ($sub in $dirs) {
         if ($Cancel.Stop) { $State.Cancelled = $true; return }
+        if ($State.Limited) { return }
         Add-ScanDirectory -Directory $sub -Recurse $true -Ffprobe $Ffprobe -Queue $Queue -Cancel $Cancel -State $State
+        if ($State.Limited) { return }
     }
+}
+
+function Test-ScanLimitReached($State) {
+    if ($null -eq $State) { return $false }
+    $limit = 0
+    if ($State.ContainsKey('Limit') -and $null -ne $State.Limit) { $limit = [int]$State.Limit }
+    if ($limit -le 0) { return $false }
+    $found = 0
+    if ($null -ne $State.Hits) { $found += [int]$State.Hits }
+    if ($null -ne $State.Shrink) { $found += [int]$State.Shrink }
+    return ($found -ge $limit)
 }
 
 function Invoke-ScanFolder {
@@ -2768,7 +2845,8 @@ function Invoke-ScanFolder {
         [Parameter(Mandatory)][string]$Ffprobe,
         $Queue,
         $Cancel,
-        $Skips
+        $Skips,
+        [int]$Limit = 0
     )
     $samples = New-Object System.Collections.Generic.List[string]
     $state = @{
@@ -2783,6 +2861,8 @@ function Invoke-ScanFolder {
         Ignored   = 0
         Samples   = $samples
         Cancelled = $false
+        Limited   = $false
+        Limit     = $Limit
         Skips     = @()
     }
     if ($null -ne $Skips) {
@@ -2816,12 +2896,17 @@ function Invoke-ScanFolder {
             Ignored   = $state.Ignored
             Samples   = ($state.Samples -join ' | ')
             Cancelled = [bool]$state.Cancelled
+            Limited   = [bool]$state.Limited
+            Limit     = [int]$state.Limit
         }
     }
 }
 
 function Invoke-RecycleSelfTest {
     $lone = @([pscustomobject]@{ Name = 'Movies' })
+    Assert-Engine (-not (Test-ScanLimitReached @{ Hits = 4; Shrink = 0; Limit = 5 })) 'four files did not fill a limit of five'
+    Assert-Engine (Test-ScanLimitReached @{ Hits = 3; Shrink = 2; Limit = 5 }) 'bloated and can-shrink files fill the limit together'
+    Assert-Engine (-not (Test-ScanLimitReached @{ Hits = 9; Shrink = 9; Limit = 0 })) 'a limit of all files stopped the scan'
     Assert-Engine (Test-StaleRecycleChild -Children $lone -RemovedName 'Movies') 'a lone removed folder was not stale'
     $pair = @([pscustomobject]@{ Name = 'Movies' }, [pscustomobject]@{ Name = 'other.txt' })
     Assert-Engine (-not (Test-StaleRecycleChild -Children $pair -RemovedName 'Movies')) 'another name was treated as a stale listing'
@@ -3495,6 +3580,41 @@ function Invoke-EngineSelfTest {
     }
     finally {
         if (Test-Path -LiteralPath $plexDir) { Remove-Item -LiteralPath $plexDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    $busyDir = Join-Path $env:TEMP ('vdh-busy-' + [guid]::NewGuid().ToString('n'))
+    New-Item -ItemType Directory -Force -Path $busyDir | Out-Null
+    try {
+        $show = Join-Path $busyDir 'Season'
+        New-Item -ItemType Directory -Force -Path $show | Out-Null
+        $hold = Join-Path $show '.vd-originals'
+        $plan = [pscustomobject]@{
+            Source  = Join-Path $show 'Episode.mkv'
+            HoldDir = $hold
+            Temp    = Join-Path $hold 'Episode.vd.tmp.mkv'
+        }
+        $marker = Add-HoldBusyMarker -Plan $plan
+        Assert-Engine ($marker -eq (Join-Path $hold 'Episode.vd.busy')) 'busy marker name'
+        Assert-Engine (([IO.File]::ReadAllText($marker).Trim()) -eq [string]$PID) 'busy marker records this process'
+        Assert-Engine (Test-Path -LiteralPath (Join-Path $show '.plexignore')) 'busy marker restored the plex ignore'
+        $other = Join-Path $hold 'Finished.mkv'
+        [IO.File]::WriteAllText($other, 'kept')
+        Remove-Item -LiteralPath $other -Force
+        Remove-EmptyDirectory -Directory $hold
+        Assert-Engine (Test-Path -LiteralPath $hold) 'a live encode marker let the holding folder be removed'
+        Assert-Engine (Test-Path -LiteralPath $marker) 'a live encode marker was deleted'
+        $dead = Join-Path $hold 'Old.vd.busy'
+        [IO.File]::WriteAllText($dead, '99999999')
+        Remove-EmptyDirectory -Directory $hold
+        Assert-Engine (-not (Test-Path -LiteralPath $dead)) 'a marker from a closed process stayed'
+        Assert-Engine (Test-Path -LiteralPath $hold) 'a closed marker removed the folder while another encode is running'
+        Remove-HoldBusyMarker -Plan $plan
+        Remove-EmptyDirectory -Directory $hold
+        Assert-Engine (-not (Test-Path -LiteralPath $hold)) 'the holding folder stayed after the last encode marker was removed'
+        Assert-Engine (-not (Test-Path -LiteralPath (Join-Path $show '.plexignore'))) 'plex ignore stayed after the holding folder was removed'
+    }
+    finally {
+        if (Test-Path -LiteralPath $busyDir) { Remove-Item -LiteralPath $busyDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
     $undoDir = Join-Path $env:TEMP ('vdh-undo-' + [guid]::NewGuid().ToString('n'))
