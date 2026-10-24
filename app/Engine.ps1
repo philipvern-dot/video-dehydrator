@@ -1157,16 +1157,21 @@ function Get-HandBrakeArguments {
     return $arguments
 }
 
+function Test-EqualTimestampLine([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $trimmed = $Text.Trim()
+    if ($trimmed -notmatch '^(?:\[[^\]]+\]\s*)?Application provided invalid, non monotonically increasing dts to muxer in stream \d+:\s*(\d+)\s*>=\s*(\d+)\s*$') {
+        return $false
+    }
+    return ($Matches[1] -eq $Matches[2])
+}
+
 function Test-HarmlessDecodeNote([string]$Text) {
     if ([string]::IsNullOrWhiteSpace($Text)) { return $true }
     $lines = @($Text -split '\s+\|\s+|\r?\n' | Where-Object { $_ -and $_.Trim() })
     if ($lines.Count -eq 0) { return $true }
     foreach ($line in $lines) {
-        $trimmed = $line.Trim()
-        if ($trimmed -notmatch '^(?:\[[^\]]+\]\s*)?Application provided invalid, non monotonically increasing dts to muxer in stream \d+:\s*(\d+)\s*>=\s*(\d+)\s*$') {
-            return $false
-        }
-        if ($Matches[1] -ne $Matches[2]) { return $false }
+        if (-not (Test-EqualTimestampLine $line)) { return $false }
     }
     return $true
 }
@@ -1224,6 +1229,9 @@ function Test-TrailingAc3Note([string]$Text) {
             if ($exitCode -eq 0) { return $false }
             $body = [string]$Matches[2]
         }
+        # Equal timestamps are already harmless. A VirtualDub AC3 tail can
+        # show up in the same last-15-second check, and both are allowed.
+        if (Test-EqualTimestampLine $body) { continue }
         $known = $false
         if ($body -match '^\[ac3 @ [0-9A-Fa-fx]+\] incomplete frame$') {
             $incomplete++
@@ -1337,6 +1345,11 @@ function Test-DecodeWindow {
     $ffArgs += @('-t', "$seconds", '-i', $File, '-f', 'null', '-')
     $run = Invoke-CapturedProcess -File $Ffmpeg -Arguments $ffArgs
     $err = (($run.StdOut + "`n" + $run.StdErr) -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '^\s*$' }) -join ' | '
+    # -xerror turns a repeated equal timestamp into a non-zero exit. Those
+    # notes are harmless on their own. A blank failure is still a failure.
+    if ((Test-HarmlessDecodeNote $err) -and -not [string]::IsNullOrWhiteSpace($err)) {
+        return [pscustomobject]@{ Ok = $true; Detail = '' }
+    }
     if ($run.ExitCode -ne 0 -or -not (Test-HarmlessDecodeNote $err)) {
         return [pscustomobject]@{ Ok = $false; Detail = "decode $Window exit=$($run.ExitCode) $err" }
     }
@@ -3383,6 +3396,10 @@ function Invoke-EngineSelfTest {
     Assert-Engine (-not (Test-HarmlessDecodeNote ($sameStamp + ' | Error while decoding stream'))) 'another decode message is not harmless'
     $ac3Tail = 'decode Last exit=-1094995529 [ac3 @ 00000200d45dad40] incomplete frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] corrupt decoded frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Error processing packet in decoder: Invalid data found when processing input | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Task finished with error code: -1094995529 (Invalid data found when processing input) | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Terminating thread with return code -1094995529 (Invalid data found when processing input)'
     Assert-Engine (Test-TrailingAc3Note $ac3Tail) 'one trailing incomplete AC3 frame is the allowed note'
+    $mixedTail = 'decode Last exit=-1094995529 ' + $sameStamp + ' | ' + ($ac3Tail -replace '^decode Last exit=-1094995529\s+', '')
+    Assert-Engine (Test-TrailingAc3Note $mixedTail) 'equal timestamps plus one short AC3 frame are allowed'
+    Assert-Engine (-not (Test-HarmlessDecodeNote $mixedTail)) 'the mixed note is not timestamps alone'
+    Assert-Engine (-not (Test-TrailingAc3Note ($mixedTail -replace '10 >= 10', '10 >= 4'))) 'a backwards timestamp stays a failure beside the AC3 tail'
     Assert-Engine (-not (Test-TrailingAc3Note ($ac3Tail + ' | [mpeg4 @ 00000001] error while decoding'))) 'a picture error stays a failure'
     Assert-Engine (-not (Test-TrailingAc3Note ($ac3Tail + ' | [ac3 @ 00000001] incomplete frame'))) 'two incomplete AC3 frames stay a failure'
     Assert-Engine (-not (Test-TrailingAc3Note ($ac3Tail -replace 'decode Last', 'decode First'))) 'the first window does not use the tail exception'
