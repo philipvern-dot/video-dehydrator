@@ -2051,6 +2051,32 @@ function Remove-EmptyRecycleDirectories {
     }
 }
 
+function Get-RecycleLookupWaits {
+    # Tests set this to a short list. An unset value waits long enough for a
+    # share to finish moving a deleted file into #recycle.
+    if ($null -ne $script:RecycleLookupWaits) { return @($script:RecycleLookupWaits) }
+    return @(1000, 2000, 4000, 8000)
+}
+
+function Get-RecycleArrivedItem([string]$Path) {
+    $waits = @(Get-RecycleLookupWaits)
+    $last = $null
+    for ($try = 0; $try -le $waits.Count; $try++) {
+        if ($try -gt 0) {
+            $pause = [int]$waits[$try - 1]
+            if ($pause -gt 0) { Start-Sleep -Milliseconds $pause }
+        }
+        try {
+            return Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        }
+        catch {
+            $last = $_
+            if (-not (Test-RecycleNotFound $_)) { throw }
+        }
+    }
+    throw $last
+}
+
 function Invoke-RecyclePurge {
     param($Plan, [int64]$Length)
     $refusal = Test-RecycleFilePlan $Plan
@@ -2084,7 +2110,7 @@ function Invoke-RecyclePurge {
         return (New-RecycleResult 'failed' $source $recycleFile 'The #recycle folder resolved to a different path. Nothing was deleted.' $name)
     }
     try {
-        $fileItem = Get-Item -LiteralPath $recycleFile -Force -ErrorAction Stop
+        $fileItem = Get-RecycleArrivedItem $recycleFile
     }
     catch {
         if (Test-RecycleNotFound $_) {
@@ -2238,7 +2264,7 @@ function Invoke-RecyclePlexIgnorePurge {
         return (New-RecycleResult 'failed' $source $recycleFile 'The #recycle path is not the recycle folder. Nothing was deleted.' $name)
     }
     try {
-        $fileItem = Get-Item -LiteralPath $recycleFile -Force -ErrorAction Stop
+        $fileItem = Get-RecycleArrivedItem $recycleFile
     }
     catch {
         if (Test-RecycleNotFound $_) { return (New-RecycleResult 'missing' $source $recycleFile 'The recycled .plexignore was not found.' $name) }
@@ -3139,6 +3165,55 @@ function Invoke-RecycleSelfTest {
             AllowLocal  = $true
             DriveMap    = $null
         }
+        $script:RecycleLookupWaits = @(80, 80, 80, 80, 80)
+        $lateHold = Join-Path $recycleRoot 'Late\Show\.vd-originals'
+        New-Item -ItemType Directory -Force -Path $lateHold | Out-Null
+        $lateTarget = Join-Path $lateHold 'Late.avi'
+        $lateBytes = [Text.Encoding]::UTF8.GetBytes('late-bytes')
+        if (-not ('VideoDehydratorLateFile' -as [type])) {
+            Add-Type -TypeDefinition @'
+public static class VideoDehydratorLateFile {
+    public static void WriteSoon(string path, byte[] bytes, int delayMs) {
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate {
+            System.Threading.Thread.Sleep(delayMs);
+            System.IO.File.WriteAllBytes(path, bytes);
+        });
+    }
+}
+'@
+        }
+        [VideoDehydratorLateFile]::WriteSoon($lateTarget, $lateBytes, 120)
+        $latePlan = [pscustomobject]@{
+            SourcePath  = '\\nas\media\Late\Show\.vd-originals\Late.avi'
+            ShareRoot   = $root
+            Relative    = 'Late\Show\.vd-originals\Late.avi'
+            RecycleRoot = $recycleRoot
+            RecycleFile = $lateTarget
+            Name        = 'Late.avi'
+            AllowLocal  = $true
+            DriveMap    = $null
+        }
+        $late = Invoke-RecyclePurge -Plan $latePlan -Length ([int64]$lateBytes.Length)
+        Assert-Engine ($late.Status -eq 'purged') 'a recycle copy that arrived late was left behind'
+        Assert-Engine (-not (Test-Path -LiteralPath $lateTarget)) 'the late recycle copy remained'
+        $script:RecycleLookupWaits = @(1)
+        $neverHold = Join-Path $recycleRoot 'Never\Show\.vd-originals'
+        New-Item -ItemType Directory -Force -Path $neverHold | Out-Null
+        $neverTarget = Join-Path $neverHold 'Never.avi'
+        $neverPlan = [pscustomobject]@{
+            SourcePath  = '\\nas\media\Never\Show\.vd-originals\Never.avi'
+            ShareRoot   = $root
+            Relative    = 'Never\Show\.vd-originals\Never.avi'
+            RecycleRoot = $recycleRoot
+            RecycleFile = $neverTarget
+            Name        = 'Never.avi'
+            AllowLocal  = $true
+            DriveMap    = $null
+        }
+        $never = Invoke-RecyclePurge -Plan $neverPlan -Length 4
+        Assert-Engine ($never.Status -eq 'missing') 'a copy that never arrived was removed'
+        Assert-Engine (-not (Test-Path -LiteralPath $neverTarget)) 'a missing copy created a file'
+        $script:RecycleLookupWaits = $null
         $absent = Invoke-RecyclePurge -Plan $absentPlan -Length 4
         Assert-Engine ($absent.Status -eq 'absent') 'a missing bin was treated as a failure'
         Assert-Engine ((Get-Content -LiteralPath $bait -Raw) -eq 'bait') 'a missing bin deleted another file'
@@ -3153,6 +3228,7 @@ function Invoke-RecycleSelfTest {
         if ($absentRoot -and (Test-Path -LiteralPath $absentRoot)) {
             Remove-Item -LiteralPath $absentRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
+        $script:RecycleLookupWaits = $null
     }
 }
 
