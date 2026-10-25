@@ -3,7 +3,7 @@
 ; Compile with Inno Setup 6:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" VideoDehydrator.iss
 
-#define AppVersion "1.0.9.4"
+#define AppVersion "1.0.9.5"
 #define Repo ".."
 #define ToolExe "E:\Programming\video_dehydrator\windows\tools"
 
@@ -29,7 +29,7 @@ Uninstallable=yes
 UninstallDisplayName=Video Dehydrator
 SetupIconFile={#Repo}\vd-icon.ico
 UninstallDisplayIcon={app}\vd-icon.ico
-VersionInfoVersion=1.0.9.4
+VersionInfoVersion=1.0.9.5
 VersionInfoProductName=Video Dehydrator
 VersionInfoCompany=Video Dehydrator
 VersionInfoDescription=Installs Video Dehydrator and the tools it needs

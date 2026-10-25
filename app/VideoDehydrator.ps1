@@ -451,7 +451,7 @@ $script:ConversionLogPath = Join-Path $script:AppDir 'conversion-log.md'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.9.4'
+$script:UpdateFallback = '1.0.9.5'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -2978,6 +2978,7 @@ function Start-NextEncode {
         $script:EncodeIndex++
         $number = $script:EncodeIndex
         $total = $script:EncodeItems.Count
+        Update-BatchCount
         $script:EtaProgress = $null
         $script:EtaChecking = $false
         Update-EtaLine
@@ -3206,9 +3207,7 @@ function Update-JobBars {
     if ($script:JobHost) { $script:JobHost.Height = 8 + ($count * 36) }
     }
     if ($script:StatusPanel) {
-        $want = 58
-        if ($script:EtaLabel -and -not [string]::IsNullOrWhiteSpace([string]$script:EtaLabel.Text)) { $want = 78 }
-        if ($show -and $script:JobHost) { $want += [int]$script:JobHost.Height }
+        $want = Get-StatusPanelWant
         if ($script:StatusPanel.Height -ne $want) {
             $script:StatusPanel.Height = $want
             Update-ChromeLayout
@@ -3446,13 +3445,47 @@ function Get-WaitingEncodeRows {
     return @($list.ToArray())
 }
 
+function Get-StatusPanelWant {
+    param([string]$EtaText)
+    $eta = ''
+    if ($PSBoundParameters.ContainsKey('EtaText')) { $eta = [string]$EtaText }
+    elseif ($script:EtaLabel) { $eta = [string]$script:EtaLabel.Text }
+    $want = 58
+    if (-not [string]::IsNullOrWhiteSpace($eta)) { $want = 78 }
+    if ($script:BatchLabel -and $script:BatchLabel.Visible) { $want += 22 }
+    if ($script:JobHost -and $script:JobHost.Visible) { $want += [int]$script:JobHost.Height }
+    return $want
+}
+
+function Update-BatchCount {
+    if (-not $script:BatchLabel) { return }
+    $total = 0
+    $index = 0
+    if ($null -ne $script:BatchTotal) { $total = [int]$script:BatchTotal }
+    if ($null -ne $script:EncodeIndex) { $index = [int]$script:EncodeIndex }
+    if ($total -gt 0 -and $index -gt $total) { $index = $total }
+    $show = ($script:Work -eq 'encode' -and $total -gt 0 -and $index -gt 0)
+    $text = ''
+    if ($show) { $text = "$index/$total" }
+    $changed = (($script:BatchLabel.Visible -ne $show) -or ([string]$script:BatchLabel.Text -ne $text))
+    $script:BatchLabel.Text = $text
+    $script:BatchLabel.Visible = $show
+    if ($script:Tips) {
+        $tip = 'How many files in this batch have started.'
+        if ($show) { $tip = "$index of $total files in this batch have started." }
+        $script:Tips.SetToolTip($script:BatchLabel, $tip)
+    }
+    if (-not $changed -or -not $script:StatusPanel) { return }
+    $want = Get-StatusPanelWant
+    if ($script:StatusPanel.Height -ne $want) { $script:StatusPanel.Height = $want }
+    Update-ChromeLayout
+}
+
 function Set-EtaText([string]$text) {
     if ($null -eq $script:EtaLabel -or $null -eq $script:StatusPanel) { return }
     if ($null -eq $text) { $text = '' }
     $show = -not [string]::IsNullOrWhiteSpace($text)
-    $want = 58
-    if ($show) { $want = 78 }
-    if ($script:JobHost -and $script:JobHost.Visible) { $want += [int]$script:JobHost.Height }
+    $want = Get-StatusPanelWant -EtaText $text
     $textSame = ([string]$script:EtaLabel.Text -eq $text)
     $heightSame = ($script:StatusPanel.Height -eq $want)
     if ($textSame -and $heightSame) { return }
@@ -3566,6 +3599,8 @@ function Finish-Batch {
     try { [VideoDehydrator.LinePump]::Stop() } catch {}
     Update-JobBars
     $script:Work = 'idle'
+    $script:BatchTotal = 0
+    Update-BatchCount
     $script:ForceEncode = $false
     Clear-EtaLine
     $script:Cancel = $false
@@ -3851,6 +3886,7 @@ function Begin-ConvertBatch {
     $script:SavedBytes = [int64]0
     $script:EncodeItems = $items
     $script:EncodeIndex = 0
+    $script:BatchTotal = $items.Count
     $script:Work = 'encode'
     Update-Buttons
     Enable-KeepAwake
@@ -5543,6 +5579,10 @@ function Update-ChromeLayout {
                 $trackY = 56
             }
         }
+        if ($script:BatchLabel -and $script:BatchLabel.Visible) {
+            $script:BatchLabel.SetBounds(24, $trackY, ([Math]::Max(80, $status.ClientSize.Width - 48)), 20)
+            $trackY += 22
+        }
         $script:ProgressTrack.SetBounds(24, $trackY, ([Math]::Max(0, $status.ClientSize.Width - 48)), 8)
         Set-Progress $script:ProgressValue
         if ($script:JobHost -and $script:JobHost.Visible) {
@@ -5591,7 +5631,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Converting'
-            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. Parallel jobs chooses how many files encode together, from 1 to 6. Each file uses about 8 cores. One is right for most computers. Two needs about 16 cores, three about 24, four about 32, five about 40, and six about 48. On fewer cores the files share the processor and the batch does not finish sooner. Log opens the conversion record, a Markdown file grouped by the day and time each file finished. Find can stop the scan after 5, 10, 25, 50, or 100 files that can be reduced. All keeps scanning the whole folder. Updating the program keeps that file. Each running file has its own bar and name. The bar is that file. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
+            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. Parallel jobs chooses how many files encode together, from 1 to 6. Each file uses about 8 cores. One is right for most computers. Two needs about 16 cores, three about 24, four about 32, five about 40, and six about 48. On fewer cores the files share the processor and the batch does not finish sooner. Log opens the conversion record, a Markdown file grouped by the day and time each file finished. Find can stop the scan after 5, 10, 25, 50, or 100 files that can be reduced. All keeps scanning the whole folder. Updating the program keeps that file. Each running file has its own bar and name. The bar is that file. Above the bars, 4/100 means this batch has started file 4 of 100. The count moves when the next file starts. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
         },
         @{
             Title = 'Checking the picture'
@@ -5901,6 +5941,14 @@ $script:EtaLabel.ForeColor = $script:ColorInk
 $script:EtaLabel.AutoEllipsis = $true
 $script:EtaLabel.BackColor = [Drawing.Color]::White
 $script:EtaLabel.Visible = $false
+$script:BatchLabel = New-Object Windows.Forms.Label
+$script:BatchLabel.Text = ''
+$script:BatchLabel.Font = $script:FontButtonBold
+$script:BatchLabel.ForeColor = $script:ColorInk
+$script:BatchLabel.BackColor = [Drawing.Color]::White
+$script:BatchLabel.AutoEllipsis = $true
+$script:BatchLabel.Visible = $false
+$script:BatchTotal = 0
 $script:VersionLabel = New-Object Windows.Forms.Label
 $script:VersionLabel.Text = Get-AppVersion
 $script:VersionLabel.Font = $script:FontHint
@@ -5968,6 +6016,7 @@ $script:Lanes = $encodeLanes
 $script:StatusPanel.Controls.Add($script:JobHost)
 $script:StatusPanel.Controls.Add($script:StatusLabel)
 $script:StatusPanel.Controls.Add($script:EtaLabel)
+$script:StatusPanel.Controls.Add($script:BatchLabel)
 $script:StatusPanel.Controls.Add($script:VersionLabel)
 $script:StatusPanel.Controls.Add($script:ProgressTrack)
 $script:StatusPanel.Add_Paint({
@@ -6689,6 +6738,7 @@ Set-Tip $script:Log 'Saved space, skipped videos, and problems are listed here.'
 Set-Tip $script:LogSplit 'Drag to make the activity box taller or shorter. Double-click to put it back.'
 Set-Tip $script:ProgressTrack 'How far the current file has been encoded. The two passes share the bar evenly.'
 Set-Tip $script:EtaLabel 'This file is the encode in progress. Estimated time remaining is the rest of the batch.'
+Set-Tip $script:BatchLabel 'How many files in this batch have started.'
 Set-Tip $script:StatusLabel 'What the program is doing right now.'
 Set-Tip $script:VersionLabel 'This copy of Video Dehydrator.'
 foreach ($panel in @($script:Header, $script:FolderCard, $script:ListHeader, $script:OptionsCard, $script:ActionPanel)) {
@@ -7416,6 +7466,65 @@ function Invoke-ListSplitCheck {
     if ($kept -ne 0) { Set-ListExtra $kept } else { Set-ListExtra 0 }
 }
 
+function Invoke-BatchCountCheck {
+    Assert-True ($null -ne $script:BatchLabel) 'The batch count is missing'
+    Assert-True ($script:BatchLabel.Parent -eq $script:StatusPanel) 'The batch count is not in the status bar'
+    Assert-True (-not $script:BatchLabel.Visible) 'The batch count showed before a convert'
+    Assert-True ([string]::IsNullOrWhiteSpace($script:BatchLabel.Text)) 'The batch count started with a number'
+    $keptWork = [string]$script:Work
+    $keptIndex = $script:EncodeIndex
+    $keptTotal = $script:BatchTotal
+    $keptHost = $false
+    $keptHostHeight = 0
+    $keptTrack = $true
+    if ($script:JobHost) {
+        $keptHost = [bool]$script:JobHost.Visible
+        $keptHostHeight = [int]$script:JobHost.Height
+    }
+    if ($script:ProgressTrack) { $keptTrack = [bool]$script:ProgressTrack.Visible }
+    try {
+        $script:Work = 'encode'
+        $script:BatchTotal = 100
+        $script:EncodeIndex = 4
+        Update-BatchCount
+        Assert-True ($script:BatchLabel.Text -eq '4/100') ("The batch count was $($script:BatchLabel.Text)")
+        Assert-True ($script:BatchLabel.Visible) 'The batch count stayed hidden during a convert'
+        Assert-True ($script:BatchLabel.Bottom -le $script:ProgressTrack.Top) 'The batch count sat on the progress bar'
+        Assert-True ($script:StatusPanel.Height -eq 80) 'The status bar did not grow for the batch count'
+        $script:EncodeIndex = 5
+        Update-BatchCount
+        Assert-True ($script:BatchLabel.Text -eq '5/100') ("The batch count did not move to the next file: $($script:BatchLabel.Text)")
+        $tip = [string]$script:Tips.GetToolTip($script:BatchLabel)
+        Assert-True ($tip -eq '5 of 100 files in this batch have started.') ("The batch count tip was $tip")
+        $script:JobHost.Visible = $true
+        $script:JobHost.Height = 44
+        $script:ProgressTrack.Visible = $false
+        Update-ChromeLayout
+        Assert-True ($script:JobHost.Top -ge $script:BatchLabel.Bottom) 'The job bars covered the batch count'
+        $script:JobHost.Visible = $false
+        $script:JobHost.Height = 0
+        $script:ProgressTrack.Visible = $true
+        $script:Work = 'idle'
+        $script:BatchTotal = 0
+        $script:EncodeIndex = 0
+        Update-BatchCount
+        Assert-True (-not $script:BatchLabel.Visible) 'The batch count stayed up after the convert'
+        Assert-True ($script:StatusPanel.Height -eq 58) 'The status bar stayed tall after the convert'
+    }
+    finally {
+        $script:Work = $keptWork
+        $script:EncodeIndex = $keptIndex
+        $script:BatchTotal = $keptTotal
+        if ($script:JobHost) {
+            $script:JobHost.Visible = $keptHost
+            $script:JobHost.Height = $keptHostHeight
+        }
+        if ($script:ProgressTrack) { $script:ProgressTrack.Visible = $keptTrack }
+        Update-BatchCount
+        Update-ChromeLayout
+    }
+}
+
 function Invoke-SmokeTest {
     $missing = @(Get-MissingTools)
     Assert-True ($missing.Count -eq 0) ("Missing tools: " + ($missing -join ', '))
@@ -7429,6 +7538,7 @@ function Invoke-SmokeTest {
     Start-Sleep -Milliseconds 200
     [Windows.Forms.Application]::DoEvents()
     Invoke-EtaCheck
+    Invoke-BatchCountCheck
     Invoke-FolderSelectCheck
     Invoke-OverCheck
     Invoke-ShowCheck
@@ -7493,6 +7603,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:HelpBox.Text -match 'Stop asking on that window hides it from then on') 'The guide was missing Stop asking'
     Assert-True ($script:HelpBox.Text -match 'does not add a line for each percent') 'The guide was missing the activity percent note'
     Assert-True ($script:HelpBox.Text -match 'Estimated time remaining is the rest of the batch') 'The guide was missing the batch time'
+    Assert-True ($script:HelpBox.Text -match '4/100 means this batch has started file 4 of 100') 'The guide was missing the batch count'
     Assert-True ($script:HelpBox.Text -match 'changes about every 30 seconds') 'The guide was missing the steady time line'
     Assert-True ($script:HelpBox.Text -match 'will not stay in sync with the picture') 'The guide was missing the compare sync note'
     Assert-True ($script:HelpBox.Text -match 'Go to the file on disk to confirm the audio') 'The guide was missing the disk audio note'
@@ -7526,7 +7637,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.9.4') 'Version file was not 1.0.9.4'
+    Assert-True ((Get-AppVersion) -eq '1.0.9.5') 'Version file was not 1.0.9.5'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -7537,7 +7648,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.0\.9\.4') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.0\.9\.5') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'
