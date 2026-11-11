@@ -1468,6 +1468,76 @@ function Get-LargerFileNote {
     return ($sentences -join ' ')
 }
 
+function Get-PacketSpanSec {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $start = [double]::MaxValue
+    $end = [double]::MinValue
+    $seen = $false
+    $stamp = 0.0
+    $duration = 0.0
+    foreach ($line in ($Text -split '\r?\n')) {
+        if (-not $line) { continue }
+        $part = $line.Split(',')
+        if ($part.Count -lt 3) { continue }
+        $hasDts = [double]::TryParse($part[1], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$stamp)
+        if (-not $hasDts) {
+            $hasPts = [double]::TryParse($part[0], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$stamp)
+            if (-not $hasPts) { continue }
+        }
+        if ($stamp -lt 0 -or [double]::IsNaN($stamp) -or [double]::IsInfinity($stamp)) { continue }
+        $duration = 0.0
+        [void][double]::TryParse($part[2], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$duration)
+        if ($duration -lt 0 -or $duration -gt 5 -or [double]::IsNaN($duration) -or [double]::IsInfinity($duration)) { $duration = 0 }
+        $packetEnd = $stamp + $duration
+        if ($stamp -lt $start) { $start = $stamp }
+        if ($packetEnd -gt $end) { $end = $packetEnd }
+        $seen = $true
+    }
+    if (-not $seen) { return $null }
+    $span = $end - $start
+    if ($span -le 0) { return $null }
+    return $span
+}
+
+function Get-IndexedDurationSec {
+    param([string]$Ffprobe, [string]$File)
+    if (-not $Ffprobe -or -not $File -or -not (Test-Path -LiteralPath $Ffprobe) -or -not (Test-Path -LiteralPath $File)) { return $null }
+    $text = New-Object System.Text.StringBuilder
+    foreach ($selector in @('v:0', 'a')) {
+        $run = Invoke-CapturedProcess -File $Ffprobe -Arguments @(
+            '-v', 'error',
+            '-select_streams', $selector,
+            '-show_entries', 'packet=pts_time,dts_time,duration_time',
+            '-of', 'csv=p=0',
+            '--', $File
+        )
+        if ($run.StdOut) { [void]$text.AppendLine([string]$run.StdOut) }
+    }
+    return Get-PacketSpanSec $text.ToString()
+}
+
+function Get-DurationBasis {
+    param(
+        [double]$HeaderSec,
+        [double]$OutputSec,
+        [double]$IndexedSec
+    )
+    $limit = 2.0
+    $basis = $HeaderSec
+    $headerGap = [math]::Abs($OutputSec - $HeaderSec)
+    if ($headerGap -gt $limit -and $IndexedSec -gt 0) {
+        $headerOverstates = ($HeaderSec - $IndexedSec) -gt $limit
+        $outputMatchesIndex = [math]::Abs($OutputSec - $IndexedSec) -le $limit
+        if ($headerOverstates -and $outputMatchesIndex) { $basis = $IndexedSec }
+    }
+    $changed = [math]::Abs($OutputSec - $basis) -gt $limit
+    return [pscustomobject]@{
+        Changed  = [bool]$changed
+        BasisSec = [double]$basis
+    }
+}
+
 function Test-EncodedFile {
     param(
         [Parameter(Mandatory)][string]$Ffmpeg,
@@ -1501,8 +1571,21 @@ function Test-EncodedFile {
         return [pscustomobject]@{ Ok = $false; Reason = ($reasons -join '; '); OutProbe = $null; NewGiBph = $null; OldGiBph = $null }
     }
 
-    if ([math]::Abs($out.DurationSec - $SourceProbe.DurationSec) -gt 2) {
-        $reasons.Add("duration changed from $([math]::Round($SourceProbe.DurationSec, 1))s to $([math]::Round($out.DurationSec, 1))s")
+    $durationBasis = [double]$SourceProbe.DurationSec
+    if ([math]::Abs($out.DurationSec - $durationBasis) -gt 2) {
+        $indexed = 0.0
+        $sourcePath = ''
+        if ($SourceProbe -and $SourceProbe.Path) { $sourcePath = [string]$SourceProbe.Path }
+        $measured = $null
+        try { $measured = Get-IndexedDurationSec -Ffprobe $Ffprobe -File $sourcePath } catch { $measured = $null }
+        if ($null -ne $measured) { $indexed = [double]$measured }
+        $durationCheck = Get-DurationBasis -HeaderSec $durationBasis -OutputSec ([double]$out.DurationSec) -IndexedSec $indexed
+        if ($durationCheck.Changed) {
+            $reasons.Add("duration changed from $([math]::Round($SourceProbe.DurationSec, 1))s to $([math]::Round($out.DurationSec, 1))s")
+        }
+        else {
+            $durationBasis = [double]$durationCheck.BasisSec
+        }
     }
     if ($out.Width -ne $SourceProbe.Width -or $out.Height -ne $SourceProbe.Height) {
         $reasons.Add("picture size changed from $($SourceProbe.Width)x$($SourceProbe.Height) to $($out.Width)x$($out.Height)")
@@ -1528,7 +1611,7 @@ function Test-EncodedFile {
     if ($tempItem.Length -ge $SourceProbe.SizeBytes) {
         $reasons.Add('the new file is not smaller')
     }
-    $oldRate = Get-GiBPerHour -Bytes $SourceProbe.SizeBytes -Seconds $SourceProbe.DurationSec
+    $oldRate = Get-GiBPerHour -Bytes $SourceProbe.SizeBytes -Seconds $durationBasis
     $newRate = Get-GiBPerHour -Bytes $tempItem.Length -Seconds $out.DurationSec
     if ($null -eq $newRate -or $null -eq $oldRate -or $newRate -ge $oldRate) {
         $reasons.Add('the new file is not smaller per hour')
@@ -3335,8 +3418,32 @@ function Invoke-RecycleSidecarSelfTest {
     }
 }
 
+function Invoke-DurationSelfTest {
+    $span = Get-PacketSpanSec "N/A,0.000000,0.041708`r`nN/A,2801.423625,0.041708"
+    Assert-Engine ($null -ne $span -and [math]::Abs($span - 2801.465333) -lt 0.001) 'packet span uses the last timestamp'
+    $fromPts = Get-PacketSpanSec "1.000000,N/A,0.040000`n2.000000,N/A,0.040000"
+    Assert-Engine ($null -ne $fromPts -and [math]::Abs($fromPts - 1.04) -lt 0.001) 'packet span can use a presentation time'
+    Assert-Engine ($null -eq (Get-PacketSpanSec '')) 'an empty packet list has no span'
+    $capped = Get-PacketSpanSec "0,0,99999`n10,10,0.040000"
+    Assert-Engine ($null -ne $capped -and [math]::Abs($capped - 10.04) -lt 0.001) 'a bogus packet duration does not stretch the span'
+    $kept = Get-DurationBasis -HeaderSec 3000.6 -OutputSec 2801.2 -IndexedSec 2801.465333
+    Assert-Engine (-not $kept.Changed) 'a long header does not reject the real picture'
+    Assert-Engine ([math]::Abs($kept.BasisSec - 2801.465333) -lt 0.001) 'the rate uses the real picture length'
+    $dropped = Get-DurationBasis -HeaderSec 3000 -OutputSec 2801 -IndexedSec 3000
+    Assert-Engine ($dropped.Changed) 'a short encode still fails when the picture is full length'
+    Assert-Engine ([math]::Abs($dropped.BasisSec - 3000) -lt 0.001) 'a short encode keeps the header length'
+    $normal = Get-DurationBasis -HeaderSec 100 -OutputSec 100.4 -IndexedSec 40
+    Assert-Engine (-not $normal.Changed) 'a matching length does not look at the index'
+    Assert-Engine ([math]::Abs($normal.BasisSec - 100) -lt 0.001) 'a matching length keeps the header'
+    $shorter = Get-DurationBasis -HeaderSec 3000 -OutputSec 2000 -IndexedSec 2801
+    Assert-Engine ($shorter.Changed) 'a file shorter than the picture still fails'
+    $unread = Get-DurationBasis -HeaderSec 3000.6 -OutputSec 2801.2 -IndexedSec 0
+    Assert-Engine ($unread.Changed) 'a long header still fails when the picture length cannot be read'
+}
+
 function Invoke-EngineSelfTest {
     Invoke-RecycleSelfTest
+    Invoke-DurationSelfTest
     Invoke-RecycleSidecarSelfTest
     Assert-Engine ((Get-TargetKbps -Width 1920 -Height 1080) -eq 3000) '1080p target'
     Assert-Engine ((Get-TargetKbps -Width 3840 -Height 2160) -eq 12000) '4K target'
