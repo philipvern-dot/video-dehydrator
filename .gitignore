@@ -2,6 +2,7 @@
 app/settings.json
 app/pending.json
 app/skipped.json
+app/faults.json
 app/convert-log.tsv
 
 # Too large for GitHub. License text stays.

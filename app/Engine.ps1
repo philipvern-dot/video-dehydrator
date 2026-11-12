@@ -1166,12 +1166,26 @@ function Test-EqualTimestampLine([string]$Text) {
     return ($Matches[1] -eq $Matches[2])
 }
 
+function Test-AacSbrFactorLine([string]$Text) {
+    # FFmpeg logs this when a seek lands in copied HE-AAC, then keeps decoding.
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return ($Text.Trim() -match '^(?:\[[^\]]+\]\s*)*(?:noise_facs_q|env_facs_q) \d+ is invalid\s*$')
+}
+
+function Test-RepeatedMessageLine([string]$Text) {
+    # FFmpeg folds a run of the same note into this line.
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return ($Text.Trim() -match '^Last message repeated \d+ times?\s*$')
+}
+
 function Test-HarmlessDecodeNote([string]$Text) {
     if ([string]::IsNullOrWhiteSpace($Text)) { return $true }
     $lines = @($Text -split '\s+\|\s+|\r?\n' | Where-Object { $_ -and $_.Trim() })
     if ($lines.Count -eq 0) { return $true }
     foreach ($line in $lines) {
-        if (-not (Test-EqualTimestampLine $line)) { return $false }
+        $body = $line.Trim()
+        if ((Test-EqualTimestampLine $body) -or (Test-AacSbrFactorLine $body) -or (Test-RepeatedMessageLine $body)) { continue }
+        return $false
     }
     return $true
 }
@@ -1345,8 +1359,9 @@ function Test-DecodeWindow {
     $ffArgs += @('-t', "$seconds", '-i', $File, '-f', 'null', '-')
     $run = Invoke-CapturedProcess -File $Ffmpeg -Arguments $ffArgs
     $err = (($run.StdOut + "`n" + $run.StdErr) -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '^\s*$' }) -join ' | '
-    # -xerror turns a repeated equal timestamp into a non-zero exit. Those
-    # notes are harmless on their own. A blank failure is still a failure.
+    # -xerror turns a recovered decoder note into a non-zero exit. Equal
+    # timestamps and an HE-AAC factor warning from a seek are recovered notes.
+    # A blank failure is still a failure.
     if ((Test-HarmlessDecodeNote $err) -and -not [string]::IsNullOrWhiteSpace($err)) {
         return [pscustomobject]@{ Ok = $true; Detail = '' }
     }
@@ -3315,6 +3330,453 @@ public static class VideoDehydratorLateFile {
     }
 }
 
+$script:FaultIssueUrl = 'https://github.com/philipvern-dot/video-dehydrator/issues/new'
+$script:FaultUrlLimit = 7000
+
+function Get-FaultField($Row, [string]$Name) {
+    if ($null -eq $Row -or [string]::IsNullOrWhiteSpace($Name)) { return $null }
+    if ($Row -is [System.Collections.IDictionary]) {
+        if ($Row.Contains($Name)) { return $Row[$Name] }
+        return $null
+    }
+    return Get-NoteProperty $Row $Name
+}
+
+function Set-FaultField($Row, [string]$Name, $Value) {
+    if ($null -eq $Row) { return }
+    if ($Row -is [System.Collections.IDictionary]) {
+        $Row[$Name] = $Value
+        return
+    }
+    $prop = $Row.PSObject.Properties[$Name]
+    if ($null -eq $prop) {
+        $Row | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    }
+    else {
+        $prop.Value = $Value
+    }
+}
+
+function Copy-FaultRecord($Row) {
+    $copy = @{}
+    if ($null -eq $Row) { return $copy }
+    if ($Row -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Row.Keys)) { $copy[[string]$key] = $Row[$key] }
+        return $copy
+    }
+    foreach ($prop in @($Row.PSObject.Properties)) { $copy[$prop.Name] = $prop.Value }
+    return $copy
+}
+
+function Test-FaultProgressLine([string]$Line) {
+    $text = [string]$Line
+    if ($text -match 'Encoding:\s*task\s+\d+\s+of\s+\d+.*%') { return $true }
+    if ($text -match 'Muxing:\s*\d+') { return $true }
+    return $false
+}
+
+function Get-UsefulHandBrakeLines {
+    param([string]$Log, [int]$Limit = 80)
+    $notes = New-Object System.Collections.Generic.List[string]
+    $progress = New-Object System.Collections.Generic.List[string]
+    foreach ($raw in ([string]$Log -split '\r?\n')) {
+        $text = $raw.Trim()
+        if (-not $text) { continue }
+        if ($text.Length -gt 400) { $text = $text.Substring(0, 400) + '...' }
+        if (Test-FaultProgressLine $text) {
+            [void]$progress.Add($text)
+            continue
+        }
+        [void]$notes.Add($text)
+    }
+    if ($notes.Count -eq 0) {
+        $start = [Math]::Max(0, $progress.Count - 15)
+        for ($i = $start; $i -lt $progress.Count; $i++) { [void]$notes.Add($progress[$i]) }
+    }
+    if ($notes.Count -gt $Limit) {
+        $kept = New-Object System.Collections.Generic.List[string]
+        for ($i = $notes.Count - $Limit; $i -lt $notes.Count; $i++) { [void]$kept.Add($notes[$i]) }
+        return ,@($kept.ToArray())
+    }
+    return ,@($notes.ToArray())
+}
+
+function Get-ProbeFacts($Probe) {
+    if ($null -eq $Probe) { return $null }
+    $audio = @()
+    $audioValue = Get-NoteProperty $Probe 'AudioCodecs'
+    if ($null -eq $audioValue) { $audioValue = Get-FaultField $Probe 'audio' }
+    if ($null -ne $audioValue) { $audio = @($audioValue) }
+    $duration = Get-NoteProperty $Probe 'DurationSec'
+    if ($null -eq $duration) { $duration = Get-FaultField $Probe 'duration_sec' }
+    $size = Get-NoteProperty $Probe 'SizeBytes'
+    if ($null -eq $size) { $size = Get-FaultField $Probe 'size_bytes' }
+    $codec = Get-NoteProperty $Probe 'VideoCodec'
+    if ($null -eq $codec) { $codec = Get-FaultField $Probe 'video_codec' }
+    $width = Get-NoteProperty $Probe 'Width'
+    if ($null -eq $width) { $width = Get-FaultField $Probe 'width' }
+    $height = Get-NoteProperty $Probe 'Height'
+    if ($null -eq $height) { $height = Get-FaultField $Probe 'height' }
+    $pix = Get-NoteProperty $Probe 'PixFmt'
+    if ($null -eq $pix) { $pix = Get-FaultField $Probe 'pix_fmt' }
+    $ten = Get-NoteProperty $Probe 'Is10Bit'
+    if ($null -eq $ten) { $ten = Get-FaultField $Probe 'ten_bit' }
+    $interlaced = Get-NoteProperty $Probe 'IsInterlaced'
+    if ($null -eq $interlaced) { $interlaced = Get-FaultField $Probe 'interlaced' }
+    $audioCount = Get-NoteProperty $Probe 'AudioCount'
+    if ($null -eq $audioCount) { $audioCount = Get-FaultField $Probe 'audio_count' }
+    $subs = Get-NoteProperty $Probe 'SubCount'
+    if ($null -eq $subs) { $subs = Get-FaultField $Probe 'subtitles' }
+    $bitrate = Get-NoteProperty $Probe 'VideoBitrate'
+    if ($null -eq $bitrate) { $bitrate = Get-FaultField $Probe 'video_bitrate' }
+    $durationNumber = 0.0
+    [void][double]::TryParse([string]$duration, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$durationNumber)
+    $sizeNumber = [int64]0
+    [void][int64]::TryParse([string]$size, [ref]$sizeNumber)
+    $widthNumber = 0
+    [void][int]::TryParse([string]$width, [ref]$widthNumber)
+    $heightNumber = 0
+    [void][int]::TryParse([string]$height, [ref]$heightNumber)
+    $audioNumber = 0
+    [void][int]::TryParse([string]$audioCount, [ref]$audioNumber)
+    $subNumber = 0
+    [void][int]::TryParse([string]$subs, [ref]$subNumber)
+    $bitNumber = [int64]0
+    [void][int64]::TryParse([string]$bitrate, [ref]$bitNumber)
+    return [pscustomobject]@{
+        duration_sec = [math]::Round($durationNumber, 3)
+        size_bytes = $sizeNumber
+        video_codec = [string]$codec
+        width = $widthNumber
+        height = $heightNumber
+        pix_fmt = [string]$pix
+        ten_bit = [bool]$ten
+        interlaced = [bool]$interlaced
+        audio = @($audio)
+        audio_count = $audioNumber
+        subtitles = $subNumber
+        video_bitrate = $bitNumber
+    }
+}
+
+function Get-SourceMediaText {
+    param([string]$Ffprobe, [string]$File)
+    if ([string]::IsNullOrWhiteSpace($Ffprobe) -or [string]::IsNullOrWhiteSpace($File)) { return '' }
+    if (-not (Test-Path -LiteralPath $File)) { return '' }
+    try {
+        $run = Invoke-CapturedProcess -File $Ffprobe -Arguments @(
+            '-v', 'error',
+            '-show_entries',
+            'format=format_name,duration,size,bit_rate:stream=index,codec_type,codec_name,profile,width,height,pix_fmt,field_order,r_frame_rate,avg_frame_rate,nb_frames,duration,channels,channel_layout,sample_rate,bit_rate',
+            '-of', 'compact',
+            '--', $File
+        )
+    }
+    catch {
+        return [string]$_.Exception.Message
+    }
+    $text = ([string]$run.StdOut).Trim()
+    if (-not $text) { $text = ([string]$run.StdErr).Trim() }
+    if ($run.ExitCode -ne 0 -and -not $text) { return ("ffprobe exited " + $run.ExitCode) }
+    if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) + "`n..." }
+    return $text
+}
+
+function New-FaultRecord {
+    param(
+        [string]$Kind,
+        [string]$Source,
+        [string]$Reason,
+        $Probe = $null,
+        $OutProbe = $null,
+        [int64]$OldBytes = 0,
+        [int64]$NewBytes = 0,
+        $OldGiBph = $null,
+        $NewGiBph = $null,
+        [int]$Kbps = 0,
+        $Command = $null,
+        [string]$HandBrakeLog = '',
+        $HandBrakeCode = $null,
+        [int]$Jobs = 0,
+        [switch]$ReencodeAudio,
+        [switch]$AutoDelete,
+        [string]$Ffprobe = ''
+    )
+    $facts = Get-ProbeFacts $Probe
+    $size = [int64]0
+    if ($Source -and (Test-Path -LiteralPath $Source)) {
+        try { $size = [int64](Get-Item -LiteralPath $Source).Length } catch { $size = 0 }
+    }
+    if ($size -le 0 -and $facts) { $size = [int64]$facts.size_bytes }
+    $commandText = ''
+    if ($null -ne $Command) {
+        if ($Command -is [System.Array]) { $commandText = ConvertTo-ArgumentLine @($Command) }
+        else { $commandText = [string]$Command }
+    }
+    $modified = ''
+    if ($Source -and (Test-Path -LiteralPath $Source)) {
+        try { $modified = (Get-Item -LiteralPath $Source).LastWriteTime.ToString('yyyy-MM-ddTHH:mm:ss') } catch { $modified = '' }
+    }
+    $name = 'file'
+    if ($Source) {
+        $leaf = [IO.Path]::GetFileName($Source)
+        if ($leaf) { $name = $leaf }
+    }
+    $media = ''
+    if ($Ffprobe) { $media = Get-SourceMediaText -Ffprobe $Ffprobe -File $Source }
+    return [pscustomobject]@{
+        when = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+        kind = $(if ($Kind) { $Kind } else { 'check' })
+        source = [string]$Source
+        name = $name
+        reason = (([string]$Reason) -replace '\s+', ' ').Trim()
+        size_bytes = $size
+        modified = $modified
+        kbps = $Kbps
+        jobs = $Jobs
+        reencode_audio = [bool]$ReencodeAudio
+        auto_delete = [bool]$AutoDelete
+        handbrake_code = $HandBrakeCode
+        command = $commandText
+        old_bytes = $OldBytes
+        new_bytes = $NewBytes
+        old_gibph = $OldGiBph
+        new_gibph = $NewGiBph
+        source_probe = $facts
+        output_probe = (Get-ProbeFacts $OutProbe)
+        media = $media
+        log = (Get-UsefulHandBrakeLines $HandBrakeLog)
+    }
+}
+
+function Merge-FaultRow {
+    param($Rows, $Record)
+    $source = [string](Get-FaultField $Record 'source')
+    $kept = New-Object System.Collections.Generic.List[object]
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row) { continue }
+        if ($source -and ([string](Get-FaultField $row 'source')) -eq $source) { continue }
+        [void]$kept.Add($row)
+    }
+    if ($source) { [void]$kept.Add($Record) }
+    if ($kept.Count -gt 30) {
+        $tail = New-Object System.Collections.Generic.List[object]
+        for ($i = $kept.Count - 30; $i -lt $kept.Count; $i++) { [void]$tail.Add($kept[$i]) }
+        return ,$tail.ToArray()
+    }
+    return ,$kept.ToArray()
+}
+
+function ConvertTo-FaultRateText($Value) {
+    if ($null -eq $Value -or [string]$Value -eq '') { return '' }
+    $number = 0.0
+    if (-not [double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number)) { return '' }
+    return $number.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function ConvertTo-FaultAudioText($Value) {
+    $items = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $Value) {
+        foreach ($item in @($Value)) {
+            if ($null -eq $item) { continue }
+            $text = [string]$item
+            if ($text) { [void]$items.Add($text) }
+        }
+    }
+    if ($items.Count -eq 0) { return 'none' }
+    return ($items -join ',')
+}
+
+function Format-ProbeLine([string]$Label, $Facts) {
+    if ($null -eq $Facts) { return '' }
+    $codec = [string](Get-FaultField $Facts 'video_codec')
+    $width = Get-FaultField $Facts 'width'
+    if (-not $codec -and -not $width) { return '' }
+    $audio = ConvertTo-FaultAudioText (Get-FaultField $Facts 'audio')
+    $pix = [string](Get-FaultField $Facts 'pix_fmt')
+    if (-not $pix) { $pix = '?' }
+    if (-not $codec) { $codec = '?' }
+    $duration = Get-FaultField $Facts 'duration_sec'
+    if ($null -eq $duration) { $duration = 0 }
+    $subs = Get-FaultField $Facts 'subtitles'
+    if ($null -eq $subs) { $subs = 0 }
+    $bitrate = Get-FaultField $Facts 'video_bitrate'
+    if ($null -eq $bitrate) { $bitrate = 0 }
+    $height = Get-FaultField $Facts 'height'
+    if ($null -eq $height) { $height = 0 }
+    if ($null -eq $width) { $width = 0 }
+    return "$Label`: $codec ${width}x$height pix $pix duration ${duration}s audio $audio subtitles $subs bitrate $bitrate"
+}
+
+function Get-FaultLogLines($Value) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Value) { return $lines }
+    foreach ($line in @($Value)) {
+        if ($null -eq $line) { continue }
+        $text = [string]$line
+        if ($text.Trim()) { [void]$lines.Add($text) }
+    }
+    return ,$lines
+}
+
+function Format-FaultReport {
+    param($Records, [string]$Version, [string]$System)
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add('Video Dehydrator found a file it could not finish.')
+    [void]$lines.Add('')
+    [void]$lines.Add("App version: $Version")
+    [void]$lines.Add("System: $System")
+    [void]$lines.Add('The original file was left in place. The new file was not kept.')
+    [void]$lines.Add('This report is an encode failure or an end-check failure. A file that was only not smaller is not listed.')
+    [void]$lines.Add('')
+    foreach ($record in @($Records)) {
+        if ($null -eq $record) { continue }
+        $name = [string](Get-FaultField $record 'name')
+        if (-not $name) { $name = [IO.Path]::GetFileName([string](Get-FaultField $record 'source')) }
+        if (-not $name) { $name = 'file' }
+        [void]$lines.Add("## $name")
+        [void]$lines.Add('When: ' + [string](Get-FaultField $record 'when'))
+        [void]$lines.Add('Kind: ' + [string](Get-FaultField $record 'kind'))
+        [void]$lines.Add('Path: ' + [string](Get-FaultField $record 'source'))
+        $size = Get-FaultField $record 'size_bytes'
+        if ($null -eq $size) { $size = 0 }
+        [void]$lines.Add("Size: $size bytes")
+        $modified = [string](Get-FaultField $record 'modified')
+        if ($modified) { [void]$lines.Add("Modified: $modified") }
+        $kbps = Get-FaultField $record 'kbps'
+        if ($null -eq $kbps) { $kbps = 0 }
+        [void]$lines.Add("Target: $kbps kbps")
+        [void]$lines.Add('Parallel jobs: ' + [string](Get-FaultField $record 'jobs'))
+        $reencode = Get-FaultField $record 'reencode_audio'
+        [void]$lines.Add('Re-encode audio: ' + $(if ($reencode) { 'yes' } else { 'no' }))
+        $auto = Get-FaultField $record 'auto_delete'
+        [void]$lines.Add('Delete originals: ' + $(if ($auto) { 'yes' } else { 'no' }))
+        $code = Get-FaultField $record 'handbrake_code'
+        $codeText = ''
+        if ($null -ne $code -and [string]$code -ne '') { $codeText = [string]$code }
+        [void]$lines.Add("HandBrake exit: $codeText")
+        $oldBytes = Get-FaultField $record 'old_bytes'
+        if ($null -eq $oldBytes) { $oldBytes = 0 }
+        $newBytes = Get-FaultField $record 'new_bytes'
+        if ($null -eq $newBytes) { $newBytes = 0 }
+        [void]$lines.Add("Old size: $oldBytes bytes")
+        [void]$lines.Add("New size: $newBytes bytes")
+        $oldRate = ConvertTo-FaultRateText (Get-FaultField $record 'old_gibph')
+        $newRate = ConvertTo-FaultRateText (Get-FaultField $record 'new_gibph')
+        if ($oldRate) { [void]$lines.Add("Old GiB/h: $oldRate") }
+        if ($newRate) { [void]$lines.Add("New GiB/h: $newRate") }
+        [void]$lines.Add('Reason: ' + [string](Get-FaultField $record 'reason'))
+        $sourceLine = Format-ProbeLine 'Source probe' (Get-FaultField $record 'source_probe')
+        $outputLine = Format-ProbeLine 'Output probe' (Get-FaultField $record 'output_probe')
+        if ($sourceLine) { [void]$lines.Add($sourceLine) }
+        if ($outputLine) { [void]$lines.Add($outputLine) }
+        $command = [string](Get-FaultField $record 'command')
+        if ($command) { [void]$lines.Add('Command: ' + $command) }
+        $media = ([string](Get-FaultField $record 'media')).Trim()
+        if ($media) {
+            [void]$lines.Add('ffprobe:')
+            [void]$lines.Add($media)
+        }
+        $notes = Get-FaultLogLines (Get-FaultField $record 'log')
+        if ($notes.Count -gt 0) {
+            [void]$lines.Add('HandBrake notes:')
+            foreach ($note in $notes) { [void]$lines.Add($note) }
+        }
+        [void]$lines.Add('')
+    }
+    return (($lines -join "`n").TrimEnd() + "`n")
+}
+
+function Get-FaultIssueUrl([string]$Title, [string]$Body) {
+    $titlePart = [uri]::EscapeDataString([string]$Title)
+    $bodyPart = ''
+    try { $bodyPart = [uri]::EscapeDataString([string]$Body) }
+    catch {
+        # EscapeDataString refuses a string that would make a huge URL.
+        # A stand-in keeps the shrink loop going until the notes fit.
+        return ('x' * ([int]$script:FaultUrlLimit + 1))
+    }
+    return $script:FaultIssueUrl + '?title=' + $titlePart + '&body=' + $bodyPart
+}
+
+function Get-FaultRows($Records) {
+    $rows = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Records) { return $rows }
+    foreach ($row in $Records) {
+        if ($null -ne $row) { [void]$rows.Add($row) }
+    }
+    return ,$rows
+}
+
+function Test-ShrinkFaultReport($Records) {
+    $rows = Get-FaultRows $Records
+    for ($n = 0; $n -lt $rows.Count; $n++) {
+        $row = $rows[$n]
+        $log = Get-FaultLogLines (Get-FaultField $row 'log')
+        if ($log.Count -gt 4) {
+            $kept = New-Object System.Collections.Generic.List[string]
+            $half = [int]($log.Count / 2)
+            for ($i = $half; $i -lt $log.Count; $i++) { [void]$kept.Add($log[$i]) }
+            Set-FaultField $row 'log' $kept.ToArray()
+            return $true
+        }
+    }
+    for ($n = 0; $n -lt $rows.Count; $n++) {
+        $row = $rows[$n]
+        $log = Get-FaultLogLines (Get-FaultField $row 'log')
+        if ($log.Count -gt 0) {
+            Set-FaultField $row 'log' @()
+            return $true
+        }
+    }
+    for ($n = 0; $n -lt $rows.Count; $n++) {
+        $row = $rows[$n]
+        $media = [string](Get-FaultField $row 'media')
+        if ($media.Length -gt 400) {
+            $take = [Math]::Max(200, [int]($media.Length / 2))
+            Set-FaultField $row 'media' $media.Substring(0, $take)
+            return $true
+        }
+    }
+    for ($n = 0; $n -lt $rows.Count; $n++) {
+        $row = $rows[$n]
+        if ([string](Get-FaultField $row 'media')) {
+            Set-FaultField $row 'media' ''
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-FaultIssueRequest {
+    param($Records, [string]$Version, [string]$System, [int]$Limit = 0)
+    if ($Limit -le 0) { $Limit = [int]$script:FaultUrlLimit }
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($row in @($Records)) {
+        if ($null -eq $row) { continue }
+        $name = [string](Get-FaultField $row 'name')
+        if (-not $name) { $name = 'file' }
+        [void]$names.Add($name)
+    }
+    $title = 'Faulty source file'
+    if ($names.Count -eq 1) { $title = 'Faulty source file: ' + $names[0] }
+    elseif ($names.Count -gt 1) { $title = "Faulty source files ($($names.Count))" }
+    $working = New-Object System.Collections.Generic.List[object]
+    foreach ($row in @($Records)) {
+        if ($null -eq $row) { continue }
+        [void]$working.Add((Copy-FaultRecord $row))
+    }
+    $body = Format-FaultReport -Records @($working.ToArray()) -Version $Version -System $System
+    $url = Get-FaultIssueUrl $title $body
+    $trimmed = $false
+    while ($url.Length -gt $Limit -and (Test-ShrinkFaultReport $working)) {
+        $trimmed = $true
+        $body = (Format-FaultReport -Records @($working.ToArray()) -Version $Version -System $System).TrimEnd() + "`n`nHandBrake notes were shortened so this link would open.`n"
+        $url = Get-FaultIssueUrl $title $body
+    }
+    return [pscustomobject]@{ Title = $title; Body = $body; Url = $url; Trimmed = [bool]$trimmed }
+}
+
 function Assert-Engine {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
@@ -3577,6 +4039,60 @@ function Invoke-EngineSelfTest {
     Assert-Engine (Test-HarmlessDecodeNote '') 'an empty decode note is harmless'
     Assert-Engine (-not (Test-HarmlessDecodeNote '[null @ 0000028ef7cc3f80] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 10 >= 4')) 'a backwards timestamp is not harmless'
     Assert-Engine (-not (Test-HarmlessDecodeNote ($sameStamp + ' | Error while decoding stream'))) 'another decode message is not harmless'
+    $aacNoise = '[aac @ 0xf8f3180] noise_facs_q 255 is invalid'
+    $aacEnv = '[aac @ 0x46d12c00] env_facs_q 254 is invalid'
+    Assert-Engine (Test-HarmlessDecodeNote $aacNoise) 'a recovered HE-AAC noise factor warning is harmless'
+    Assert-Engine (Test-HarmlessDecodeNote ($aacEnv + ' | Last message repeated 3 times')) 'an HE-AAC envelope warning and its repeat are harmless'
+    Assert-Engine (Test-HarmlessDecodeNote ($aacNoise + ' | ' + $aacEnv + ' | Application provided invalid, non monotonically increasing dts to muxer in stream 0: 210 >= 210')) 'HE-AAC factor warnings plus an equal timestamp are harmless'
+    Assert-Engine (-not (Test-HarmlessDecodeNote ($aacNoise + ' | [mpeg4 @ 00000001] error while decoding'))) 'a picture error stays a failure beside the HE-AAC note'
+    Assert-Engine (-not (Test-HarmlessDecodeNote '[aac @ 0xf8f3180] Prediction is not allowed in AAC-LC')) 'another AAC error stays a failure'
+    Assert-Engine (-not (Test-HarmlessDecodeNote 'Last message repeated 3 times | [h264 @ 00000001] error while decoding')) 'a repeated line does not hide a picture error'
+    $keptNotes = @(Get-UsefulHandBrakeLines "Encoding: task 1 of 2, 10.00 %`n[error] Could not open the source`nMuxing: 50 %")
+    Assert-Engine ($keptNotes.Count -eq 1 -and $keptNotes[0] -eq '[error] Could not open the source') 'a fault report keeps the HandBrake error and drops the percent lines'
+    $fault = [pscustomobject]@{
+        when = '2026-11-11T16:42:27'
+        kind = 'check'
+        source = 'Z:\Movies\The Stingiest Man in Town (1978).mp4'
+        name = 'The Stingiest Man in Town (1978).mp4'
+        reason = 'duration changed from 2993.8s to 2985.6s'
+        size_bytes = 427543074
+        modified = '2026-11-01T12:00:00'
+        kbps = 500
+        jobs = 4
+        reencode_audio = $false
+        auto_delete = $true
+        handbrake_code = 0
+        command = 'HandBrakeCLI -i "Z:\Movies\The Stingiest Man in Town (1978).mp4"'
+        old_bytes = 427543074
+        new_bytes = 236000000
+        old_gibph = 0.479
+        new_gibph = 0.265
+        source_probe = [pscustomobject]@{ video_codec = 'h264'; width = 720; height = 480; pix_fmt = 'yuv420p'; duration_sec = 2993.791; audio = @('aac'); subtitles = 0; video_bitrate = 1000000 }
+        output_probe = [pscustomobject]@{ video_codec = 'hevc'; width = 720; height = 480; pix_fmt = 'yuv420p'; duration_sec = 2985.6; audio = @('aac'); subtitles = 0; video_bitrate = 500000 }
+        media = 'stream|codec_name=h264|nb_frames=89724|duration=2993.790800'
+        log = @('Encode done')
+    }
+    $report = Format-FaultReport -Records @($fault) -Version '1.0.10' -System 'Windows 11 (build 1)'
+    Assert-Engine ($report -match 'App version: 1\.0\.10') 'a fault report names the app version'
+    Assert-Engine ($report -match 'The Stingiest Man in Town \(1978\)\.mp4' -and $report -match 'duration changed from 2993\.8s to 2985\.6s') 'a fault report names the file and the failure'
+    Assert-Engine ($report -match 'nb_frames=89724' -and $report -match 'HandBrakeCLI' -and $report -match 'h264 720x480') 'a fault report includes the probe and the command'
+    Assert-Engine ($report -match 'original file was left in place') 'a fault report says the original stayed'
+    $issue = Get-FaultIssueRequest -Records @($fault) -Version '1.0.10' -System 'Windows 11 (build 1)'
+    Assert-Engine ($issue.Url.StartsWith($script:FaultIssueUrl + '?title=')) 'a fault report opens a Windows GitHub issue'
+    Assert-Engine ($issue.Url -match 'body=' -and $issue.Url -match 'duration%20changed') 'the issue link carries the failure'
+    $fatLog = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt 400; $i++) { [void]$fatLog.Add(('note ' + $i + (' x' * 80))) }
+    $fat = Copy-FaultRecord $fault
+    $fat['log'] = @($fatLog.ToArray())
+    $short = Get-FaultIssueRequest -Records @($fat) -Version '1.0.10' -System 'Windows 11 (build 1)' -Limit 2500
+    Assert-Engine ($short.Url.Length -le 2500 -and $short.Trimmed) 'a long HandBrake log shrinks to fit the link'
+    Assert-Engine ($short.Body -match 'duration changed from 2993\.8s to 2985\.6s') 'a shortened report still has the failure'
+    $again = Copy-FaultRecord $fault
+    $again['reason'] = 'HandBrake stopped (3).'
+    $merged = Merge-FaultRow -Rows @($fault) -Record $again
+    Assert-Engine ($merged.Count -eq 1 -and ([string](Get-FaultField $merged[0] 'reason')) -eq 'HandBrake stopped (3).') 'a later failure replaces the same file'
+    $made = New-FaultRecord -Kind 'check' -Source 'C:\missing\does-not-exist.mkv' -Reason "duration changed from 10s to 3s" -Kbps 200 -Jobs 1
+    Assert-Engine ($made.kind -eq 'check' -and $made.reason.StartsWith('duration changed') -and $made.name -eq 'does-not-exist.mkv') 'a fault record keeps the kind and the file name'
     $ac3Tail = 'decode Last exit=-1094995529 [ac3 @ 00000200d45dad40] incomplete frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] corrupt decoded frame | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Error processing packet in decoder: Invalid data found when processing input | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Task finished with error code: -1094995529 (Invalid data found when processing input) | [aist#0:1/ac3 @ 00000200d2731900] [dec:ac3 @ 00000200d45b9b40] Terminating thread with return code -1094995529 (Invalid data found when processing input)'
     Assert-Engine (Test-TrailingAc3Note $ac3Tail) 'one trailing incomplete AC3 frame is the allowed note'
     $mixedTail = 'decode Last exit=-1094995529 ' + $sameStamp + ' | ' + ($ac3Tail -replace '^decode Last exit=-1094995529\s+', '')

@@ -446,12 +446,14 @@ $script:SettingsPath = Join-Path $script:AppDir 'settings.json'
 $script:PendingPath = Join-Path $script:AppDir 'pending.json'
 $script:SkipPath = Join-Path $script:AppDir 'skipped.json'
 $script:SkipRows = @()
+$script:FaultPath = Join-Path $script:AppDir 'faults.json'
+$script:FaultRows = @()
 $script:ConvertLogPath = Join-Path $script:AppDir 'convert-log.tsv'
 $script:ConversionLogPath = Join-Path $script:AppDir 'conversion-log.md'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.9.6'
+$script:UpdateFallback = '1.0.10'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -735,6 +737,12 @@ function Update-ButtonFace($btn) {
         $btn.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(252, 165, 165)
         $btn.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(254, 242, 242)
         $btn.FlatAppearance.MouseDownBackColor = [Drawing.Color]::FromArgb(254, 226, 226)
+    } elseif ($role -eq 'alert') {
+        $btn.BackColor = [Drawing.Color]::FromArgb(185, 28, 28)
+        $btn.ForeColor = [Drawing.Color]::White
+        $btn.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(185, 28, 28)
+        $btn.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(153, 27, 27)
+        $btn.FlatAppearance.MouseDownBackColor = [Drawing.Color]::FromArgb(127, 29, 29)
     } else {
         $btn.BackColor = [Drawing.Color]::White
         $btn.ForeColor = $script:ColorInk
@@ -755,7 +763,7 @@ function New-Button([string]$text, [string]$role, [int]$width, [int]$height) {
     $btn.Cursor = [Windows.Forms.Cursors]::Hand
     $btn.UseVisualStyleBackColor = $false
     $btn.Margin = New-Object Windows.Forms.Padding(0, 4, 8, 0)
-    if ($role -eq 'primary') { $btn.Font = $script:FontButtonBold } else { $btn.Font = $script:FontButton }
+    if ($role -eq 'primary' -or $role -eq 'alert') { $btn.Font = $script:FontButtonBold } else { $btn.Font = $script:FontButton }
     $btn.Add_EnabledChanged({ Update-ButtonFace $this })
     Update-ButtonFace $btn
     return $btn
@@ -2937,6 +2945,7 @@ function Start-EncodeProcess {
     $Lane.Percent = 0
     $Lane.Pass = ''
     $Lane.SinglePass = [bool]$SinglePass
+    $Lane.CommandLine = ConvertTo-ArgumentLine (@($script:HandBrake) + @($arguments))
     if ($script:DetailedCheck.Checked) {
         $shown = [IO.Path]::GetFileName($Plan.Source) + '  ' + (ConvertTo-ArgumentLine (@($script:HandBrake) + $arguments))
         if ((Get-JobCount) -le 1) { $shown = ConvertTo-ArgumentLine (@($script:HandBrake) + $arguments) }
@@ -2998,7 +3007,27 @@ function Start-NextEncode {
         try {
             $plan = Get-ReplacePlan -Source $source
             if ($plan.Blocked) { throw "A file already has the new name: $($plan.Final)" }
+        }
+        catch {
+            $item.Tag.Status = 'Failed'
+            $item.Tag.Reason = $_.Exception.Message
+            Update-ResultRow $item
+            Write-Activity ("Could not read  " + [IO.Path]::GetFileName($source) + "  " + $_.Exception.Message) 'err'
+            continue
+        }
+        try {
             $probe = Get-MediaProbe -Ffprobe $script:Ffprobe -File $source
+        }
+        catch {
+            $item.Tag.Status = 'Failed'
+            $item.Tag.Reason = $_.Exception.Message
+            Update-ResultRow $item
+            Write-Activity ("Could not read  " + [IO.Path]::GetFileName($source) + "  " + $_.Exception.Message) 'err'
+            $unread = New-FaultRecord -Kind 'unreadable' -Source $source -Reason ([string]$_.Exception.Message) -Jobs (Get-JobCount) -ReencodeAudio:([bool]$script:ReencodeCheck.Checked) -AutoDelete:([bool]$script:AutoCheck.Checked) -Ffprobe $script:Ffprobe
+            Add-SourceFault $unread
+            continue
+        }
+        try {
             $decision = Get-BloatDecision -Probe $probe
         }
         catch {
@@ -3046,7 +3075,8 @@ function Fail-Active {
     param(
         [string]$Reason,
         $Verify,
-        $Lane
+        $Lane,
+        [string]$Kind = ''
     )
     $item = $null
     $plan = $null
@@ -3110,6 +3140,9 @@ function Fail-Active {
         Write-Activity ("Failed  $name  $Reason") 'err'
         if ($note) { Write-Activity $note 'warn' }
         Add-RunLog -Status 'FAIL' -Reason $Reason -Source $(if ($plan) { $plan.Source } else { '' }) -NewPath '' -Kept '' -Width $(if ($laneProbe) { $laneProbe.Width } else { '' }) -Height $(if ($laneProbe) { $laneProbe.Height } else { '' }) -Kbps $(if ($laneDecision) { $laneDecision.TargetKbps } else { '' })
+        if ($Kind -eq 'encode' -or $Kind -eq 'check') {
+            Add-LaneFault -Kind $Kind -Reason $Reason -Lane $Lane -Verify $Verify
+        }
     }
     if ($Lane) {
         $Lane.Item = $null
@@ -3261,7 +3294,7 @@ function Complete-ActiveEncode {
             return
         }
         $tail = Get-EncodeFailureText $laneLines
-        Fail-Active "HandBrake stopped ($exitCode). $tail" -Lane $Lane
+        Fail-Active "HandBrake stopped ($exitCode). $tail" -Lane $Lane -Kind 'encode'
         Start-NextEncode
         return
     }
@@ -3276,7 +3309,7 @@ function Complete-ActiveEncode {
     $script:Form.Refresh()
     $verify = Test-EncodedFile -Ffmpeg $script:Ffmpeg -Ffprobe $script:Ffprobe -Temp $plan.Temp -SourceProbe $laneProbe -HandBrakeLog $log -AllowAudioReencode:$laneReencode
     if (-not $verify.Ok) {
-        Fail-Active -Reason $verify.Reason -Verify $verify -Lane $Lane
+        Fail-Active -Reason $verify.Reason -Verify $verify -Lane $Lane -Kind 'check'
         Start-NextEncode
         return
     }
@@ -4890,6 +4923,199 @@ function Open-HttpLink([string]$Url) {
     Start-Process $Url
 }
 
+function Read-FaultFile {
+    if (-not (Test-Path -LiteralPath $script:FaultPath)) { return @() }
+    try {
+        $raw = [IO.File]::ReadAllText($script:FaultPath)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+        $payload = $raw | ConvertFrom-Json
+        $rows = New-Object System.Collections.Generic.List[object]
+        foreach ($row in @($payload)) {
+            if ($null -eq $row) { continue }
+            if ([string](Get-FaultField $row 'source')) { [void]$rows.Add($row) }
+        }
+        return ,$rows.ToArray()
+    }
+    catch {
+        return @()
+    }
+}
+
+function Write-FaultFile {
+    $rows = @($script:FaultRows | Where-Object { $_ -and [string](Get-FaultField $_ 'source') })
+    if ($rows.Count -eq 0) {
+        if (Test-Path -LiteralPath $script:FaultPath) { Remove-Item -LiteralPath $script:FaultPath -Force }
+        return
+    }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($row in $rows) { [void]$parts.Add(($row | ConvertTo-Json -Depth 8 -Compress)) }
+    $json = '[' + ($parts -join ',') + ']'
+    $utf8 = New-Object System.Text.UTF8Encoding $true
+    [IO.File]::WriteAllText($script:FaultPath, $json, $utf8)
+}
+
+function Update-FaultButton {
+    $rows = @($script:FaultRows | Where-Object { $_ -and [string](Get-FaultField $_ 'source') })
+    $count = $rows.Count
+    $button = $script:FaultButton
+    if (-not $button) { return }
+    $button.Enabled = ($count -gt 0)
+    if ($count -gt 1) { $button.Text = "Faulty source file ($count)" }
+    else { $button.Text = 'Faulty source file' }
+    $wanted = 196
+    if ($count -gt 1) { $wanted = 230 }
+    $resized = ($button.Width -ne $wanted)
+    if ($resized) { $button.Width = $wanted }
+    if ($count -eq 1) { Set-Tip $button '1 file failed. Click to open a GitHub report with the file and the log.' }
+    elseif ($count -gt 1) { Set-Tip $button "$count files failed. Click to open a GitHub report with the files and the logs." }
+    else { Set-Tip $button 'Turns red when a file fails the encode or the end check.' }
+    if ($resized) { Update-ChromeLayout }
+}
+
+function Add-SourceFault($Record) {
+    if ($null -eq $Record) { return }
+    if (-not [string](Get-FaultField $Record 'source')) { return }
+    $script:FaultRows = Merge-FaultRow -Rows $script:FaultRows -Record $Record
+    Write-FaultFile
+    Update-FaultButton
+    $name = [string](Get-FaultField $Record 'name')
+    if (-not $name) { $name = 'file' }
+    Write-Activity "Faulty source file: $name. The red button can open a GitHub report." 'err'
+}
+
+function Add-LaneFault {
+    param(
+        [string]$Kind,
+        [string]$Reason,
+        $Lane,
+        $Verify
+    )
+    if ($Kind -ne 'encode' -and $Kind -ne 'check') { return }
+    if ($Kind -eq 'check' -and (Test-SizeSkipReason $Reason)) { return }
+    if (-not $Lane -or -not $Lane.Plan) { return }
+    $source = [string]$Lane.Plan.Source
+    if (-not $source) { return }
+    $log = ''
+    if ($Lane.Lines) { $log = (@($Lane.Lines) -join "`n") }
+    $code = $null
+    if ($Lane.Pump) { $code = [int]$Lane.Pump.ExitCode }
+    $oldBytes = [int64]0
+    $newBytes = [int64]0
+    $oldRate = $null
+    $newRate = $null
+    $kbps = 0
+    if ($Lane.Probe) { $oldBytes = [int64]$Lane.Probe.SizeBytes }
+    if ($Lane.Decision -and $Lane.Decision.TargetKbps) { $kbps = [int]$Lane.Decision.TargetKbps }
+    if ($Verify) {
+        if ($null -ne (Get-NoteProperty $Verify 'NewBytes')) { $newBytes = [int64]$Verify.NewBytes }
+        $oldRate = $Verify.OldGiBph
+        $newRate = $Verify.NewGiBph
+    }
+    $outProbe = $null
+    if ($Verify) { $outProbe = $Verify.OutProbe }
+    $jobs = 1
+    try { $jobs = Get-JobCount } catch { $jobs = 1 }
+    $auto = $false
+    if ($script:AutoCheck) { $auto = [bool]$script:AutoCheck.Checked }
+    $record = New-FaultRecord -Kind $Kind -Source $source -Reason $Reason -Probe $Lane.Probe -OutProbe $outProbe -OldBytes $oldBytes -NewBytes $newBytes -OldGiBph $oldRate -NewGiBph $newRate -Kbps $kbps -Command ([string]$Lane.CommandLine) -HandBrakeLog $log -HandBrakeCode $code -Jobs $jobs -ReencodeAudio:([bool]$Lane.ReencodeAudio) -AutoDelete:$auto -Ffprobe $script:Ffprobe
+    Add-SourceFault $record
+}
+
+function Show-FaultReport {
+    $records = @($script:FaultRows | Where-Object { $_ -and [string](Get-FaultField $_ 'source') })
+    if ($records.Count -lt 1) {
+        Update-FaultButton
+        return
+    }
+    $full = Format-FaultReport -Records $records -Version (Get-AppVersion) -System (Get-WindowsLabel)
+    $issue = Get-FaultIssueRequest -Records $records -Version (Get-AppVersion) -System (Get-WindowsLabel)
+    $form = New-Object Windows.Forms.Form
+    $form.Text = 'Faulty source file'
+    $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.StartPosition = 'CenterParent'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $false
+    $form.KeyPreview = $true
+    $form.ClientSize = New-Object Drawing.Size(640, 420)
+    $form.Font = $script:FontUi
+    $form.BackColor = [Drawing.Color]::White
+    $icon = Get-AppIcon
+    if ($icon) { $form.Icon = $icon }
+    $word = if ($records.Count -eq 1) { 'file' } else { 'files' }
+    $label = New-Object Windows.Forms.Label
+    $label.Font = $script:FontUi
+    $label.ForeColor = $script:ColorInk
+    $label.BackColor = [Drawing.Color]::White
+    $label.SetBounds(16, 12, 608, 88)
+    $label.Text = "$($records.Count) $word failed the encode or the end check. The original stayed in place.`r`n`r`nOpen GitHub report fills in a new issue with the path, the probe, the failure, the encode command, and the HandBrake notes. You submit it on the GitHub page. This program does not send it. The same report is copied, in case the page cuts it off."
+    $listing = New-Object Windows.Forms.TextBox
+    $listing.Multiline = $true
+    $listing.ReadOnly = $true
+    $listing.ScrollBars = 'Vertical'
+    $listing.Font = $script:FontUi
+    $listing.SetBounds(16, 108, 608, 210)
+    $shown = New-Object System.Collections.Generic.List[string]
+    foreach ($record in $records) {
+        $reason = [string](Get-FaultField $record 'reason')
+        if ($reason.Length -gt 180) { $reason = $reason.Substring(0, 180) + '...' }
+        $fileName = [string](Get-FaultField $record 'name')
+        if (-not $fileName) { $fileName = 'file' }
+        [void]$shown.Add($fileName)
+        [void]$shown.Add($reason)
+        [void]$shown.Add('')
+    }
+    $listing.Text = ($shown -join "`r`n").TrimEnd()
+    $note = New-Object Windows.Forms.Label
+    $note.Font = $script:FontUi
+    $note.ForeColor = $script:ColorInk
+    $note.BackColor = [Drawing.Color]::White
+    $note.SetBounds(16, 324, 608, 36)
+    $note.Text = 'The HandBrake notes in the link are shortened. The copy has the full notes.'
+    $note.Visible = [bool]$issue.Trimmed
+    $open = New-Button 'Open GitHub report' 'primary' 180 34
+    $cancel = New-Button 'Not now' 'secondary' 110 34
+    $open.SetBounds(318, 368, 180, 34)
+    $cancel.SetBounds(506, 368, 110, 34)
+    $form.Controls.Add($label)
+    $form.Controls.Add($listing)
+    $form.Controls.Add($note)
+    $form.Controls.Add($open)
+    $form.Controls.Add($cancel)
+    $state = [pscustomobject]@{ Open = $false }
+    $form.Tag = $state
+    $form.AcceptButton = $open
+    $form.CancelButton = $cancel
+    $open.Add_Click({
+        $state.Open = $true
+        $form.DialogResult = [Windows.Forms.DialogResult]::OK
+        $form.Close()
+    }.GetNewClosure())
+    $cancel.Add_Click({
+        $state.Open = $false
+        $form.DialogResult = [Windows.Forms.DialogResult]::Cancel
+        $form.Close()
+    }.GetNewClosure())
+    try { [void]$form.ShowDialog($script:Form) }
+    finally { if (-not $form.IsDisposed) { $form.Dispose() } }
+    if (-not $state.Open) { return }
+    try { [Windows.Forms.Clipboard]::SetText($full) } catch { }
+    Open-HttpLink $issue.Url
+    $answer = [Windows.Forms.MessageBox]::Show(
+        $script:Form,
+        "The GitHub page is open and the report is on the clipboard.`r`n`r`nTurn the alert off after you submit the issue?",
+        'Faulty source file',
+        [Windows.Forms.MessageBoxButtons]::YesNo,
+        [Windows.Forms.MessageBoxIcon]::Question,
+        [Windows.Forms.MessageBoxDefaultButton]::Button2
+    )
+    if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
+    $script:FaultRows = @()
+    Write-FaultFile
+    Update-FaultButton
+    Write-Activity 'Fault report opened. The alert is off.' 'text'
+}
+
 function Get-AppVersion {
     $path = Join-Path $script:AppDir 'version.txt'
     if (Test-Path -LiteralPath $path) {
@@ -5552,7 +5778,12 @@ function Update-ChromeLayout {
             if ($script:ReportBugButton -and $script:DonateButton) {
                 $script:ReportBugButton.Location = New-Object Drawing.Point(($right - $script:ReportBugButton.Width), 60)
                 $script:DonateButton.Location = New-Object Drawing.Point(($script:ReportBugButton.Left - 8 - $script:DonateButton.Width), 60)
-                if ($script:DonateButton.Left -lt $leftEdge) { $leftEdge = $script:DonateButton.Left }
+                $rowLeft = $script:DonateButton.Left
+                if ($script:FaultButton) {
+                    $script:FaultButton.Location = New-Object Drawing.Point(($script:DonateButton.Left - 8 - $script:FaultButton.Width), 60)
+                    $rowLeft = $script:FaultButton.Left
+                }
+                if ($rowLeft -lt $leftEdge) { $leftEdge = $rowLeft }
             }
             $reserve = $header.ClientSize.Width - $leftEdge + 16
         }
@@ -5690,7 +5921,7 @@ Keep an SSH path in single quotes. A name with an apostrophe needs the quotes cl
         },
         @{
             Title = 'Updates'
-            Body = "The bottom right corner shows this copy's version.`r`n`r`nThe program checks for updates when it opens. Check for updates looks again. When a newer version is found, a window tells you once. Closing that window keeps it from opening again until a later version is published. The status line keeps saying that version is available. Update downloads it and opens the setup program. The setup replaces the installed copy and keeps your settings. The setup asks whether to create a Start menu shortcut and whether to create a desktop shortcut.`r`n`r`nFinish or cancel the current job before you update. The program closes while the setup runs, then you can open it again.`r`n`r`nDonate opens a tip page. The program stays free. A tip of `$5` or more can include a feature suggestion on that page. Report a bug opens a GitHub page with this version and the Windows version filled in. Include latest activity is a choice on that step. Leave it unchecked and nothing else is added. The latest lines from the activity box can include folder paths. This program does not send the report. You submit it on the GitHub page."
+            Body = "The bottom right corner shows this copy's version.`r`n`r`nThe program checks for updates when it opens. Check for updates looks again. When a newer version is found, a window tells you once. Closing that window keeps it from opening again until a later version is published. The status line keeps saying that version is available. Update downloads it and opens the setup program. The setup replaces the installed copy and keeps your settings. The setup asks whether to create a Start menu shortcut and whether to create a desktop shortcut.`r`n`r`nFinish or cancel the current job before you update. The program closes while the setup runs, then you can open it again.`r`n`r`nDonate opens a tip page. The program stays free. A tip of `$5` or more can include a feature suggestion on that page. Report a bug opens a GitHub page with this version and the Windows version filled in. Include latest activity is a choice on that step. Leave it unchecked and nothing else is added. The latest lines from the activity box can include folder paths. This program does not send the report. You submit it on the GitHub page.`r`n`r`nFaulty source file stays off until a file fails the encode or the end check. It then turns red. A file that is only not smaller does not turn it on. Click it to open a GitHub issue with the file path, the probe, the failure, the encode command, and the HandBrake notes. You submit that issue on the GitHub page. The alert stays on until you say you submitted it."
         },
         @{
             Title = 'What is in this folder'
@@ -5917,12 +6148,15 @@ $script:UpdateButton = New-Button 'Update' 'primary' 100 34
 $script:UpdateButton.Enabled = $false
 $script:DonateButton = New-Button 'Donate' 'secondary' 96 28
 $script:ReportBugButton = New-Button 'Report a bug' 'secondary' 132 28
+$script:FaultButton = New-Button 'Faulty source file' 'alert' 196 28
+$script:FaultButton.Enabled = $false
 $script:Header.Controls.Add($script:TitleLabel)
 $script:Header.Controls.Add($script:SubtitleLabel)
 $script:Header.Controls.Add($script:CheckUpdateButton)
 $script:Header.Controls.Add($script:UpdateButton)
 $script:Header.Controls.Add($script:DonateButton)
 $script:Header.Controls.Add($script:ReportBugButton)
+$script:Header.Controls.Add($script:FaultButton)
 
 $script:StatusPanel = New-Object Windows.Forms.Panel
 $script:StatusPanel.Dock = 'Bottom'
@@ -6513,6 +6747,7 @@ $script:HelpButton.Add_Click({ Show-Help })
 $script:CheckUpdateButton.Add_Click({ Start-UpdateCheck })
 $script:DonateButton.Add_Click({ Open-HttpLink 'https://ko-fi.com/philipvern' })
 $script:ReportBugButton.Add_Click({ Show-BugReport })
+$script:FaultButton.Add_Click({ Show-FaultReport })
 $script:UpdateButton.Add_Click({ Start-UpdateInstall })
 
 $activityLabel = New-Object Windows.Forms.Label
@@ -6717,6 +6952,7 @@ Set-Tip $script:HelpButton 'Open the guide, including how to clear a drive recyc
 Set-Tip $script:CheckUpdateButton 'Look on GitHub for a newer version.'
 Set-Tip $script:DonateButton 'Free forever. Tips of $5 or more can include a feature suggestion.'
 Set-Tip $script:ReportBugButton 'Open a GitHub bug report with this version filled in.'
+Set-Tip $script:FaultButton 'Turns red when a file fails the encode or the end check.'
 Set-Tip $script:UpdateButton 'Download the newer version and open its setup. This window closes while that runs.'
 Set-Tip $script:FolderPick 'Folders with files to shrink. Pick one for a smaller job.'
 Set-Tip $script:SelectFolderButton 'Check the files in this folder and clear the other checks.'
@@ -6841,6 +7077,9 @@ $script:PlayTimer.Add_Tick({
 })
 
 $script:SkipRows = @(Read-SkipFile)
+$loadedFaults = Read-FaultFile
+if ($null -eq $loadedFaults) { $script:FaultRows = @() } else { $script:FaultRows = $loadedFaults }
+Update-FaultButton
 Add-PendingRows
 Write-Welcome
 $waiting = @($script:Files.Items | Where-Object { [string]$_.Tag.Status -eq 'Ready to delete' })
@@ -7637,7 +7876,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.9.6') 'Version file was not 1.0.9.6'
+    Assert-True ((Get-AppVersion) -eq '1.0.10') 'Version file was not 1.0.10'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -7648,7 +7887,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.0\.9\.6') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.0\.10') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'
@@ -7882,6 +8121,25 @@ function Invoke-SmokeTest {
     Assert-True ($script:UpdateButton.Right -le ($script:Header.ClientSize.Width - 8)) 'Update sits outside the header'
     Assert-True ($script:ReportBugButton.Right -le ($script:Header.ClientSize.Width - 8)) 'Report a bug sits outside the header'
     Assert-True ($script:DonateButton.Right -le ($script:ReportBugButton.Left + 1)) 'Donate overlaps Report a bug'
+    Assert-True ($script:FaultButton.Text -eq 'Faulty source file') 'Faulty source file was missing'
+    Assert-True (-not $script:FaultButton.Enabled) 'Faulty source file started turned on'
+    Assert-True ($script:FaultButton.Parent -eq $script:Header) 'Faulty source file is not in the header'
+    Assert-True ($script:FaultButton.Right -le ($script:DonateButton.Left + 1)) 'Faulty source file overlaps Donate'
+    Assert-True ($script:TitleLabel.Right -le $script:FaultButton.Left) 'The title overlaps Faulty source file'
+    Assert-True ($script:HelpBox.Text -match 'Faulty source file stays off until a file fails') 'The guide was missing the faulty source button'
+    $script:FaultRows = @([pscustomobject]@{ source = 'C:\Show\A.mkv'; name = 'A.mkv'; reason = 'duration changed from 10s to 3s' })
+    Update-FaultButton
+    Assert-True ($script:FaultButton.Enabled) 'Faulty source file stayed off after a failure'
+    Assert-True ($script:FaultButton.BackColor.R -eq 185 -and $script:FaultButton.ForeColor.R -eq 255) 'Faulty source file did not turn red'
+    $script:FaultRows = @(
+        [pscustomobject]@{ source = 'C:\Show\A.mkv'; name = 'A.mkv'; reason = 'one' },
+        [pscustomobject]@{ source = 'C:\Show\B.mkv'; name = 'B.mkv'; reason = 'two' }
+    )
+    Update-FaultButton
+    Assert-True ($script:FaultButton.Text -eq 'Faulty source file (2)') 'Faulty source file hid the count'
+    $script:FaultRows = @()
+    Update-FaultButton
+    Assert-True (-not $script:FaultButton.Enabled) 'Faulty source file stayed on after it was cleared'
     Assert-True ($script:DonateButton.Top -ge $script:UpdateButton.Bottom) 'Donate overlaps the update buttons'
     Assert-True ($script:TitleLabel.Right -le $script:DonateButton.Left) 'The title overlaps Donate'
     Assert-True ($script:VersionLabel.Right -le ($script:StatusPanel.ClientSize.Width - 8)) 'Version sits outside the status bar'
