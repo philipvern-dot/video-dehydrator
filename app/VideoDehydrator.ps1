@@ -453,7 +453,7 @@ $script:ConversionLogPath = Join-Path $script:AppDir 'conversion-log.md'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.0.10'
+$script:UpdateFallback = '1.1.0'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -6241,6 +6241,7 @@ for ($i = 0; $i -lt 6; $i++) {
         Percent = [double]0
         Pass = ''
         SinglePass = $false
+        CommandLine = ''
         OutputRetries = 0
         Row = $jobRow
     }
@@ -7790,6 +7791,12 @@ function Invoke-SmokeTest {
     Start-Sleep -Milliseconds 200
     Save-FormImage $script:HelpForm (Join-Path $env:TEMP 'vdh-help.png')
     Assert-True (@($script:Lanes).Count -eq 6) 'Encode lanes did not go to six'
+    foreach ($lane in @($script:Lanes)) {
+        Assert-True ($null -ne $lane.PSObject.Properties['CommandLine']) 'An encode lane was created without a command line'
+        $lane.CommandLine = 'HandBrakeCLI.exe --encoder x265'
+        Assert-True ([string]$lane.CommandLine -eq 'HandBrakeCLI.exe --encoder x265') 'The encode lane refused its command line'
+        $lane.CommandLine = ''
+    }
     Assert-True (@($script:JobRows).Count -eq 6) 'Job bars did not go to six'
     Assert-True ($script:JobBox.Items.Count -eq 6) 'Jobs at once is missing a level'
     Assert-True ([string]$script:JobBox.Items[0] -eq '1') 'Jobs at once does not start at one'
@@ -7876,7 +7883,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.0.10') 'Version file was not 1.0.10'
+    Assert-True ((Get-AppVersion) -eq '1.1.0') 'Version file was not 1.1.0'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -7887,7 +7894,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.0\.10') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.1\.0') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'
