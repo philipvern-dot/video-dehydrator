@@ -453,7 +453,7 @@ $script:ConversionLogPath = Join-Path $script:AppDir 'conversion-log.md'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.1.2'
+$script:UpdateFallback = '1.1.3'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -1143,6 +1143,7 @@ function Load-Settings {
         ColumnOrder = @()
         ListExtra = 0
         LogExtra = 0
+        JobExtra = 0
         ParallelJobs = $false
         JobCount = 1
         DynamicJobs = $false
@@ -1212,6 +1213,15 @@ function Load-Settings {
                 $defaults.LogExtra = $logExtra
             }
         }
+        if ($null -ne $json.jobExtra) {
+            $rawJob = [string]$json.jobExtra
+            if ($rawJob -match '^-?\d+$') {
+                $jobExtra = [int]$rawJob
+                if ($jobExtra -gt 800) { $jobExtra = 800 }
+                if ($jobExtra -lt -400) { $jobExtra = -400 }
+                $defaults.JobExtra = $jobExtra
+            }
+        }
         if ($null -ne $json.listExtra) {
             $rawExtra = [string]$json.listExtra
             if ($rawExtra -match '^-?\d+$') {
@@ -1254,6 +1264,7 @@ function Save-Settings {
         columnOrder = @($script:ColumnOrder)
         listExtra = [int]$script:ListExtra
         logExtra = [int]$script:LogExtra
+        jobExtra = [int]$script:JobExtra
         jobCount = (Get-JobCount)
         parallelJobs = ((Get-JobCount) -gt 1)
         dynamicJobs = (Test-DynamicJobs)
@@ -3364,7 +3375,11 @@ function Update-JobBars {
     if ($script:JobHost) { $script:JobHost.Visible = $show }
     if ($script:ProgressTrack) { $script:ProgressTrack.Visible = -not $show }
     if (-not $show) {
-        if ($script:JobHost) { $script:JobHost.Height = 0 }
+        if ($script:JobHost) {
+            $script:JobHost.Height = 0
+            $script:JobHost.AutoScroll = $false
+            $script:JobHost.AutoScrollMinSize = New-Object Drawing.Size(0, 0)
+        }
     } else {
     $rows = @($script:JobRows)
     $limit = Get-RunJobLimit
@@ -3381,8 +3396,16 @@ function Update-JobBars {
         Set-JobBar $rows[$i] $laneName ([double]$lane.Percent) ([string]$lane.Pass)
     }
     if ($count -lt 1) { $count = 1 }
-    if ($script:JobHost) { $script:JobHost.Height = 8 + ($count * 36) }
+    if ($script:JobHost) {
+        $content = 8 + ($count * 36)
+        $extra = 0
+        if ($null -ne $script:JobExtra) { $extra = [int]$script:JobExtra }
+        $script:JobHost.AutoScroll = $true
+        $script:JobHost.AutoScrollMinSize = New-Object Drawing.Size(0, $content)
+        $script:JobHost.Height = (Get-JobViewHeight $content $extra)
     }
+    }
+    if ($script:JobSplit) { $script:JobSplit.Visible = [bool]$show }
     if ($script:StatusPanel) {
         $want = Get-StatusPanelWant
         if ($script:StatusPanel.Height -ne $want) {
@@ -3621,6 +3644,20 @@ function Get-WaitingEncodeRows {
         [void]$list.Add([pscustomobject]@{ PixelSeconds = $pixels; TenBit = $ten; Known = $known })
     }
     return @($list.ToArray())
+}
+
+function Get-JobViewHeight([int]$Content, [int]$Extra) {
+    if ($Content -lt 1) { return 0 }
+    $row = 36
+    $chrome = 8
+    $default = $chrome + ($row * 4)
+    if ($default -gt $Content) { $default = $Content }
+    $minimum = $chrome + $row
+    if ($minimum -gt $Content) { $minimum = $Content }
+    $view = $default + $Extra
+    if ($view -lt $minimum) { $view = $minimum }
+    if ($view -gt $Content) { $view = $Content }
+    return $view
 }
 
 function Get-StatusPanelWant {
@@ -5994,14 +6031,24 @@ function Update-ChromeLayout {
         }
         $script:ProgressTrack.SetBounds(24, $trackY, ([Math]::Max(0, $status.ClientSize.Width - 48)), 8)
         Set-Progress $script:ProgressValue
-        if ($script:JobHost -and $script:JobHost.Visible) {
+        $showJobs = ($script:JobHost -and $script:JobHost.Visible)
+        if ($script:JobSplit) { $script:JobSplit.Visible = [bool]$showJobs }
+        if ($showJobs) {
+            if ($script:JobSplit) {
+                $script:JobSplit.SetBounds(24, $trackY, ([Math]::Max(80, $status.ClientSize.Width - 48)), 12)
+            }
             $script:JobHost.SetBounds(24, ($trackY + 12), ([Math]::Max(80, $status.ClientSize.Width - 48)), $script:JobHost.Height)
-            $rowTop = 0
+            if ($script:JobHost.IsHandleCreated) {
+                $script:JobHost.HorizontalScroll.Enabled = $false
+                $script:JobHost.HorizontalScroll.Visible = $false
+            }
+            $rowTop = 4
+            $scroll = $script:JobHost.AutoScrollPosition
             $rows = @($script:JobRows)
             for ($i = 0; $i -lt $rows.Count; $i++) {
                 $row = $rows[$i]
                 if (-not $row -or -not $row.Panel.Visible) { continue }
-                $row.Panel.SetBounds(0, $rowTop, $script:JobHost.ClientSize.Width, 34)
+                $row.Panel.SetBounds($scroll.X, ($rowTop + $scroll.Y), $script:JobHost.ClientSize.Width, 34)
                 $row.Label.SetBounds(0, 0, $row.Panel.Width, 16)
                 $row.Track.SetBounds(0, 18, $row.Panel.Width, 8)
                 $pct = 0.0
@@ -6040,7 +6087,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Converting'
-            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. Parallel jobs chooses how many files encode together, from 1 to 6. Each file uses about 8 cores. One is right for most computers. Two needs about 16 cores, three about 24, four about 32, five about 40, and six about 48. On fewer cores the files share the processor and the batch does not finish sooner. Dynamic encode batch jobs sizes each file from its picture instead of Parallel jobs. A small picture uses 3 threads, 720p uses 4, and 1080p or larger uses 8. CPU use chooses 25%, 50%, 75%, 95%, or 100% of the processor. 100% still leaves one or two cores free so the computer can keep running. A large file waits until its threads are free. Files behind it wait with it. Log opens the conversion record, a Markdown file grouped by the day and time each file finished. Find can stop the scan after 5, 10, 25, 50, or 100 files that can be reduced. All keeps scanning the whole folder. Updating the program keeps that file. Each running file has its own bar and name. The bar is that file. Above the bars, 4/100 means this batch has started file 4 of 100. The count moves when the next file starts. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
+            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. Parallel jobs chooses how many files encode together, from 1 to 6. Each file uses about 8 cores. One is right for most computers. Two needs about 16 cores, three about 24, four about 32, five about 40, and six about 48. On fewer cores the files share the processor and the batch does not finish sooner. Dynamic encode batch jobs sizes each file from its picture instead of Parallel jobs. A small picture uses 3 threads, 720p uses 4, and 1080p or larger uses 8. CPU use chooses 25%, 50%, 75%, 95%, or 100% of the processor. 100% still leaves one or two cores free so the computer can keep running. A large file waits until its threads are free. Files behind it wait with it. Log opens the conversion record, a Markdown file grouped by the day and time each file finished. Find can stop the scan after 5, 10, 25, 50, or 100 files that can be reduced. All keeps scanning the whole folder. Updating the program keeps that file. Each running file has its own bar and name. Drag the bar above the encode bars to make that list taller or shorter. A scrollbar shows the rest. Double-click that bar to put the list back. The bar is that file. Above the bars, 4/100 means this batch has started file 4 of 100. The count moves when the next file starts. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
         },
         @{
             Title = 'Checking the picture'
@@ -6280,6 +6327,7 @@ $script:RecycleAlertMuted = [bool]$settings.RecycleAlertMuted
 $script:RecyclePurgeEnabled = [bool]$settings.PurgeRecycle
 $script:ListExtra = [int]$settings.ListExtra
 $script:LogExtra = [int]$settings.LogExtra
+$script:JobExtra = [int]$settings.JobExtra
 $script:JobCount = [int]$settings.JobCount
 if ($script:JobCount -lt 1 -or $script:JobCount -gt 6) { $script:JobCount = 1 }
 $script:DynamicLaneCount = 0
@@ -6433,6 +6481,72 @@ for ($i = 0; $i -lt 6; $i++) {
 $script:JobRows = $jobRows
 $script:Lanes = $encodeLanes
 $script:StatusPanel.Controls.Add($script:JobHost)
+$script:JobSplit = New-Object Windows.Forms.Panel
+$script:JobSplit.Height = 12
+$script:JobSplit.Visible = $false
+$script:JobSplit.Margin = New-Object Windows.Forms.Padding(0)
+$script:JobSplit.Cursor = [Windows.Forms.Cursors]::SizeNS
+$script:JobSplit.BackColor = [Drawing.Color]::White
+$script:JobSplit.TabStop = $false
+Enable-DoubleBuffer $script:JobSplit
+$script:JobSplit.Add_Paint({
+    $g = $_.Graphics
+    $mid = [int]($this.ClientSize.Height / 2)
+    $line = New-Object Drawing.Pen $script:ColorLine
+    $g.DrawLine($line, 0, $mid, $this.ClientSize.Width, $mid)
+    $line.Dispose()
+    $tone = $(if ($script:JobSplitHot -or $script:JobSplitDrag) { [Drawing.Color]::FromArgb(71, 85, 105) } else { [Drawing.Color]::FromArgb(148, 156, 168) })
+    $brush = New-Object Drawing.SolidBrush $tone
+    $cx = [int]($this.ClientSize.Width / 2)
+    foreach ($offset in @(-18, -6, 6, 18)) {
+        $g.FillRectangle($brush, ($cx + $offset), ($mid - 1), 4, 3)
+    }
+    $brush.Dispose()
+})
+$script:JobSplit.Add_MouseEnter({
+    $script:JobSplitHot = $true
+    $this.Invalidate()
+})
+$script:JobSplit.Add_MouseLeave({
+    if ($script:JobSplitDrag) { return }
+    $script:JobSplitHot = $false
+    $this.Invalidate()
+})
+$script:JobSplit.Add_MouseDown({
+    if ($_.Button -ne [Windows.Forms.MouseButtons]::Left) { return }
+    $script:JobSplitDrag = @{
+        Y = [Windows.Forms.Cursor]::Position.Y
+        Extra = [int]$script:JobExtra
+    }
+    $this.Capture = $true
+    $this.Invalidate()
+})
+$script:JobSplit.Add_MouseMove({
+    if (-not $script:JobSplitDrag) { return }
+    if ($_.Button -ne [Windows.Forms.MouseButtons]::Left) { return }
+    $drag = $script:JobSplitDrag
+    $dy = [Windows.Forms.Cursor]::Position.Y - [int]$drag.Y
+    $script:JobExtra = [int]$drag.Extra - $dy
+    Update-JobBars
+    $this.Invalidate()
+})
+$script:JobSplit.Add_MouseUp({
+    if ($_.Button -ne [Windows.Forms.MouseButtons]::Left) { return }
+    $script:JobSplitDrag = $null
+    $this.Capture = $false
+    $script:JobSplitHot = $false
+    $this.Invalidate()
+    Save-Settings
+})
+$script:JobSplit.Add_MouseDoubleClick({
+    if ($_.Button -ne [Windows.Forms.MouseButtons]::Left) { return }
+    $script:JobSplitDrag = $null
+    $this.Capture = $false
+    $script:JobExtra = 0
+    Update-JobBars
+    Save-Settings
+})
+$script:StatusPanel.Controls.Add($script:JobSplit)
 $script:StatusPanel.Controls.Add($script:StatusLabel)
 $script:StatusPanel.Controls.Add($script:EtaLabel)
 $script:StatusPanel.Controls.Add($script:BatchLabel)
@@ -7193,6 +7307,8 @@ Set-Tip $script:FindBox 'Stop scanning after this many files that can be reduced
 Set-Tip $script:FindLabel 'Stop scanning after this many files that can be reduced. All keeps scanning the whole folder.'
 Set-Tip $script:Log 'Saved space, skipped videos, and problems are listed here.'
 Set-Tip $script:LogSplit 'Drag to make the activity box taller or shorter. Double-click to put it back.'
+Set-Tip $script:JobSplit 'Drag to make the encode bars taller or shorter. Double-click to put them back.'
+Set-Tip $script:JobHost 'Each file that is encoding has its own bar. A scrollbar shows the rest.'
 Set-Tip $script:ProgressTrack 'How far the current file has been encoded. The two passes share the bar evenly.'
 Set-Tip $script:EtaLabel 'This file is the encode in progress. Estimated time remaining is the rest of the batch.'
 Set-Tip $script:BatchLabel 'How many files in this batch have started.'
@@ -8018,6 +8134,20 @@ function Invoke-SmokeTest {
         $lane.CommandLine = ''
     }
     Assert-True (@($script:JobRows).Count -eq 6) 'Job bars did not go to six'
+    Assert-True ($null -ne $script:JobSplit) 'The encode bars have no resize bar'
+    Assert-True ($script:JobSplit.Cursor -eq [Windows.Forms.Cursors]::SizeNS) 'The encode bar resize pointer is missing'
+    Assert-True ($script:JobSplit.Parent -eq $script:StatusPanel) 'The encode bar resize left the status bar'
+    Assert-True ($script:JobHost.Parent -eq $script:StatusPanel) 'The encode bars left the status bar'
+    $jobTipText = [string]$script:Tips.GetToolTip($script:JobSplit)
+    Assert-True ($jobTipText -eq 'Drag to make the encode bars taller or shorter. Double-click to put them back.') ("Encode bar resize tip was $jobTipText")
+    $tenBars = 8 + (10 * 36)
+    Assert-True ((Get-JobViewHeight $tenBars 0) -eq (8 + (4 * 36))) 'Four encode bars did not show before the list scrolls'
+    Assert-True ((Get-JobViewHeight (8 + (2 * 36)) 0) -eq (8 + (2 * 36))) 'Two encode bars left empty space'
+    Assert-True ((Get-JobViewHeight $tenBars 80) -eq (8 + (4 * 36) + 80)) 'Dragging the encode bars dropped the extra pixels'
+    Assert-True ((Get-JobViewHeight $tenBars 9999) -eq $tenBars) 'The encode bars grew past the files'
+    Assert-True ((Get-JobViewHeight $tenBars -9999) -eq (8 + 36)) 'The encode bars lost their last row'
+    Assert-True ((Get-JobViewHeight 0 40) -eq 0) 'Hidden encode bars took space'
+    Assert-True ($script:HelpBox.Text -match 'Drag the bar above the encode bars') 'The guide was missing the encode bar resize'
     Assert-True ($script:JobBox.Items.Count -eq 6) 'Jobs at once is missing a level'
     Assert-True ([string]$script:JobBox.Items[0] -eq '1') 'Jobs at once does not start at one'
     Assert-True ([string]$script:JobBox.Items[5] -eq '6') 'Jobs at once does not go to six'
@@ -8114,7 +8244,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.1.2') 'Version file was not 1.1.2'
+    Assert-True ((Get-AppVersion) -eq '1.1.3') 'Version file was not 1.1.3'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -8125,7 +8255,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.1\.2') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.1\.3') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'

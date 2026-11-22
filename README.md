@@ -1,12 +1,16 @@
 # Video Dehydrator
 
-Version 1.1.2
+Version 1.1.3
 
 A Windows program that finds videos that are too big for their picture size, encodes a smaller copy, and puts that copy where the original was.
 
 Double-click **Video Dehydrator** in this folder. If that shortcut does nothing, open `app\launch.vbs` once. That starts the program and repairs the shortcut.
 
 Choose a folder and click Scan. Checked rows are the ones Optimize will shrink. ~Savings is the current size minus New size, and the first click on that heading puts the largest estimates first. If the picture rate is missing, New size and ~Savings start with ~. Ratio shows how many times the budget a file uses. `1.00x` is on the line. Slight, Heavy, and Extreme can be checked as one group. Can shrink rows are under the line and the picture is still above the target rate. Showing all leaves every row on screen until a group box is checked. The original is kept in `.vd-originals` until you delete it. Compare plays the original on the left and the new file on the right. Undo puts the last conversion back.
+
+## What's new in 1.1.3
+
+When more than one file is encoding, the bars sit in a list. A scrollbar shows the rest when they do not fit. Drag the bar above that list to make it taller or shorter. Double-click that bar to put the list back.
 
 ## What's new in 1.1.2
 
