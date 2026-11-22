@@ -453,7 +453,7 @@ $script:ConversionLogPath = Join-Path $script:AppDir 'conversion-log.md'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.1.0'
+$script:UpdateFallback = '1.1.1'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -904,9 +904,90 @@ function Get-JobCount {
     return $count
 }
 
+function Test-DynamicJobs {
+    if (-not $script:DynamicCheck) { return $false }
+    return [bool]$script:DynamicCheck.Checked
+}
+
+function Get-CpuTarget {
+    if ($script:CpuUseBox -and $script:CpuUseBox.SelectedIndex -ge 0) {
+        return (ConvertTo-CpuTargetPercent $script:CpuUseBox.SelectedItem)
+    }
+    return (ConvertTo-CpuTargetPercent $script:CpuTarget)
+}
+
+function Get-RunJobLimit {
+    if ((Test-DynamicJobs) -and [int]$script:DynamicLaneCount -gt 0) {
+        return [int]$script:DynamicLaneCount
+    }
+    return (Get-JobCount)
+}
+
+function Get-PhysicalCoreCount {
+    try {
+        $sum = 0
+        foreach ($cpu in @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)) {
+            $sum += [int]$cpu.NumberOfCores
+        }
+        if ($sum -ge 1) { return $sum }
+    } catch {}
+    $count = [Environment]::ProcessorCount
+    if ($count -lt 1) { return 1 }
+    return $count
+}
+
+function Release-LaneCores($Lane) {
+    if (-not $Lane -or -not $script:DynamicAdmission) { return }
+    $key = [string]$Lane.AdmitKey
+    if (-not $key) { return }
+    Undo-Admit -Admission $script:DynamicAdmission -Key $key
+    $Lane.AdmitKey = ''
+    $Lane.Pool = 0
+}
+
+function New-EncodeLane([int]$Index) {
+    $jobRow = New-JobRow
+    $script:JobHost.Controls.Add($jobRow.Panel)
+    return [pscustomobject]@{
+        Index = $Index
+        Pump = (New-Object VideoDehydrator.JobPump)
+        Item = $null
+        Plan = $null
+        Probe = $null
+        Decision = $null
+        Lines = (New-Object 'System.Collections.Generic.List[string]')
+        ReencodeAudio = $false
+        Encoder = ''
+        Percent = [double]0
+        Pass = ''
+        SinglePass = $false
+        CommandLine = ''
+        OutputRetries = 0
+        Row = $jobRow
+        Pool = 0
+        AdmitKey = ''
+        Dynamic = $false
+    }
+}
+
+function Ensure-EncodeLanes([int]$Count) {
+    if ($Count -lt 1) { $Count = 1 }
+    $lanes = New-Object System.Collections.Generic.List[object]
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($lane in @($script:Lanes)) { [void]$lanes.Add($lane) }
+    foreach ($row in @($script:JobRows)) { [void]$rows.Add($row) }
+    while ($lanes.Count -lt $Count) {
+        $lane = New-EncodeLane $lanes.Count
+        [void]$lanes.Add($lane)
+        [void]$rows.Add($lane.Row)
+    }
+    $script:Lanes = @($lanes)
+    $script:JobRows = @($rows)
+}
+
 function Get-OpenLane {
     if (-not $script:Lanes) { return $null }
-    $limit = Get-JobCount
+    $limit = Get-RunJobLimit
     $lanes = @($script:Lanes)
     for ($i = 0; $i -lt $limit -and $i -lt $lanes.Count; $i++) {
         if (-not $lanes[$i].Item) { return $lanes[$i] }
@@ -1064,6 +1145,8 @@ function Load-Settings {
         LogExtra = 0
         ParallelJobs = $false
         JobCount = 1
+        DynamicJobs = $false
+        CpuTarget = 100
         FindLimit = 0
     }
     if (-not (Test-Path -LiteralPath $script:SettingsPath)) { return $defaults }
@@ -1111,6 +1194,8 @@ function Load-Settings {
             }
         }
         elseif ($defaults.ParallelJobs) { $defaults.JobCount = 2 }
+        if ($null -ne $json.dynamicJobs) { $defaults.DynamicJobs = [bool]$json.dynamicJobs }
+        if ($null -ne $json.cpuTarget) { $defaults.CpuTarget = (ConvertTo-CpuTargetPercent $json.cpuTarget) }
         if ($null -ne $json.findLimit) {
             $rawFind = [string]$json.findLimit
             if ($rawFind -match '^\d+$') {
@@ -1171,6 +1256,8 @@ function Save-Settings {
         logExtra = [int]$script:LogExtra
         jobCount = (Get-JobCount)
         parallelJobs = ((Get-JobCount) -gt 1)
+        dynamicJobs = (Test-DynamicJobs)
+        cpuTarget = (Get-CpuTarget)
         findLimit = (Get-FindLimit)
     }
     $json = $obj | ConvertTo-Json
@@ -2315,7 +2402,9 @@ function Update-Buttons {
     foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:RecycleCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
         if ($chk) { $chk.Enabled = -not $busy }
     }
-    if ($script:JobBox) { $script:JobBox.Enabled = -not $busy }
+    if ($script:JobBox) { $script:JobBox.Enabled = ((-not $busy) -and -not (Test-DynamicJobs)) }
+    if ($script:DynamicCheck) { $script:DynamicCheck.Enabled = -not $busy }
+    if ($script:CpuUseBox) { $script:CpuUseBox.Enabled = ((-not $busy) -and (Test-DynamicJobs)) }
     if ($script:FindBox) { $script:FindBox.Enabled = -not $busy }
     foreach ($box in @($script:BudgetBoxes)) {
         if ($box) { $box.Enabled = -not $busy }
@@ -2933,7 +3022,8 @@ function Start-EncodeProcess {
     $reencode = $false
     if ($script:ReencodeCheck) { $reencode = [bool]$script:ReencodeCheck.Checked }
     $pool = 0
-    if ((Get-JobCount) -gt 1) { $pool = 8 }
+    if ($Lane.Dynamic) { $pool = [int]$Lane.Pool }
+    elseif ((Get-JobCount) -gt 1) { $pool = 8 }
     $arguments = Get-HandBrakeArguments -Source $Plan.Source -Temp $Plan.Temp -Probe $Probe -VideoKbps $Decision.TargetKbps -Encoder $encoder -ReencodeAudio:$reencode -ThreadPool $pool -SinglePass:$SinglePass
     $Lane.ReencodeAudio = $reencode
     $Lane.Lines = New-Object System.Collections.Generic.List[string]
@@ -2983,6 +3073,31 @@ function Start-NextEncode {
         }
         $lane = Get-OpenLane
         if (-not $lane) { return }
+        $lane.Dynamic = $false
+        $lane.Pool = 0
+        Release-LaneCores $lane
+        if (Test-DynamicJobs) {
+            $head = $script:EncodeItems[$script:EncodeIndex]
+            $width = 0
+            $height = 0
+            if ($head.Tag) {
+                [void][int]::TryParse([string]$head.Tag.Width, [ref]$width)
+                [void][int]::TryParse([string]$head.Tag.Height, [ref]$height)
+            }
+            $cap = 1
+            if ($script:DynamicAdmission) {
+                foreach ($itemCap in @($script:DynamicAdmission.Capacity)) {
+                    if ([int]$itemCap -gt $cap) { $cap = [int]$itemCap }
+                }
+            }
+            $need = Get-EncoderThreadCount $width $height $cap
+            $key = 'file-' + [string]$script:EncodeIndex
+            $node = Invoke-AdmitHead -Admission $script:DynamicAdmission -Key $key -Threads $need
+            if ([int]$node -lt 0) { return }
+            $lane.Dynamic = $true
+            $lane.Pool = $need
+            $lane.AdmitKey = $key
+        }
         $item = $script:EncodeItems[$script:EncodeIndex]
         $script:EncodeIndex++
         $number = $script:EncodeIndex
@@ -3000,6 +3115,7 @@ function Start-NextEncode {
             $item.Tag.Reason = 'The file is no longer there.'
             Update-ResultRow $item
             Write-Activity ("Missing  " + $source) 'err'
+            Release-LaneCores $lane
             continue
         }
         $plan = $null
@@ -3013,6 +3129,7 @@ function Start-NextEncode {
             $item.Tag.Reason = $_.Exception.Message
             Update-ResultRow $item
             Write-Activity ("Could not read  " + [IO.Path]::GetFileName($source) + "  " + $_.Exception.Message) 'err'
+            Release-LaneCores $lane
             continue
         }
         try {
@@ -3025,6 +3142,7 @@ function Start-NextEncode {
             Write-Activity ("Could not read  " + [IO.Path]::GetFileName($source) + "  " + $_.Exception.Message) 'err'
             $unread = New-FaultRecord -Kind 'unreadable' -Source $source -Reason ([string]$_.Exception.Message) -Jobs (Get-JobCount) -ReencodeAudio:([bool]$script:ReencodeCheck.Checked) -AutoDelete:([bool]$script:AutoCheck.Checked) -Ffprobe $script:Ffprobe
             Add-SourceFault $unread
+            Release-LaneCores $lane
             continue
         }
         try {
@@ -3035,6 +3153,7 @@ function Start-NextEncode {
             $item.Tag.Reason = $_.Exception.Message
             Update-ResultRow $item
             Write-Activity ("Could not read  " + [IO.Path]::GetFileName($source) + "  " + $_.Exception.Message) 'err'
+            Release-LaneCores $lane
             continue
         }
         $convertible = ($decision.Decision -eq 'bloated' -or $decision.Decision -eq 'shrink')
@@ -3046,6 +3165,7 @@ function Start-NextEncode {
             $item.Checked = $false
             Update-ResultRow $item
             Write-Activity ("Left alone  " + [IO.Path]::GetFileName($source) + "  " + $decision.Reason) 'dim'
+            Release-LaneCores $lane
             continue
         }
         try {
@@ -3058,14 +3178,37 @@ function Start-NextEncode {
             $item.Tag.Reason = $_.Exception.Message
             Update-ResultRow $item
             Write-Activity ("Could not prepare  " + [IO.Path]::GetFileName($source) + "  " + $_.Exception.Message) 'err'
+            Release-LaneCores $lane
             continue
+        }
+        if ($lane.Dynamic) {
+            $cap = 1
+            if ($script:DynamicAdmission) {
+                foreach ($itemCap in @($script:DynamicAdmission.Capacity)) {
+                    if ([int]$itemCap -gt $cap) { $cap = [int]$itemCap }
+                }
+            }
+            $real = Get-EncoderThreadCount $probe.Width $probe.Height $cap
+            if ($real -ne [int]$lane.Pool) {
+                $node = Resize-Admit -Admission $script:DynamicAdmission -Key ([string]$lane.AdmitKey) -Threads $real
+                if ([int]$node -lt 0) {
+                    $script:EncodeIndex--
+                    $lane.AdmitKey = ''
+                    $lane.Pool = 0
+                    $lane.Dynamic = $false
+                    return
+                }
+                $lane.Pool = $real
+            }
         }
         $item.Tag.TargetKbps = $decision.TargetKbps
         $item.Tag.Width = $probe.Width
         $item.Tag.Height = $probe.Height
-        Write-Activity ("Converting  " + [IO.Path]::GetFileName($source) + "  at $($decision.TargetKbps) kbps") 'text'
+        $convertLine = "Converting  " + [IO.Path]::GetFileName($source) + "  at $($decision.TargetKbps) kbps"
+        if ($lane.Dynamic) { $convertLine = $convertLine + ". $([int]$lane.Pool) threads." }
+        Write-Activity $convertLine 'text'
         Start-EncodeProcess -Item $item -Plan $plan -Probe $probe -Decision $decision -Lane $lane
-        if ((Get-JobCount) -gt 1 -and (Get-OpenLane) -and -not $script:StopAfterFile -and -not $script:Cancel) { continue }
+        if ((Get-RunJobLimit) -gt 1 -and (Get-OpenLane) -and -not $script:StopAfterFile -and -not $script:Cancel) { continue }
         return
     }
     if (-not (Test-EncodeBusy)) { Finish-Batch 'done' }
@@ -3145,6 +3288,7 @@ function Fail-Active {
         }
     }
     if ($Lane) {
+        Release-LaneCores $Lane
         $Lane.Item = $null
         $Lane.Plan = $null
     }
@@ -3169,7 +3313,7 @@ function Read-LaneLines($Lane) {
         if ((Test-EncodeProgressLine $line)) { continue }
         if ($script:DetailedCheck.Checked) {
             $prefix = ''
-            if ((Get-JobCount) -gt 1 -and $Lane.Plan) { $prefix = [IO.Path]::GetFileName($Lane.Plan.Source) + '  ' }
+            if ((Get-RunJobLimit) -gt 1 -and $Lane.Plan) { $prefix = [IO.Path]::GetFileName($Lane.Plan.Source) + '  ' }
             Write-Activity ($prefix + $line) 'dim'
         }
     }
@@ -3199,7 +3343,7 @@ function Paint-EncodeProgress {
         $total = 0
         if ($script:EncodeItems) { $total = $script:EncodeItems.Count }
         $fileStatus = "File $number of $total - $name - " + ('{0:0}%' -f [double]$statusLane.Percent)
-        if ((Get-JobCount) -gt 1) {
+        if ((Get-RunJobLimit) -gt 1) {
             $running = 0
             foreach ($lane in @($script:Lanes)) { if ($lane.Item) { $running++ } }
             $fileStatus = "$running files at once - $name - " + ('{0:0}%' -f [double]$statusLane.Percent)
@@ -3216,14 +3360,14 @@ function Update-JobBars {
     if ($script:Lanes) {
         foreach ($lane in @($script:Lanes)) { if ($lane.Item) { $running++ } }
     }
-    $show = ((Get-JobCount) -gt 1) -and ($running -gt 0)
+    $show = ((Get-RunJobLimit) -gt 1) -and ($running -gt 0)
     if ($script:JobHost) { $script:JobHost.Visible = $show }
     if ($script:ProgressTrack) { $script:ProgressTrack.Visible = -not $show }
     if (-not $show) {
         if ($script:JobHost) { $script:JobHost.Height = 0 }
     } else {
     $rows = @($script:JobRows)
-    $limit = Get-JobCount
+    $limit = Get-RunJobLimit
     $count = 0
     for ($i = 0; $i -lt $rows.Count; $i++) {
         $lane = $null
@@ -3363,6 +3507,7 @@ function Complete-ActiveEncode {
     Update-ResultRow $item
     if ($plan.Source) { Forget-SizeSkipPath ([string]$plan.Source) }
     Add-RunLog -Status $(if ($swap.Deleted) { 'REPLACED' } else { 'KEPT' }) -Reason 'ok' -Source $plan.Source -NewPath $swap.NewPath -Kept $swap.KeptPath -OldBytes $swap.OldBytes -NewBytes $swap.NewBytes -OldRate $verify.OldGiBph -NewRate $verify.NewGiBph -Width $(if ($laneProbe) { $laneProbe.Width } else { '' }) -Height $(if ($laneProbe) { $laneProbe.Height } else { '' }) -Kbps $(if ($laneDecision) { $laneDecision.TargetKbps } else { '' })
+    Release-LaneCores $Lane
     $Lane.Item = $null
     $Lane.Plan = $null
     if (-not (Test-EncodeBusy)) { Stop-ActivityPulse }
@@ -3625,10 +3770,13 @@ function Finish-Batch {
         foreach ($lane in @($script:Lanes)) {
             try { if ($lane.Pump) { $lane.Pump.Stop() } } catch {}
             if ($lane.Item) { Release-EncodeHold $lane.Plan }
+            Release-LaneCores $lane
             $lane.Item = $null
             $lane.Plan = $null
         }
     }
+    $script:DynamicLaneCount = 0
+    $script:DynamicAdmission = $null
     try { [VideoDehydrator.LinePump]::Stop() } catch {}
     Update-JobBars
     $script:Work = 'idle'
@@ -3927,8 +4075,21 @@ function Begin-ConvertBatch {
     $verb = 'Converting'
     if ($Force) { $verb = 'Forcing' }
     Write-Activity ("$verb $($items.Count) $word.") 'text'
+    if ((Test-DynamicJobs) -and $items.Count -gt 0) {
+        $cores = Get-PhysicalCoreCount
+        $percent = Get-CpuTarget
+        $budget = Get-TargetCoreBudget -Cores $cores -Percent $percent
+        $script:DynamicAdmission = New-EncodeAdmission -NodeCores @($budget)
+        $script:DynamicLaneCount = Get-DynamicLaneCount -Files $items.Count -Budget $budget
+        Ensure-EncodeLanes $script:DynamicLaneCount
+        Write-Activity ("Dynamic encode batch jobs is on at $percent% CPU use. Small pictures use 3 threads, 720p uses 4, and 1080p or larger uses 8.") 'text'
+    }
+    else {
+        $script:DynamicLaneCount = 0
+        $script:DynamicAdmission = $null
+    }
     $jobCount = Get-JobCount
-    if ($jobCount -gt 1 -and $items.Count -gt 1) {
+    if (-not (Test-DynamicJobs) -and $jobCount -gt 1 -and $items.Count -gt 1) {
         $running = $jobCount
         if ($running -gt $items.Count) { $running = $items.Count }
         Write-Activity ("Parallel jobs is $jobCount. Up to $running files encode at the same time.") 'text'
@@ -5400,6 +5561,23 @@ function Layout-Actions {
             if ($labelWidth -lt 20) { $labelWidth = 108 }
             $script:JobLabel.Location = New-Object Drawing.Point(($script:JobBox.Left - 8 - $labelWidth), 48)
         }
+        $leftEdge = $script:JobLabel.Left
+        if ($script:CpuUseBox) {
+            $script:CpuUseBox.Location = New-Object Drawing.Point(($leftEdge - 12 - $script:CpuUseBox.Width), 44)
+            if ($script:CpuUseLabel) {
+                $cpuWidth = $script:CpuUseLabel.Width
+                if ($cpuWidth -lt 20) { $cpuWidth = $script:CpuUseLabel.PreferredSize.Width }
+                if ($cpuWidth -lt 20) { $cpuWidth = 64 }
+                $script:CpuUseLabel.Location = New-Object Drawing.Point(($script:CpuUseBox.Left - 8 - $cpuWidth), 48)
+                $leftEdge = $script:CpuUseLabel.Left
+            }
+        }
+        if ($script:DynamicCheck) {
+            $dynamicWidth = $script:DynamicCheck.Width
+            if ($dynamicWidth -lt 20) { $dynamicWidth = $script:DynamicCheck.PreferredSize.Width }
+            if ($dynamicWidth -lt 20) { $dynamicWidth = 210 }
+            $script:DynamicCheck.Location = New-Object Drawing.Point(($leftEdge - 12 - $dynamicWidth), 46)
+        }
     }
     $script:HelpButton.Location = New-Object Drawing.Point(($panel.ClientSize.Width - $script:HelpButton.Width), ($y + 2))
     $script:DeleteButton.Location = New-Object Drawing.Point(($script:HelpButton.Left - 8 - $script:DeleteButton.Width), ($y + 2))
@@ -5862,7 +6040,7 @@ function Get-HelpSections {
         },
         @{
             Title = 'Converting'
-            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. Parallel jobs chooses how many files encode together, from 1 to 6. Each file uses about 8 cores. One is right for most computers. Two needs about 16 cores, three about 24, four about 32, five about 40, and six about 48. On fewer cores the files share the processor and the batch does not finish sooner. Log opens the conversion record, a Markdown file grouped by the day and time each file finished. Find can stop the scan after 5, 10, 25, 50, or 100 files that can be reduced. All keeps scanning the whole folder. Updating the program keeps that file. Each running file has its own bar and name. The bar is that file. Above the bars, 4/100 means this batch has started file 4 of 100. The count moves when the next file starts. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
+            Body = "Convert shrinks every checked file whose status is Bloated, Can shrink, or Failed. Parallel jobs chooses how many files encode together, from 1 to 6. Each file uses about 8 cores. One is right for most computers. Two needs about 16 cores, three about 24, four about 32, five about 40, and six about 48. On fewer cores the files share the processor and the batch does not finish sooner. Dynamic encode batch jobs sizes each file from its picture instead of Parallel jobs. A small picture uses 3 threads, 720p uses 4, and 1080p or larger uses 8. CPU use chooses 25%, 50%, 75%, 95%, or 100% of the processor. 100% still leaves one or two cores free so the computer can keep running. A large file waits until its threads are free. Files behind it wait with it. Log opens the conversion record, a Markdown file grouped by the day and time each file finished. Find can stop the scan after 5, 10, 25, 50, or 100 files that can be reduced. All keeps scanning the whole folder. Updating the program keeps that file. Each running file has its own bar and name. The bar is that file. Above the bars, 4/100 means this batch has started file 4 of 100. The count moves when the next file starts. Under the bar, this file is how long that encode still has. The first pass shows only that pass until a finished file has shown how long the second pass takes. Estimated time remaining is the rest of the batch. It stays on estimating until this run has a speed to measure, and 10-bit files are timed apart from 8-bit files. The time line keeps a rolling average and changes about every 30 seconds, and when a file starts. Stop after current file leaves Estimated time remaining on the file that is still running. Cancel stops the file that is running. Stop after current file lets that file finish, then leaves the rest of the batch for later. Continue keeps the batch going. Files that already finished stay finished. Manual converts a chosen file or folder even when it is not over the budget. Test savings reads those files and estimates the savings, then asks you to proceed or cancel. Convert now skips that estimate. Include subfolders when the path is a folder. Dolby Vision is still left alone, and a result that is not smaller is still thrown away.`r`n`r`nThe new file is written inside .vd-originals first, then checked: it has to be smaller, the same length, the same picture size, with the same audio when that audio can be copied, and at least as many subtitles, and the start and end have to play. When the check passes, the original moves into .vd-originals and the new .mkv takes its place. When the check fails, the original stays where it was. When the new file is not smaller, the row is marked Skipped and the activity box says why. The picture rate plus the audio can be larger than a file that was already small. That file is left unchecked and remembered. Later scans leave it off the list. A smaller budget lists it again. Clear skips forgets those marks so the same budget can be tried again.`r`n`r`nThe folder needs free space for the new file while the original is still there. Show detailed activity lists each encode step. The activity box does not add a line for each percent. A moving mark on the last line shows that the file is still being worked on. With that box off, the activity box lists when a file starts and when it finishes. The bar along the bottom still shows the percent.`r`n`r`nShutdown computer upon completion turns the computer off after the convert finishes. A one-minute countdown gives you a chance to cancel. If you stop the convert, the computer stays on. A scan does not turn the computer off."
         },
         @{
             Title = 'Checking the picture'
@@ -6104,6 +6282,9 @@ $script:ListExtra = [int]$settings.ListExtra
 $script:LogExtra = [int]$settings.LogExtra
 $script:JobCount = [int]$settings.JobCount
 if ($script:JobCount -lt 1 -or $script:JobCount -gt 6) { $script:JobCount = 1 }
+$script:DynamicLaneCount = 0
+$script:CpuTarget = ConvertTo-CpuTargetPercent $settings.CpuTarget
+$script:DynamicAdmission = $null
 $script:FindLimit = [int]$settings.FindLimit
 $script:AutoWarnShown = $false
 $script:AutoWarnBusy = $false
@@ -6244,6 +6425,9 @@ for ($i = 0; $i -lt 6; $i++) {
         CommandLine = ''
         OutputRetries = 0
         Row = $jobRow
+        Pool = 0
+        AdmitKey = ''
+        Dynamic = $false
     }
 }
 $script:JobRows = $jobRows
@@ -6596,6 +6780,34 @@ $script:JobBox.Add_SelectedIndexChanged({
     $script:JobCount = Get-JobCount
     Save-Settings
 })
+$script:DynamicCheck = New-Check 'Dynamic encode batch jobs'
+$script:DynamicCheck.Checked = [bool]$settings.DynamicJobs
+$script:DynamicCheck.Add_CheckedChanged({
+    if ($script:Loading) { return }
+    Update-Buttons
+    Save-Settings
+})
+$script:CpuUseLabel = New-Object Windows.Forms.Label
+$script:CpuUseLabel.Text = 'CPU use'
+$script:CpuUseLabel.Font = $script:FontUi
+$script:CpuUseLabel.ForeColor = $script:ColorInk
+$script:CpuUseLabel.BackColor = $script:ColorPage
+$script:CpuUseLabel.AutoSize = $true
+$script:CpuUseBox = New-Object Windows.Forms.ComboBox
+$script:CpuUseBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+$script:CpuUseBox.FlatStyle = [Windows.Forms.FlatStyle]::Flat
+$script:CpuUseBox.Font = $script:FontUi
+$script:CpuUseBox.SetBounds(0, 0, 72, 28)
+foreach ($percent in @(25, 50, 75, 95, 100)) { [void]$script:CpuUseBox.Items.Add(([string]$percent + '%')) }
+$cpuPick = [string]$script:CpuTarget + '%'
+$cpuIndex = $script:CpuUseBox.Items.IndexOf($cpuPick)
+if ($cpuIndex -lt 0) { $cpuIndex = $script:CpuUseBox.Items.Count - 1 }
+$script:CpuUseBox.SelectedIndex = $cpuIndex
+$script:CpuUseBox.Add_SelectedIndexChanged({
+    if ($script:Loading) { return }
+    $script:CpuTarget = Get-CpuTarget
+    Save-Settings
+})
 $script:SubfoldersCheck.Checked = [bool]$settings.IncludeSubfolders
 $script:AutoCheck.Checked = [bool]$settings.AutoDelete
 $script:RecycleCheck.Checked = [bool]$settings.PurgeRecycle
@@ -6735,6 +6947,9 @@ $script:ActionPanel.Controls.Add($script:FindLabel)
 $script:ActionPanel.Controls.Add($script:FindBox)
 $script:ActionPanel.Controls.Add($script:JobLabel)
 $script:ActionPanel.Controls.Add($script:JobBox)
+$script:ActionPanel.Controls.Add($script:DynamicCheck)
+$script:ActionPanel.Controls.Add($script:CpuUseLabel)
+$script:ActionPanel.Controls.Add($script:CpuUseBox)
 $script:ScanButton.Add_Click({ Start-Scan })
 $script:ConvertButton.Add_Click({ Start-Convert })
 $script:ForceButton.Add_Click({ Start-Force })
@@ -6968,6 +7183,11 @@ Set-Tip $script:Files 'Checked rows are ready to shrink. Click a heading to sort
 Set-Tip $script:ListSplit 'Drag to make the video list taller or shorter. Double-click to put it back.'
 Set-Tip $script:JobLabel (Get-JobTip)
 Set-Tip $script:JobBox (Get-JobTip)
+$dynamicTip = "Size each encode from the picture, and run as many files as fit.`r`n`r`nA small picture uses 3 threads, 720p uses 4, and 1080p or larger uses 8.`r`nCPU use is how much of this computer those threads may fill.`r`n100% still leaves one or two cores free so the system can keep running.`r`n`r`nParallel jobs is not used while this is on. Leave it off on a laptop that should stay at one file."
+Set-Tip $script:DynamicCheck $dynamicTip
+$cpuTip = "How much of this computer Dynamic encode batch jobs may use.`r`n`r`n25%, 50%, 75%, and 95% are shares of the safe amount.`r`n100% is that safe amount. It still leaves one or two cores free."
+Set-Tip $script:CpuUseLabel $cpuTip
+Set-Tip $script:CpuUseBox $cpuTip
 Set-Tip $script:LogButton 'Open the conversion log. It is a Markdown file of every conversion, grouped by the day and time it finished. Updating the program keeps this file.'
 Set-Tip $script:FindBox 'Stop scanning after this many files that can be reduced. All keeps scanning the whole folder.'
 Set-Tip $script:FindLabel 'Stop scanning after this many files that can be reduced. All keeps scanning the whole folder.'
@@ -7809,6 +8029,17 @@ function Invoke-SmokeTest {
     Assert-True ($script:JobBox.Parent -eq $script:ActionPanel) 'Parallel jobs left the action row'
     Assert-True ($script:JobBox.Right -le ($script:FindLabel.Left + 1)) 'Parallel jobs is not left of Find'
     Assert-True ($script:JobLabel.Right -le ($script:JobBox.Left + 1)) 'Parallel jobs label overlaps its dropdown'
+    Assert-True ($script:DynamicCheck.Text -eq 'Dynamic encode batch jobs') 'Dynamic encode batch jobs checkbox'
+    Assert-True (-not $script:DynamicCheck.Checked) 'Dynamic encode batch jobs starts off'
+    Assert-True ($script:DynamicCheck.Parent -eq $script:ActionPanel) 'Dynamic encode batch jobs left the action row'
+    Assert-True ($script:CpuUseLabel.Text -eq 'CPU use') 'CPU use label'
+    Assert-True ($script:CpuUseBox.Items.Count -eq 5) 'CPU use is missing a level'
+    Assert-True ([string]$script:CpuUseBox.Items[0] -eq '25%') 'CPU use does not start at 25%'
+    Assert-True ([string]$script:CpuUseBox.Items[4] -eq '100%') 'CPU use does not end at 100%'
+    Assert-True ((Get-CpuTarget) -eq 100) 'CPU use did not start at 100%'
+    Assert-True ($script:CpuUseBox.Parent -eq $script:ActionPanel) 'CPU use left the action row'
+    Assert-True ($script:HelpBox.Text -match 'Dynamic encode batch jobs') 'The guide was missing dynamic batch'
+    Assert-True ($script:HelpBox.Text -match 'leaves one or two cores free') 'The guide was missing the safe 100% cap'
     $script:ProgressPaintAt = [datetime]::UtcNow
     Assert-True (-not (Test-ProgressPaintDue)) 'The status bar would repaint too often'
     $script:ProgressPaintAt = [datetime]::UtcNow.AddSeconds(-2)
@@ -7883,7 +8114,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.1.0') 'Version file was not 1.1.0'
+    Assert-True ((Get-AppVersion) -eq '1.1.1') 'Version file was not 1.1.1'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -7894,7 +8125,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.1\.0') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.1\.1') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'

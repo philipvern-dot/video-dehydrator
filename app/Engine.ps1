@@ -1094,6 +1094,166 @@ function Get-EncoderName {
     return 'x265'
 }
 
+function ConvertTo-CpuTargetPercent {
+    param($Value)
+    $number = 0
+    if (-not [int]::TryParse([string]$Value, [ref]$number)) { return 100 }
+    if (@(25, 50, 75, 95, 100) -contains $number) { return $number }
+    return 100
+}
+
+function Get-EncoderThreadCount {
+    param($Width, $Height, [int]$NodeCap)
+    $pixels = [int64]0
+    $wide = 0
+    $high = 0
+    [void][int]::TryParse([string]$Width, [ref]$wide)
+    [void][int]::TryParse([string]$Height, [ref]$high)
+    if ($wide -gt 0 -and $high -gt 0) { $pixels = [int64]$wide * [int64]$high }
+    $want = 8
+    if ($pixels -gt 0 -and $pixels -lt 600000) { $want = 3 }
+    elseif ($pixels -gt 0 -and $pixels -lt 1500000) { $want = 4 }
+    if ($NodeCap -lt 1) { $NodeCap = 1 }
+    if ($want -gt $NodeCap) { $want = $NodeCap }
+    if ($want -lt 1) { $want = 1 }
+    return $want
+}
+
+function Get-SystemReserve {
+    param([int]$Cores)
+    if ($Cores -le 1) { return 0 }
+    if ($Cores -lt 8) { return 1 }
+    return 2
+}
+
+function Get-SafeCoreBudget {
+    param([int]$Cores)
+    if ($Cores -lt 1) { $Cores = 1 }
+    $safe = $Cores - (Get-SystemReserve $Cores)
+    if ($safe -lt 1) { $safe = 1 }
+    return $safe
+}
+
+function Get-TargetCoreBudget {
+    param([int]$Cores, $Percent)
+    $safe = Get-SafeCoreBudget $Cores
+    $pct = ConvertTo-CpuTargetPercent $Percent
+    if ($pct -ge 100) { $budget = $safe }
+    else { $budget = [int][Math]::Floor(($safe * $pct) / 100) }
+    if ($budget -lt 1) { $budget = 1 }
+    if ($budget -gt $safe) { $budget = $safe }
+    return $budget
+}
+
+function Get-SplitCoreBudget {
+    param([int[]]$NodeCores, [int]$Budget)
+    $caps = New-Object System.Collections.Generic.List[int]
+    foreach ($item in @($NodeCores)) {
+        $number = [int]$item
+        if ($number -lt 1) { $number = 1 }
+        [void]$caps.Add($number)
+    }
+    if ($caps.Count -eq 0) { [void]$caps.Add(1) }
+    $left = $Budget
+    if ($left -lt 1) { $left = 1 }
+    $out = New-Object int[] $caps.Count
+    while ($left -gt 0) {
+        $progressed = $false
+        for ($index = 0; $index -lt $caps.Count; $index++) {
+            if ($left -le 0) { break }
+            if ($out[$index] -lt $caps[$index]) {
+                $out[$index] = $out[$index] + 1
+                $left = $left - 1
+                $progressed = $true
+            }
+        }
+        if (-not $progressed) { break }
+    }
+    if (($out | Measure-Object -Sum).Sum -lt 1) { $out[0] = 1 }
+    return @($out)
+}
+
+function Get-DynamicLaneCount {
+    param([int]$Files, [int]$Budget)
+    if ($Files -le 1) { return 1 }
+    $cores = $Budget
+    if ($cores -lt 1) { $cores = 1 }
+    $lanes = [int][Math]::Floor($cores / 3)
+    if ($lanes -lt 1) { $lanes = 1 }
+    if ($lanes -gt $Files) { $lanes = $Files }
+    return $lanes
+}
+
+function New-EncodeAdmission {
+    param([int[]]$NodeCores)
+    $capacity = New-Object System.Collections.Generic.List[int]
+    foreach ($item in @($NodeCores)) {
+        $number = [int]$item
+        if ($number -lt 1) { $number = 1 }
+        [void]$capacity.Add($number)
+    }
+    if ($capacity.Count -eq 0) { [void]$capacity.Add(1) }
+    $free = New-Object int[] $capacity.Count
+    for ($index = 0; $index -lt $capacity.Count; $index++) { $free[$index] = $capacity[$index] }
+    return [pscustomobject]@{
+        Capacity = @($capacity)
+        Free = $free
+        Running = @{}
+    }
+}
+
+function Invoke-AdmitHead {
+    param($Admission, [string]$Key, [int]$Threads)
+    if ($Admission.Running.ContainsKey($Key)) { return [int]$Admission.Running[$Key].Node }
+    $need = $Threads
+    if ($need -lt 1) { $need = 1 }
+    $largest = 1
+    foreach ($cap in @($Admission.Capacity)) { if ([int]$cap -gt $largest) { $largest = [int]$cap } }
+    if ($need -gt $largest) { $need = $largest }
+    for ($index = 0; $index -lt $Admission.Free.Count; $index++) {
+        if ($Admission.Free[$index] -ge $need -and $need -le [int]$Admission.Capacity[$index]) {
+            $Admission.Free[$index] = $Admission.Free[$index] - $need
+            $Admission.Running[$Key] = @{ Node = $index; Threads = $need }
+            return $index
+        }
+    }
+    return -1
+}
+
+function Undo-Admit {
+    param($Admission, [string]$Key)
+    if (-not $Admission -or -not $Key) { return }
+    if (-not $Admission.Running.ContainsKey($Key)) { return }
+    $held = $Admission.Running[$Key]
+    $Admission.Free[[int]$held.Node] = $Admission.Free[[int]$held.Node] + [int]$held.Threads
+    [void]$Admission.Running.Remove($Key)
+}
+
+function Resize-Admit {
+    param($Admission, [string]$Key, [int]$Threads)
+    if (-not $Admission.Running.ContainsKey($Key)) { return (Invoke-AdmitHead -Admission $Admission -Key $Key -Threads $Threads) }
+    $node = [int]$Admission.Running[$Key].Node
+    Undo-Admit -Admission $Admission -Key $Key
+    $need = $Threads
+    if ($need -lt 1) { $need = 1 }
+    $largest = 1
+    foreach ($cap in @($Admission.Capacity)) { if ([int]$cap -gt $largest) { $largest = [int]$cap } }
+    if ($need -gt $largest) { $need = $largest }
+    $order = New-Object System.Collections.Generic.List[int]
+    [void]$order.Add($node)
+    for ($index = 0; $index -lt $Admission.Free.Count; $index++) {
+        if ($index -ne $node) { [void]$order.Add($index) }
+    }
+    foreach ($index in $order) {
+        if ($Admission.Free[$index] -ge $need -and $need -le [int]$Admission.Capacity[$index]) {
+            $Admission.Free[$index] = $Admission.Free[$index] - $need
+            $Admission.Running[$Key] = @{ Node = $index; Threads = $need }
+            return $index
+        }
+    }
+    return -1
+}
+
 function Get-HandBrakeArguments {
     param(
         [Parameter(Mandatory)][string]$Source,
@@ -4378,6 +4538,35 @@ function Invoke-EngineSelfTest {
     finally {
         if (Test-Path -LiteralPath $undoDir) { Remove-Item -LiteralPath $undoDir -Recurse -Force -ErrorAction SilentlyContinue }
     }
+
+    Assert-Engine ((Get-EncoderThreadCount 528 400 16) -eq 3) 'sd pictures use 3 threads'
+    Assert-Engine ((Get-EncoderThreadCount 720 480 16) -eq 3) '480p uses 3 threads'
+    Assert-Engine ((Get-EncoderThreadCount 1280 720 16) -eq 4) '720p uses 4 threads'
+    Assert-Engine ((Get-EncoderThreadCount 1920 1080 16) -eq 8) '1080p uses 8 threads'
+    Assert-Engine ((Get-EncoderThreadCount 3840 2160 16) -eq 8) '4k uses 8 threads'
+    Assert-Engine ((Get-EncoderThreadCount 0 0 16) -eq 8) 'a missing size stays at 8'
+    Assert-Engine ((Get-EncoderThreadCount 1920 1080 4) -eq 4) 'thread count stays inside the node'
+    Assert-Engine ((Get-SystemReserve 32) -eq 2 -and (Get-SystemReserve 4) -eq 1) '100% leaves cores for the system'
+    Assert-Engine ((Get-TargetCoreBudget 32 100) -eq 30) '100% on 32 cores uses 30'
+    Assert-Engine ((Get-TargetCoreBudget 32 95) -eq 28 -and (Get-TargetCoreBudget 32 75) -eq 22) 'lower cpu use is a share of the safe budget'
+    Assert-Engine ((Get-TargetCoreBudget 32 50) -eq 15 -and (Get-TargetCoreBudget 32 25) -eq 7) 'half and quarter cpu use'
+    $split = @(Get-SplitCoreBudget -NodeCores @(16, 16) -Budget 30)
+    Assert-Engine ($split.Count -eq 2 -and $split[0] -eq 15 -and $split[1] -eq 15) 'a 30 core budget splits across two processors'
+    Assert-Engine ((Get-DynamicLaneCount -Files 100 -Budget 30) -eq 10) 'lane count follows the budget'
+    Assert-Engine ((Get-DynamicLaneCount -Files 1 -Budget 30) -eq 1) 'one file stays one file'
+    $admission = New-EncodeAdmission -NodeCores @(32)
+    for ($index = 0; $index -lt 10; $index++) {
+        Assert-Engine ((Invoke-AdmitHead -Admission $admission -Key ([string]$index) -Threads 3) -ge 0) 'ten small files fit in 32 cores'
+    }
+    $free = 0
+    foreach ($item in @($admission.Free)) { $free += [int]$item }
+    Assert-Engine ($free -eq 2) 'ten small files leave 2 cores'
+    Assert-Engine ((Invoke-AdmitHead -Admission $admission -Key 'big' -Threads 8) -lt 0) 'a large file waits when 8 cores are not free'
+    Assert-Engine (-not $admission.Running.ContainsKey('later')) 'a later small file does not pass a waiting large file'
+    Undo-Admit -Admission $admission -Key '0'
+    Undo-Admit -Admission $admission -Key '1'
+    Assert-Engine ((Invoke-AdmitHead -Admission $admission -Key 'big' -Threads 8) -ge 0) 'the large file starts once 8 cores are free'
+    Assert-Engine (-not $admission.Running.ContainsKey('later')) 'the file behind the large one is still waiting'
 }
 
 function Invoke-PipelineTest {
