@@ -1675,6 +1675,136 @@ function Get-PacketSpanSec {
     return $span
 }
 
+function Get-FrameSeconds {
+    param([string]$Rate)
+    if ([string]::IsNullOrWhiteSpace($Rate) -or $Rate -eq '0/0') { return 0.0 }
+    $fps = 0.0
+    if ($Rate -match '^(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)$') {
+        $num = 0.0
+        $den = 0.0
+        [void][double]::TryParse($Matches[1], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$num)
+        [void][double]::TryParse($Matches[2], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$den)
+        if ($num -le 0 -or $den -le 0) { return 0.0 }
+        $fps = $num / $den
+    }
+    else {
+        [void][double]::TryParse($Rate, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$fps)
+    }
+    if ($fps -lt 5 -or $fps -gt 120) { return 0.0 }
+    return (1.0 / $fps)
+}
+
+function Get-AudioSamplesPerPacket {
+    param([string]$Codec, [string]$Profile)
+    $name = ''
+    if ($Codec) { $name = $Codec.ToLowerInvariant() }
+    $prof = ''
+    if ($Profile) { $prof = $Profile.ToLowerInvariant() }
+    if ($name -eq 'mp3' -or $name -eq 'mp2') { return 1152 }
+    if ($name -eq 'ac3') { return 1536 }
+    if ($name -eq 'aac' -or $name -eq 'aac_latm') {
+        if ($prof -match 'he-aac|^he|sbr') { return 2048 }
+        return 1024
+    }
+    return 0
+}
+
+function Get-PresentationCount {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return 0 }
+    $count = 0
+    $stamp = 0.0
+    foreach ($line in ($Text -split '\r?\n')) {
+        if (-not $line) { continue }
+        $token = $line.Split(',')[0].Trim()
+        if (-not $token -or $token -eq 'N/A') { continue }
+        $ok = [double]::TryParse($token, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$stamp)
+        if ($ok -and $stamp -ge 0 -and -not [double]::IsNaN($stamp) -and -not [double]::IsInfinity($stamp)) { $count++ }
+    }
+    return $count
+}
+
+function Get-PacketCsv {
+    param([string]$Ffprobe, [string]$File, [string]$Selector)
+    $run = Invoke-CapturedProcess -File $Ffprobe -Arguments @(
+        '-v', 'error',
+        '-select_streams', $Selector,
+        '-show_entries', 'packet=pts_time,dts_time,duration_time',
+        '-of', 'csv=p=0',
+        '--', $File
+    )
+    return [string]$run.StdOut
+}
+
+function Get-DurationEvidence {
+    param([string]$Ffprobe, [string]$File)
+    $empty = [pscustomobject]@{ IndexedSec = 0.0; PictureSec = 0.0; AudioSec = 0.0 }
+    if (-not $Ffprobe -or -not $File -or -not (Test-Path -LiteralPath $Ffprobe) -or -not (Test-Path -LiteralPath $File)) { return $empty }
+    $run = Invoke-CapturedProcess -File $Ffprobe -Arguments @(
+        '-v', 'error', '-show_streams', '-print_format', 'json', '--', $File
+    )
+    if (-not $run.StdOut) { return $empty }
+    try { $json = $run.StdOut | ConvertFrom-Json } catch { return $empty }
+    $streams = @($(Get-NoteProperty $json 'streams'))
+    $video = $null
+    $audios = @()
+    foreach ($stream in $streams) {
+        $kind = [string](Get-NoteProperty $stream 'codec_type')
+        if ($kind -eq 'audio') { $audios += $stream; continue }
+        if ($kind -ne 'video' -or $null -ne $video) { continue }
+        $disposition = Get-NoteProperty $stream 'disposition'
+        if ([string](Get-NoteProperty $disposition 'attached_pic') -eq '1') { continue }
+        $width = 0
+        [void][int]::TryParse([string](Get-NoteProperty $stream 'width'), [ref]$width)
+        if ($width -le 0) { continue }
+        $video = $stream
+    }
+    $rate = ''
+    if ($video) {
+        $rate = [string](Get-NoteProperty $video 'avg_frame_rate')
+        if (-not $rate -or $rate -eq '0/0') { $rate = [string](Get-NoteProperty $video 'r_frame_rate') }
+    }
+    $frame = Get-FrameSeconds $rate
+    $chunks = New-Object System.Collections.Generic.List[string]
+    $videoCsv = Get-PacketCsv -Ffprobe $Ffprobe -File $File -Selector 'v:0'
+    $picture = 0.0
+    if ($videoCsv) {
+        [void]$chunks.Add($videoCsv)
+        if ($frame -gt 0) { $picture = (Get-PresentationCount $videoCsv) * $frame }
+    }
+    $audioSec = -1.0
+    if ($audios.Count -gt 0) {
+        $audioSec = 0.0
+        $clocks = @()
+        $measurable = $true
+        for ($i = 0; $i -lt $audios.Count; $i++) {
+            $samples = Get-AudioSamplesPerPacket -Codec ([string](Get-NoteProperty $audios[$i] 'codec_name')) -Profile ([string](Get-NoteProperty $audios[$i] 'profile'))
+            $sampleRate = 0
+            [void][int]::TryParse([string](Get-NoteProperty $audios[$i] 'sample_rate'), [ref]$sampleRate)
+            $csv = Get-PacketCsv -Ffprobe $Ffprobe -File $File -Selector "a:$i"
+            if ($csv) { [void]$chunks.Add($csv) }
+            if ($samples -le 0 -or $sampleRate -le 0 -or -not $csv) { $measurable = $false; continue }
+            $clocks += ((Get-PresentationCount $csv) * $samples) / [double]$sampleRate
+        }
+        if ($measurable -and $clocks.Count -gt 0) {
+            $first = [double]$clocks[0]
+            $close = $true
+            foreach ($clock in $clocks) {
+                if ([math]::Abs([double]$clock - $first) -gt 2) { $close = $false }
+            }
+            if ($close) { $audioSec = $first }
+        }
+    }
+    $span = Get-PacketSpanSec ($chunks -join "`n")
+    $indexed = 0.0
+    if ($null -ne $span) { $indexed = [double]$span }
+    return [pscustomobject]@{
+        IndexedSec = $indexed
+        PictureSec = [double]$picture
+        AudioSec   = [double]$audioSec
+    }
+}
+
 function Get-IndexedDurationSec {
     param([string]$Ffprobe, [string]$File)
     if (-not $Ffprobe -or -not $File -or -not (Test-Path -LiteralPath $Ffprobe) -or -not (Test-Path -LiteralPath $File)) { return $null }
@@ -1696,7 +1826,9 @@ function Get-DurationBasis {
     param(
         [double]$HeaderSec,
         [double]$OutputSec,
-        [double]$IndexedSec
+        [double]$IndexedSec,
+        [double]$PictureSec = 0,
+        [double]$AudioSec = 0
     )
     $limit = 2.0
     $basis = $HeaderSec
@@ -1705,6 +1837,14 @@ function Get-DurationBasis {
         $headerOverstates = ($HeaderSec - $IndexedSec) -gt $limit
         $outputMatchesIndex = [math]::Abs($OutputSec - $IndexedSec) -le $limit
         if ($headerOverstates -and $outputMatchesIndex) { $basis = $IndexedSec }
+    }
+    # A shared timestamp hole makes the header longer than the pictures.
+    # Keep the encode when the new file still matches the picture clock and the audio clock.
+    # AudioSec below 0 means the file has no audio. Zero means the clock was not read.
+    $pictureMatches = ($PictureSec -gt 0) -and ([math]::Abs($OutputSec - $PictureSec) -le $limit)
+    $audioMatches = ($AudioSec -lt 0) -or (($AudioSec -gt 0) -and ([math]::Abs($OutputSec - $AudioSec) -le $limit))
+    if ($pictureMatches -and $audioMatches -and ([math]::Abs($OutputSec - $basis) -gt $limit)) {
+        $basis = $PictureSec
     }
     $changed = [math]::Abs($OutputSec - $basis) -gt $limit
     return [pscustomobject]@{
@@ -1749,12 +1889,18 @@ function Test-EncodedFile {
     $durationBasis = [double]$SourceProbe.DurationSec
     if ([math]::Abs($out.DurationSec - $durationBasis) -gt 2) {
         $indexed = 0.0
+        $picture = 0.0
+        $audio = 0.0
         $sourcePath = ''
         if ($SourceProbe -and $SourceProbe.Path) { $sourcePath = [string]$SourceProbe.Path }
-        $measured = $null
-        try { $measured = Get-IndexedDurationSec -Ffprobe $Ffprobe -File $sourcePath } catch { $measured = $null }
-        if ($null -ne $measured) { $indexed = [double]$measured }
-        $durationCheck = Get-DurationBasis -HeaderSec $durationBasis -OutputSec ([double]$out.DurationSec) -IndexedSec $indexed
+        $evidence = $null
+        try { $evidence = Get-DurationEvidence -Ffprobe $Ffprobe -File $sourcePath } catch { $evidence = $null }
+        if ($null -ne $evidence) {
+            $indexed = [double]$evidence.IndexedSec
+            $picture = [double]$evidence.PictureSec
+            $audio = [double]$evidence.AudioSec
+        }
+        $durationCheck = Get-DurationBasis -HeaderSec $durationBasis -OutputSec ([double]$out.DurationSec) -IndexedSec $indexed -PictureSec $picture -AudioSec $audio
         if ($durationCheck.Changed) {
             $reasons.Add("duration changed from $([math]::Round($SourceProbe.DurationSec, 1))s to $([math]::Round($out.DurationSec, 1))s")
         }
@@ -4061,6 +4207,26 @@ function Invoke-DurationSelfTest {
     Assert-Engine ($shorter.Changed) 'a file shorter than the picture still fails'
     $unread = Get-DurationBasis -HeaderSec 3000.6 -OutputSec 2801.2 -IndexedSec 0
     Assert-Engine ($unread.Changed) 'a long header still fails when the picture length cannot be read'
+    $plow = Get-DurationBasis -HeaderSec 3075.6 -OutputSec 3072.5 -IndexedSec 3075.5 -PictureSec 3072.444 -AudioSec 3072.469
+    Assert-Engine (-not $plow.Changed) 'a timestamp hole does not reject the pictures'
+    Assert-Engine ([math]::Abs($plow.BasisSec - 3072.444) -lt 0.001) 'a timestamp hole uses the picture clock'
+    $station = Get-DurationBasis -HeaderSec 3081.2 -OutputSec 3076.4 -IndexedSec 3081.2 -PictureSec 3076.365 -AudioSec 3076.288
+    Assert-Engine (-not $station.Changed) 'Red River Station keeps the pictures'
+    $fever = Get-DurationBasis -HeaderSec 2903.7 -OutputSec 2900.5 -IndexedSec 2903.7 -PictureSec 2900.440 -AudioSec 2900.480
+    Assert-Engine (-not $fever.Changed) 'Gold Fever keeps the pictures'
+    $cut = Get-DurationBasis -HeaderSec 2993.8 -OutputSec 2985.6 -IndexedSec 2993.8 -PictureSec 2993.8 -AudioSec 2993.8
+    Assert-Engine ($cut.Changed) 'a shorter picture still fails'
+    $audioCut = Get-DurationBasis -HeaderSec 3075.6 -OutputSec 3072.5 -IndexedSec 3075.5 -PictureSec 3072.444 -AudioSec 3075.6
+    Assert-Engine ($audioCut.Changed) 'a timestamp hole still fails when the audio is longer'
+    $silent = Get-DurationBasis -HeaderSec 3075.6 -OutputSec 3072.5 -IndexedSec 3075.5 -PictureSec 3072.444 -AudioSec -1
+    Assert-Engine (-not $silent.Changed) 'a timestamp hole with no audio uses the picture clock'
+    $unknown = Get-DurationBasis -HeaderSec 3075.6 -OutputSec 3072.5 -IndexedSec 3075.5 -PictureSec 3072.444 -AudioSec 0
+    Assert-Engine ($unknown.Changed) 'a timestamp hole still fails when the audio clock was not read'
+    Assert-Engine ((Get-AudioSamplesPerPacket -Codec 'aac' -Profile 'LC') -eq 1024) 'AAC-LC is 1024 samples'
+    Assert-Engine ((Get-AudioSamplesPerPacket -Codec 'aac' -Profile 'HE-AAC') -eq 2048) 'HE-AAC is 2048 samples'
+    Assert-Engine ([math]::Abs((Get-FrameSeconds '24000/1001') - (1001 / 24000.0)) -lt 0.0000001) '23.976 frame length'
+    Assert-Engine ((Get-FrameSeconds '0/0') -eq 0) 'a missing frame rate has no length'
+    Assert-Engine ((Get-PresentationCount "0.000,0.000,0.042`n0.042,0.042,0.042`nN/A,0.084,0.042") -eq 2) 'presentation count skips a missing time'
 }
 
 function Invoke-EngineSelfTest {
