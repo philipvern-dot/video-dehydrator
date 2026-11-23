@@ -453,7 +453,7 @@ $script:ConversionLogPath = Join-Path $script:AppDir 'conversion-log.md'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.1.3'
+$script:UpdateFallback = '1.1.3.1'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -970,19 +970,36 @@ function New-EncodeLane([int]$Index) {
     }
 }
 
+function Copy-ObjectList($Items) {
+    # @() around List[object] throws "Argument types do not match" on Windows PowerShell 5.1.
+    $copy = New-Object 'object[]' 0
+    if ($null -eq $Items) { return $copy }
+    $count = 0
+    foreach ($item in $Items) { if ($null -ne $item) { $count++ } }
+    if ($count -lt 1) { return $copy }
+    $copy = New-Object 'object[]' $count
+    $index = 0
+    foreach ($item in $Items) {
+        if ($null -eq $item) { continue }
+        $copy[$index] = $item
+        $index++
+    }
+    return $copy
+}
+
 function Ensure-EncodeLanes([int]$Count) {
     if ($Count -lt 1) { $Count = 1 }
     $lanes = New-Object System.Collections.Generic.List[object]
     $rows = New-Object System.Collections.Generic.List[object]
-    foreach ($lane in @($script:Lanes)) { [void]$lanes.Add($lane) }
-    foreach ($row in @($script:JobRows)) { [void]$rows.Add($row) }
+    foreach ($lane in $script:Lanes) { if ($null -ne $lane) { [void]$lanes.Add($lane) } }
+    foreach ($row in $script:JobRows) { if ($null -ne $row) { [void]$rows.Add($row) } }
     while ($lanes.Count -lt $Count) {
         $lane = New-EncodeLane $lanes.Count
         [void]$lanes.Add($lane)
         [void]$rows.Add($lane.Row)
     }
-    $script:Lanes = @($lanes)
-    $script:JobRows = @($rows)
+    $script:Lanes = Copy-ObjectList $lanes
+    $script:JobRows = Copy-ObjectList $rows
 }
 
 function Get-OpenLane {
@@ -5558,6 +5575,19 @@ function Start-UpdateInstall {
     $script:Form.Close()
 }
 
+function Test-ActionOverlap($A, $B) {
+    if ($null -eq $A -or $null -eq $B) { return $false }
+    $aRight = $A.Left + $A.Width
+    $aBottom = $A.Top + $A.Height
+    $bRight = $B.Left + $B.Width
+    $bBottom = $B.Top + $B.Height
+    if ($aRight -le $B.Left) { return $false }
+    if ($bRight -le $A.Left) { return $false }
+    if ($aBottom -le $B.Top) { return $false }
+    if ($bBottom -le $A.Top) { return $false }
+    return $true
+}
+
 function Layout-Actions {
     $panel = $script:ActionPanel
     if ($null -eq $panel -or $panel.ClientSize.Width -lt 20) { return }
@@ -5570,16 +5600,6 @@ function Layout-Actions {
         $continueLeft = 0
         if ($script:StopAfterButton) { $continueLeft = $script:StopAfterButton.Right + 8 }
         $script:ContinueButton.Location = New-Object Drawing.Point($continueLeft, 44)
-    }
-    if ($script:ForceButton) {
-        $forceLeft = 0
-        if ($script:ContinueButton) { $forceLeft = $script:ContinueButton.Right + 8 }
-        $script:ForceButton.Location = New-Object Drawing.Point($forceLeft, 44)
-    }
-    if ($script:LogButton) {
-        $logLeft = 0
-        if ($script:ForceButton) { $logLeft = $script:ForceButton.Right + 8 }
-        $script:LogButton.Location = New-Object Drawing.Point($logLeft, 44)
     }
     if ($script:FindBox) {
         $script:FindBox.Location = New-Object Drawing.Point(($panel.ClientSize.Width - $script:FindBox.Width), 44)
@@ -5624,6 +5644,40 @@ function Layout-Actions {
         $script:UndoButton.Location = New-Object Drawing.Point(($script:DeleteButton.Left - 8 - $script:UndoButton.Width), ($y + 2))
     }
     $script:CompareButton.Location = New-Object Drawing.Point(($script:DeleteButton.Left - 8 - $undoWidth - $script:CompareButton.Width), ($y + 2))
+    $pairWidth = 0
+    if ($script:ForceButton) { $pairWidth += $script:ForceButton.Width }
+    if ($script:LogButton) {
+        if ($pairWidth -gt 0) { $pairWidth += 8 }
+        $pairWidth += $script:LogButton.Width
+    }
+    $bottomLeft = 0
+    if ($script:ContinueButton) { $bottomLeft = $script:ContinueButton.Right + 8 }
+    elseif ($script:StopAfterButton) { $bottomLeft = $script:StopAfterButton.Right + 8 }
+    $bottomLimit = $panel.ClientSize.Width
+    if ($script:DynamicCheck) { $bottomLimit = $script:DynamicCheck.Left - 12 }
+    $topLeft = $script:CancelButton.Right + 8
+    $topLimit = $panel.ClientSize.Width
+    if ($script:CompareButton) { $topLimit = $script:CompareButton.Left - 12 }
+    $topFits = (($topLeft + $pairWidth) -le $topLimit)
+    $bottomFits = (($bottomLeft + $pairWidth) -le $bottomLimit)
+    $useTop = $topFits
+    if (-not $topFits -and -not $bottomFits) {
+        $useTop = (($topLimit - $topLeft) -ge ($bottomLimit - $bottomLeft))
+    }
+    $pairLeft = $bottomLeft
+    $pairTop = 44
+    if ($useTop) {
+        $pairLeft = $topLeft
+        $pairTop = $y + 2
+    }
+    if ($script:ForceButton) {
+        $script:ForceButton.Location = New-Object Drawing.Point($pairLeft, $pairTop)
+    }
+    if ($script:LogButton) {
+        $logLeft = $pairLeft
+        if ($script:ForceButton) { $logLeft = $script:ForceButton.Right + 8 }
+        $script:LogButton.Location = New-Object Drawing.Point($logLeft, $pairTop)
+    }
 }
 
 function Get-BudgetBox([string]$Id) {
@@ -6348,12 +6402,12 @@ $script:Form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
 $script:Form.KeyPreview = $true
 $script:Form.AllowDrop = $true
 $area = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-$wantW = 1120
+$wantW = 1200
 $wantH = 948
 if ($wantW -gt ($area.Width - 24)) { $wantW = [Math]::Max(860, $area.Width - 24) }
 if ($wantH -gt ($area.Height - 24)) { $wantH = [Math]::Max(680, $area.Height - 24) }
 $script:Form.ClientSize = New-Object Drawing.Size($wantW, $wantH)
-$script:Form.MinimumSize = New-Object Drawing.Size([Math]::Min(960, $area.Width), [Math]::Min(760, $area.Height))
+$script:Form.MinimumSize = New-Object Drawing.Size([Math]::Min(1180, $area.Width), [Math]::Min(760, $area.Height))
 $appIcon = Get-AppIcon
 if ($appIcon) { $script:Form.Icon = $appIcon }
 Enable-DoubleBuffer $script:Form
@@ -8126,6 +8180,7 @@ function Invoke-SmokeTest {
     [Windows.Forms.Application]::DoEvents()
     Start-Sleep -Milliseconds 200
     Save-FormImage $script:HelpForm (Join-Path $env:TEMP 'vdh-help.png')
+    Ensure-EncodeLanes 4
     Assert-True (@($script:Lanes).Count -eq 6) 'Encode lanes did not go to six'
     foreach ($lane in @($script:Lanes)) {
         Assert-True ($null -ne $lane.PSObject.Properties['CommandLine']) 'An encode lane was created without a command line'
@@ -8244,7 +8299,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.1.3') 'Version file was not 1.1.3'
+    Assert-True ((Get-AppVersion) -eq '1.1.3.1') 'Version file was not 1.1.3.1'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -8255,7 +8310,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.1\.3') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.1\.3\.1') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'
@@ -8376,6 +8431,10 @@ function Invoke-SmokeTest {
     Update-Buttons
     Assert-True ($script:ForceButton.Left -ge $script:ContinueButton.Right) 'Force overlaps Continue'
     Assert-True ($script:ForceButton.Bottom -le $script:ActionPanel.ClientSize.Height) 'Force sits outside the action row'
+    Assert-True ($script:LogButton.Right -le ($script:CompareButton.Left - 8)) 'Log overlaps Compare'
+    Assert-True ($script:DynamicCheck.Left -ge ($script:ContinueButton.Right + 8)) 'Dynamic encode batch jobs overlaps Continue'
+    Assert-True (-not (Test-ActionOverlap $script:ForceButton $script:DynamicCheck)) 'Manual overlaps Dynamic encode batch jobs'
+    Assert-True (-not (Test-ActionOverlap $script:LogButton $script:DynamicCheck)) 'Log overlaps Dynamic encode batch jobs'
     $forcePick = New-ForcePickForm
     try {
         $forcePick.StartPosition = 'Manual'
