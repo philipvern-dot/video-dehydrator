@@ -453,7 +453,7 @@ $script:ConversionLogPath = Join-Path $script:AppDir 'conversion-log.md'
 $script:UpdateRepo = 'video-dehydrator'
 $script:UpdateAsset = 'video_dehydrator.exe'
 $script:UpdateProduct = 'Video Dehydrator'
-$script:UpdateFallback = '1.1.3.1'
+$script:UpdateFallback = '1.1.3.2'
 $script:UpdateOffer = $null
 $script:UpdatePrompt = ''
 $script:UpdateClosing = $false
@@ -616,34 +616,100 @@ $script:FontLog = New-Object Drawing.Font('Consolas', 10)
 $script:FontHelpHeading = New-Object Drawing.Font('Segoe UI', 13, [Drawing.FontStyle]::Bold)
 $script:FontHelpBody = New-Object Drawing.Font('Segoe UI', 10)
 
-$script:ColorPage = [Drawing.Color]::FromArgb(238, 241, 244)
-$script:ColorInk = [Drawing.Color]::FromArgb(17, 24, 39)
-$script:ColorBody = [Drawing.Color]::FromArgb(55, 65, 81)
-$script:ColorMuted = [Drawing.Color]::FromArgb(75, 85, 99)
-$script:ColorLine = [Drawing.Color]::FromArgb(214, 218, 225)
-$script:ColorHeader = [Drawing.Color]::FromArgb(28, 36, 48)
-$script:ColorHeaderMuted = [Drawing.Color]::FromArgb(209, 213, 219)
-$script:ColorPrimary = [Drawing.Color]::FromArgb(29, 78, 216)
-$script:ColorPrimaryHover = [Drawing.Color]::FromArgb(30, 64, 175)
-$script:ColorDanger = [Drawing.Color]::FromArgb(185, 28, 28)
-$script:ColorLogBg = [Drawing.Color]::FromArgb(28, 36, 48)
-$script:ColorLogText = [Drawing.Color]::FromArgb(229, 231, 235)
-$script:ColorLogOk = [Drawing.Color]::FromArgb(134, 239, 172)
-$script:ColorLogWarn = [Drawing.Color]::FromArgb(252, 211, 77)
-$script:ColorLogErr = [Drawing.Color]::FromArgb(252, 165, 165)
-$script:ColorLogMuted = [Drawing.Color]::FromArgb(156, 163, 175)
-$script:ColorOkText = [Drawing.Color]::FromArgb(22, 101, 52)
-$script:ColorErrText = [Drawing.Color]::FromArgb(153, 27, 27)
-$script:ColorOverSlightBack = [Drawing.Color]::FromArgb(220, 252, 231)
-$script:ColorOverHeavyBack = [Drawing.Color]::FromArgb(254, 249, 195)
-$script:ColorOverHeavyFore = [Drawing.Color]::FromArgb(133, 77, 14)
-$script:ColorOverExtremeBack = [Drawing.Color]::FromArgb(254, 226, 226)
-$script:BudgetMark = @{
-    '2160' = @{ Mark = [Drawing.Color]::FromArgb(29, 78, 216); Back = [Drawing.Color]::FromArgb(219, 234, 254); Fore = [Drawing.Color]::FromArgb(30, 58, 138) }
-    '1080' = @{ Mark = [Drawing.Color]::FromArgb(15, 118, 110); Back = [Drawing.Color]::FromArgb(204, 251, 241); Fore = [Drawing.Color]::FromArgb(17, 94, 89) }
-    '720' = @{ Mark = [Drawing.Color]::FromArgb(109, 40, 217); Back = [Drawing.Color]::FromArgb(237, 233, 254); Fore = [Drawing.Color]::FromArgb(91, 33, 182) }
-    '480' = @{ Mark = [Drawing.Color]::FromArgb(194, 65, 12); Back = [Drawing.Color]::FromArgb(255, 237, 213); Fore = [Drawing.Color]::FromArgb(154, 52, 18) }
+function Set-ThemePalette([bool]$Dark) {
+    $script:DarkMode = [bool]$Dark
+    $script:ColorHeader = [Drawing.Color]::FromArgb(28, 36, 48)
+    $script:ColorHeaderMuted = [Drawing.Color]::FromArgb(209, 213, 219)
+    $script:ColorPrimary = [Drawing.Color]::FromArgb(29, 78, 216)
+    $script:ColorPrimaryHover = [Drawing.Color]::FromArgb(30, 64, 175)
+    $script:ColorLogBg = [Drawing.Color]::FromArgb(28, 36, 48)
+    $script:ColorLogText = [Drawing.Color]::FromArgb(229, 231, 235)
+    $script:ColorLogOk = [Drawing.Color]::FromArgb(134, 239, 172)
+    $script:ColorLogWarn = [Drawing.Color]::FromArgb(252, 211, 77)
+    $script:ColorLogErr = [Drawing.Color]::FromArgb(252, 165, 165)
+    $script:ColorLogMuted = [Drawing.Color]::FromArgb(156, 163, 175)
+    $script:ColorAlert = [Drawing.Color]::FromArgb(185, 28, 28)
+    $script:ColorAlertHover = [Drawing.Color]::FromArgb(153, 27, 27)
+    $script:ColorAlertDown = [Drawing.Color]::FromArgb(127, 29, 29)
+    if ($script:DarkMode) {
+        $script:ColorPage = [Drawing.Color]::FromArgb(15, 23, 42)
+        $script:ColorCard = [Drawing.Color]::FromArgb(30, 41, 59)
+        $script:ColorField = [Drawing.Color]::FromArgb(15, 23, 42)
+        $script:ColorInk = [Drawing.Color]::FromArgb(229, 231, 235)
+        $script:ColorBody = [Drawing.Color]::FromArgb(209, 213, 219)
+        $script:ColorMuted = [Drawing.Color]::FromArgb(156, 163, 175)
+        $script:ColorLine = [Drawing.Color]::FromArgb(229, 231, 235)
+        $script:ColorRule = [Drawing.Color]::FromArgb(229, 231, 235)
+        $script:ColorButton = [Drawing.Color]::FromArgb(51, 65, 85)
+        $script:ColorButtonHover = [Drawing.Color]::FromArgb(71, 85, 105)
+        $script:ColorButtonDown = [Drawing.Color]::FromArgb(30, 41, 59)
+        $script:ColorDisabled = [Drawing.Color]::FromArgb(100, 116, 139)
+        $script:ColorDisabledText = [Drawing.Color]::FromArgb(241, 245, 249)
+        $script:ColorDisabledInk = [Drawing.Color]::FromArgb(203, 213, 225)
+        $script:ColorDisabledBorder = [Drawing.Color]::FromArgb(203, 213, 225)
+        $script:ColorDanger = [Drawing.Color]::FromArgb(254, 202, 202)
+        $script:ColorDangerBack = [Drawing.Color]::FromArgb(69, 10, 10)
+        $script:ColorDangerBorder = [Drawing.Color]::FromArgb(248, 113, 113)
+        $script:ColorDangerHover = [Drawing.Color]::FromArgb(127, 29, 29)
+        $script:ColorDangerDown = [Drawing.Color]::FromArgb(153, 27, 27)
+        $script:ColorOkText = [Drawing.Color]::FromArgb(134, 239, 172)
+        $script:ColorErrText = [Drawing.Color]::FromArgb(252, 165, 165)
+        $script:ColorOverSlightBack = [Drawing.Color]::FromArgb(6, 78, 59)
+        $script:ColorOverHeavyBack = [Drawing.Color]::FromArgb(120, 53, 15)
+        $script:ColorOverHeavyFore = [Drawing.Color]::FromArgb(254, 240, 138)
+        $script:ColorOverExtremeBack = [Drawing.Color]::FromArgb(127, 29, 29)
+        $script:ColorTrack = [Drawing.Color]::FromArgb(51, 65, 85)
+        $script:ColorGrip = [Drawing.Color]::FromArgb(203, 213, 225)
+        $script:ColorGripHot = [Drawing.Color]::FromArgb(248, 250, 252)
+        $script:ColorLink = [Drawing.Color]::FromArgb(147, 197, 253)
+        $script:ColorLinkActive = [Drawing.Color]::FromArgb(191, 219, 254)
+        $script:BudgetMark = @{
+            '2160' = @{ Mark = [Drawing.Color]::FromArgb(29, 78, 216); Back = [Drawing.Color]::FromArgb(30, 58, 138); Fore = [Drawing.Color]::FromArgb(191, 219, 254) }
+            '1080' = @{ Mark = [Drawing.Color]::FromArgb(15, 118, 110); Back = [Drawing.Color]::FromArgb(19, 78, 74); Fore = [Drawing.Color]::FromArgb(153, 246, 228) }
+            '720' = @{ Mark = [Drawing.Color]::FromArgb(109, 40, 217); Back = [Drawing.Color]::FromArgb(76, 29, 149); Fore = [Drawing.Color]::FromArgb(221, 214, 254) }
+            '480' = @{ Mark = [Drawing.Color]::FromArgb(194, 65, 12); Back = [Drawing.Color]::FromArgb(124, 45, 18); Fore = [Drawing.Color]::FromArgb(254, 215, 170) }
+        }
+    } else {
+        $script:ColorPage = [Drawing.Color]::FromArgb(238, 241, 244)
+        $script:ColorCard = [Drawing.Color]::White
+        $script:ColorField = [Drawing.Color]::White
+        $script:ColorInk = [Drawing.Color]::FromArgb(17, 24, 39)
+        $script:ColorBody = [Drawing.Color]::FromArgb(55, 65, 81)
+        $script:ColorMuted = [Drawing.Color]::FromArgb(75, 85, 99)
+        $script:ColorLine = [Drawing.Color]::FromArgb(214, 218, 225)
+        $script:ColorRule = [Drawing.Color]::FromArgb(31, 41, 55)
+        $script:ColorButton = [Drawing.Color]::White
+        $script:ColorButtonHover = [Drawing.Color]::FromArgb(243, 244, 246)
+        $script:ColorButtonDown = [Drawing.Color]::FromArgb(229, 231, 235)
+        $script:ColorDisabled = [Drawing.Color]::FromArgb(229, 231, 235)
+        $script:ColorDisabledText = [Drawing.Color]::FromArgb(156, 163, 175)
+        $script:ColorDisabledInk = [Drawing.Color]::FromArgb(156, 163, 175)
+        $script:ColorDisabledBorder = [Drawing.Color]::FromArgb(229, 231, 235)
+        $script:ColorDanger = [Drawing.Color]::FromArgb(185, 28, 28)
+        $script:ColorDangerBack = [Drawing.Color]::White
+        $script:ColorDangerBorder = [Drawing.Color]::FromArgb(252, 165, 165)
+        $script:ColorDangerHover = [Drawing.Color]::FromArgb(254, 242, 242)
+        $script:ColorDangerDown = [Drawing.Color]::FromArgb(254, 226, 226)
+        $script:ColorOkText = [Drawing.Color]::FromArgb(22, 101, 52)
+        $script:ColorErrText = [Drawing.Color]::FromArgb(153, 27, 27)
+        $script:ColorOverSlightBack = [Drawing.Color]::FromArgb(220, 252, 231)
+        $script:ColorOverHeavyBack = [Drawing.Color]::FromArgb(254, 249, 195)
+        $script:ColorOverHeavyFore = [Drawing.Color]::FromArgb(133, 77, 14)
+        $script:ColorOverExtremeBack = [Drawing.Color]::FromArgb(254, 226, 226)
+        $script:ColorTrack = [Drawing.Color]::FromArgb(229, 231, 235)
+        $script:ColorGrip = [Drawing.Color]::FromArgb(148, 156, 168)
+        $script:ColorGripHot = [Drawing.Color]::FromArgb(71, 85, 105)
+        $script:ColorLink = [Drawing.Color]::FromArgb(37, 99, 235)
+        $script:ColorLinkActive = [Drawing.Color]::FromArgb(29, 78, 216)
+        $script:BudgetMark = @{
+            '2160' = @{ Mark = [Drawing.Color]::FromArgb(29, 78, 216); Back = [Drawing.Color]::FromArgb(219, 234, 254); Fore = [Drawing.Color]::FromArgb(30, 58, 138) }
+            '1080' = @{ Mark = [Drawing.Color]::FromArgb(15, 118, 110); Back = [Drawing.Color]::FromArgb(204, 251, 241); Fore = [Drawing.Color]::FromArgb(17, 94, 89) }
+            '720' = @{ Mark = [Drawing.Color]::FromArgb(109, 40, 217); Back = [Drawing.Color]::FromArgb(237, 233, 254); Fore = [Drawing.Color]::FromArgb(91, 33, 182) }
+            '480' = @{ Mark = [Drawing.Color]::FromArgb(194, 65, 12); Back = [Drawing.Color]::FromArgb(255, 237, 213); Fore = [Drawing.Color]::FromArgb(154, 52, 18) }
+        }
+    }
 }
+Set-ThemePalette $false
 
 $script:Work = 'idle'
 $script:ForceEncode = $false
@@ -696,6 +762,17 @@ function Enable-DoubleBuffer($control) {
     if ($prop) { $prop.SetValue($control, $true, $null) }
 }
 
+function Enable-ResizeRedraw($control) {
+    if (-not $control) { return }
+    $flags = [Reflection.BindingFlags]'Instance,NonPublic'
+    $setStyle = $control.GetType().GetMethod('SetStyle', $flags)
+    if ($setStyle) {
+        [void]$setStyle.Invoke($control, @([Windows.Forms.ControlStyles]::ResizeRedraw, $true))
+    }
+    $update = $control.GetType().GetMethod('UpdateStyles', $flags)
+    if ($update) { [void]$update.Invoke($control, @()) }
+}
+
 function Get-AppIconPath {
     $path = Join-Path $script:Root 'vd-icon.ico'
     if (Test-Path -LiteralPath $path) { return $path }
@@ -715,14 +792,13 @@ function Get-AppIcon {
 function Update-ButtonFace($btn) {
     if ($null -eq $btn) { return }
     $role = [string]$btn.Tag
-    $gray = [Drawing.Color]::FromArgb(229, 231, 235)
-    $grayText = [Drawing.Color]::FromArgb(156, 163, 175)
     if (-not $btn.Enabled) {
-        $btn.BackColor = $gray
-        $btn.ForeColor = $grayText
-        $btn.FlatAppearance.BorderColor = $gray
-        $btn.FlatAppearance.MouseOverBackColor = $gray
-        $btn.FlatAppearance.MouseDownBackColor = $gray
+        $btn.BackColor = $script:ColorDisabled
+        $btn.ForeColor = $script:ColorDisabledText
+        $btn.FlatAppearance.BorderColor = $script:ColorDisabledBorder
+        $btn.FlatAppearance.MouseOverBackColor = $script:ColorDisabled
+        $btn.FlatAppearance.MouseDownBackColor = $script:ColorDisabled
+        $btn.Invalidate()
         return
     }
     if ($role -eq 'primary') {
@@ -732,24 +808,382 @@ function Update-ButtonFace($btn) {
         $btn.FlatAppearance.MouseOverBackColor = $script:ColorPrimaryHover
         $btn.FlatAppearance.MouseDownBackColor = $script:ColorPrimaryHover
     } elseif ($role -eq 'danger') {
-        $btn.BackColor = [Drawing.Color]::White
+        $btn.BackColor = $script:ColorDangerBack
         $btn.ForeColor = $script:ColorDanger
-        $btn.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(252, 165, 165)
-        $btn.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(254, 242, 242)
-        $btn.FlatAppearance.MouseDownBackColor = [Drawing.Color]::FromArgb(254, 226, 226)
+        $btn.FlatAppearance.BorderColor = $script:ColorDangerBorder
+        $btn.FlatAppearance.MouseOverBackColor = $script:ColorDangerHover
+        $btn.FlatAppearance.MouseDownBackColor = $script:ColorDangerDown
     } elseif ($role -eq 'alert') {
-        $btn.BackColor = [Drawing.Color]::FromArgb(185, 28, 28)
+        $btn.BackColor = $script:ColorAlert
         $btn.ForeColor = [Drawing.Color]::White
-        $btn.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(185, 28, 28)
-        $btn.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(153, 27, 27)
-        $btn.FlatAppearance.MouseDownBackColor = [Drawing.Color]::FromArgb(127, 29, 29)
+        $btn.FlatAppearance.BorderColor = $script:ColorAlert
+        $btn.FlatAppearance.MouseOverBackColor = $script:ColorAlertHover
+        $btn.FlatAppearance.MouseDownBackColor = $script:ColorAlertDown
     } else {
-        $btn.BackColor = [Drawing.Color]::White
+        $btn.BackColor = $script:ColorButton
         $btn.ForeColor = $script:ColorInk
         $btn.FlatAppearance.BorderColor = $script:ColorLine
-        $btn.FlatAppearance.MouseOverBackColor = [Drawing.Color]::FromArgb(243, 244, 246)
-        $btn.FlatAppearance.MouseDownBackColor = [Drawing.Color]::FromArgb(229, 231, 235)
+        $btn.FlatAppearance.MouseOverBackColor = $script:ColorButtonHover
+        $btn.FlatAppearance.MouseDownBackColor = $script:ColorButtonDown
     }
+}
+
+function Paint-ButtonFace($btn, $graphics) {
+    if ($null -eq $btn -or $null -eq $graphics -or $btn.Enabled) { return }
+    if ($btn.Width -lt 2 -or $btn.Height -lt 2) { return }
+    $graphics.Clear($script:ColorDisabled)
+    $pen = New-Object Drawing.Pen $script:ColorDisabledBorder
+    $graphics.DrawRectangle($pen, 0, 0, ($btn.Width - 1), ($btn.Height - 1))
+    $pen.Dispose()
+    $flags = [Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [Windows.Forms.TextFormatFlags]::VerticalCenter -bor [Windows.Forms.TextFormatFlags]::EndEllipsis -bor [Windows.Forms.TextFormatFlags]::SingleLine -bor [Windows.Forms.TextFormatFlags]::NoPadding
+    [Windows.Forms.TextRenderer]::DrawText($graphics, [string]$btn.Text, $btn.Font, $btn.ClientRectangle, $script:ColorDisabledText, $flags)
+}
+
+function Paint-CheckFace($chk, $graphics) {
+    if ($null -eq $chk -or $null -eq $graphics -or $chk.Enabled -or -not $script:DarkMode) { return }
+    if ($chk.Width -lt 8 -or $chk.Height -lt 8) { return }
+    $graphics.Clear($chk.BackColor)
+    $box = 14
+    $y = [int](($chk.Height - $box) / 2)
+    if ($y -lt 0) { $y = 0 }
+    $rect = New-Object Drawing.Rectangle 1, $y, ($box - 1), ($box - 1)
+    $fill = New-Object Drawing.SolidBrush $script:ColorDisabled
+    $graphics.FillRectangle($fill, $rect)
+    $fill.Dispose()
+    $pen = New-Object Drawing.Pen $script:ColorDisabledBorder
+    $graphics.DrawRectangle($pen, $rect)
+    $pen.Dispose()
+    if ($chk.CheckState -eq [Windows.Forms.CheckState]::Indeterminate) {
+        $bar = New-Object Drawing.SolidBrush $script:ColorDisabledText
+        $graphics.FillRectangle($bar, ($rect.X + 3), ($rect.Y + 6), 7, 2)
+        $bar.Dispose()
+    } elseif ($chk.Checked) {
+        $mark = New-Object Drawing.Pen $script:ColorDisabledText, 2
+        $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $graphics.DrawLines($mark, @(
+            (New-Object Drawing.Point ($rect.X + 3), ($rect.Y + 7)),
+            (New-Object Drawing.Point ($rect.X + 6), ($rect.Y + 10)),
+            (New-Object Drawing.Point ($rect.X + 11), ($rect.Y + 3))
+        ))
+        $mark.Dispose()
+    }
+    $textRect = New-Object Drawing.Rectangle ($box + 6), 0, ([Math]::Max(0, $chk.Width - $box - 8)), $chk.Height
+    $flags = [Windows.Forms.TextFormatFlags]::Left -bor [Windows.Forms.TextFormatFlags]::VerticalCenter -bor [Windows.Forms.TextFormatFlags]::EndEllipsis -bor [Windows.Forms.TextFormatFlags]::SingleLine -bor [Windows.Forms.TextFormatFlags]::NoPadding
+    [Windows.Forms.TextRenderer]::DrawText($graphics, [string]$chk.Text, $chk.Font, $textRect, $script:ColorDisabledInk, $flags)
+}
+
+function Paint-ComboItem($box, $e) {
+    if (-not $box -or -not $e -or -not $e.Graphics) { return }
+    $state = [int]$e.State
+    $edit = ($state -band [int][Windows.Forms.DrawItemState]::ComboBoxEdit) -ne 0
+    $selected = ($state -band [int][Windows.Forms.DrawItemState]::Selected) -ne 0
+    $text = ''
+    if ($e.Index -ge 0 -and $e.Index -lt $box.Items.Count) { $text = [string]$box.Items[$e.Index] }
+    $back = $box.BackColor
+    $fore = $box.ForeColor
+    if (-not $box.Enabled) {
+        if ($script:DarkMode) {
+            $mark = $null
+            if ($box.Tag) { $mark = Get-BudgetMark ([string]$box.Tag) }
+            if ($mark) { $back = $mark.Back } else { $back = $script:ColorDisabled }
+            $fore = $script:ColorDisabledText
+        } else {
+            $back = $script:ColorDisabled
+            $fore = $script:ColorDisabledText
+        }
+    } elseif ($selected -and -not $edit) {
+        if ($script:DarkMode) {
+            $back = $script:ColorPrimary
+            $fore = [Drawing.Color]::White
+        } else {
+            $back = [Drawing.SystemColors]::Highlight
+            $fore = [Drawing.SystemColors]::HighlightText
+        }
+    }
+    $brush = New-Object Drawing.SolidBrush $back
+    $e.Graphics.FillRectangle($brush, $e.Bounds)
+    $brush.Dispose()
+    $rect = New-Object Drawing.Rectangle ($e.Bounds.X + 4), $e.Bounds.Y, ([Math]::Max(0, $e.Bounds.Width - 8)), $e.Bounds.Height
+    $flags = [Windows.Forms.TextFormatFlags]::Left -bor [Windows.Forms.TextFormatFlags]::VerticalCenter -bor [Windows.Forms.TextFormatFlags]::EndEllipsis -bor [Windows.Forms.TextFormatFlags]::SingleLine -bor [Windows.Forms.TextFormatFlags]::NoPadding
+    $font = $e.Font
+    if (-not $font) { $font = $box.Font }
+    if ($rect.Width -gt 0 -and $rect.Height -gt 0 -and $font) {
+        [Windows.Forms.TextRenderer]::DrawText($e.Graphics, $text, $font, $rect, $fore, $flags)
+    }
+    $focused = ($state -band [int][Windows.Forms.DrawItemState]::Focus) -ne 0
+    if ($focused -and -not $edit -and $box.Enabled) { $e.DrawFocusRectangle() }
+}
+
+function Install-ComboDraw($box) {
+    if (-not $box) { return }
+    if ($box.DrawMode -eq [Windows.Forms.DrawMode]::OwnerDrawFixed) { return }
+    $height = [int]$box.Height
+    if ($height -lt 18) { $height = 24 }
+    if ($height -gt 32) { $height = 28 }
+    $box.DrawMode = [Windows.Forms.DrawMode]::OwnerDrawFixed
+    $box.ItemHeight = $height
+    $box.Add_DrawItem({ Paint-ComboItem $this $_ })
+}
+
+function Set-EntryColors($entry) {
+    if (-not $entry) { return }
+    $entry.BackColor = $script:ColorField
+    $entry.ForeColor = $script:ColorInk
+}
+
+function Paint-SplitBar($panel, $graphics, [bool]$hot) {
+    if (-not $panel -or -not $graphics) { return }
+    $mid = [int]($panel.ClientSize.Height / 2)
+    $pen = New-Object Drawing.Pen $script:ColorRule, 2
+    $graphics.DrawLine($pen, 0, $mid, $panel.ClientSize.Width, $mid)
+    $pen.Dispose()
+    $tone = $(if ($hot) { $script:ColorGripHot } else { $script:ColorGrip })
+    $brush = New-Object Drawing.SolidBrush $tone
+    $cx = [int]($panel.ClientSize.Width / 2)
+    foreach ($offset in @(-18, -6, 6, 18)) {
+        $graphics.FillRectangle($brush, ($cx + $offset), ($mid - 2), 4, 4)
+    }
+    $brush.Dispose()
+}
+
+function Paint-RuleBorder($graphics, [int]$width, [int]$height) {
+    if (-not $graphics -or $width -lt 4 -or $height -lt 4) { return }
+    $pen = New-Object Drawing.Pen $script:ColorRule, 2
+    $graphics.DrawRectangle($pen, 1, 1, ($width - 3), ($height - 3))
+    $pen.Dispose()
+}
+
+function Update-ButtonTree($parent) {
+    if (-not $parent) { return }
+    foreach ($control in @($parent.Controls)) {
+        if ($control -is [Windows.Forms.Button]) { Update-ButtonFace $control }
+        if ($control.Controls.Count -gt 0) { Update-ButtonTree $control }
+    }
+}
+
+function Update-HelpColors {
+    $box = $script:HelpBox
+    if (-not $box -or $box.IsDisposed -or -not $script:HelpMarks) { return }
+    $box.BackColor = $script:ColorCard
+    $box.ForeColor = $script:ColorInk
+    $marks = @($script:HelpMarks.GetEnumerator() | Sort-Object { [int]$_.Value })
+    if ($marks.Count -eq 0) { return }
+    $savedStart = $box.SelectionStart
+    $savedLength = $box.SelectionLength
+    $end = $box.TextLength
+    for ($i = 0; $i -lt $marks.Count; $i++) {
+        $start = [int]$marks[$i].Value
+        $next = $end
+        if (($i + 1) -lt $marks.Count) { $next = [int]$marks[$i + 1].Value }
+        $titleLen = ([string]$marks[$i].Key).Length
+        if ($titleLen -gt 0 -and ($start + $titleLen) -le $end) {
+            $box.Select($start, $titleLen)
+            $box.SelectionColor = $script:ColorInk
+        }
+        $bodyStart = $start + $titleLen
+        if ($bodyStart -lt $next) {
+            $box.Select($bodyStart, ($next - $bodyStart))
+            $box.SelectionColor = $script:ColorBody
+        }
+    }
+    $box.Select($savedStart, $savedLength)
+}
+
+function Update-HelpTheme {
+    $form = $script:HelpForm
+    if (-not $form -or $form.IsDisposed) { return }
+    $form.BackColor = $script:ColorCard
+    foreach ($control in @($form.Controls)) {
+        if (-not ($control -is [Windows.Forms.Panel])) { continue }
+        $heading = $null
+        $close = $null
+        foreach ($child in @($control.Controls)) {
+            if ($child -is [Windows.Forms.Label] -and $child.Text -eq 'How this works') { $heading = $child }
+            if ($child -is [Windows.Forms.Button]) { $close = $child }
+        }
+        if ($heading) {
+            $control.BackColor = $script:ColorHeader
+            foreach ($child in @($control.Controls)) {
+                $child.BackColor = $script:ColorHeader
+                if ($child -eq $heading) { $child.ForeColor = [Drawing.Color]::White }
+                elseif ($child -is [Windows.Forms.Label]) { $child.ForeColor = $script:ColorHeaderMuted }
+            }
+            continue
+        }
+        if ($close) {
+            $control.BackColor = $script:ColorPage
+            Update-ButtonFace $close
+            $control.Invalidate()
+            continue
+        }
+        $control.BackColor = $script:ColorCard
+        foreach ($child in @($control.Controls)) {
+            if ($child -is [Windows.Forms.RichTextBox]) {
+                $child.BackColor = $script:ColorCard
+                $child.ForeColor = $script:ColorInk
+            }
+        }
+    }
+    Update-HelpColors
+}
+
+function Update-CompareTheme {
+    if ($script:CompareTitle -and -not $script:CompareTitle.IsDisposed -and $script:CompareTitle.Parent) {
+        $top = $script:CompareTitle.Parent
+        $top.BackColor = $script:ColorHeader
+        foreach ($child in @($top.Controls)) {
+            $child.BackColor = $script:ColorHeader
+            if ($child -eq $script:CompareTitle) { $child.ForeColor = [Drawing.Color]::White }
+            elseif ($child -is [Windows.Forms.Label]) { $child.ForeColor = $script:ColorHeaderMuted }
+        }
+    }
+    if ($script:PlayButton -and -not $script:PlayButton.IsDisposed) {
+        Update-ButtonFace $script:PlayButton
+        if ($script:PlayButton.Parent) { $script:PlayButton.Parent.BackColor = $script:ColorPage }
+    }
+    if ($script:PlaySlider -and -not $script:PlaySlider.IsDisposed) { $script:PlaySlider.BackColor = $script:ColorPage }
+    if ($script:PlayTime -and -not $script:PlayTime.IsDisposed) {
+        $script:PlayTime.ForeColor = $script:ColorInk
+        $script:PlayTime.BackColor = $script:ColorPage
+    }
+}
+
+function Apply-MainTheme {
+    if ($script:Form) { $script:Form.BackColor = $script:ColorPage }
+    if ($script:Header) { $script:Header.BackColor = $script:ColorHeader }
+    if ($script:TitleLabel) {
+        $script:TitleLabel.ForeColor = [Drawing.Color]::White
+        $script:TitleLabel.BackColor = $script:ColorHeader
+    }
+    if ($script:SubtitleLabel) {
+        $script:SubtitleLabel.ForeColor = $script:ColorHeaderMuted
+        $script:SubtitleLabel.BackColor = $script:ColorHeader
+    }
+    if ($script:MainTable) { $script:MainTable.BackColor = $script:ColorPage }
+    foreach ($label in @($script:FolderCaption, $script:HintLabel, $script:ListLabel, $script:ActivityLabel, $script:JobLabel, $script:CpuUseLabel, $script:FindLabel)) {
+        if (-not $label) { continue }
+        $label.ForeColor = $(if ($label -eq $script:HintLabel) { $script:ColorMuted } else { $script:ColorInk })
+        $label.BackColor = $script:ColorPage
+    }
+    if ($script:SavingsLabel) {
+        $script:SavingsLabel.ForeColor = $script:ColorOkText
+        $script:SavingsLabel.BackColor = $script:ColorPage
+    }
+    foreach ($panel in @($script:HintPanel, $script:ListHeader, $script:ActionPanel, $script:ListSplit, $script:LogSplit)) {
+        if ($panel) { $panel.BackColor = $script:ColorPage }
+    }
+    foreach ($panel in @($script:FolderCard, $script:OptionsCard, $script:StatusPanel, $script:JobHost, $script:JobSplit)) {
+        if ($panel) { $panel.BackColor = $script:ColorCard }
+    }
+    foreach ($label in @($script:FolderLabel, $script:OptionsTitle, $script:BudgetTitle, $script:StatusLabel, $script:EtaLabel, $script:BatchLabel, $script:VersionLabel)) {
+        if (-not $label) { continue }
+        $label.BackColor = $script:ColorCard
+    }
+    if ($script:FolderLabel) { $script:FolderLabel.ForeColor = $script:ColorInk }
+    if ($script:OptionsTitle) { $script:OptionsTitle.ForeColor = $script:ColorInk }
+    if ($script:BudgetTitle) { $script:BudgetTitle.ForeColor = $script:ColorInk }
+    if ($script:EtaLabel) { $script:EtaLabel.ForeColor = $script:ColorInk }
+    if ($script:BatchLabel) { $script:BatchLabel.ForeColor = $script:ColorInk }
+    if ($script:VersionLabel) { $script:VersionLabel.ForeColor = $script:ColorMuted }
+    $kind = [string]$script:StatusKind
+    if ($script:StatusLabel) {
+        if ($kind -eq 'ok') { $script:StatusLabel.ForeColor = $script:ColorOkText }
+        elseif ($kind -eq 'err') { $script:StatusLabel.ForeColor = $script:ColorErrText }
+        elseif ($kind -eq 'busy') { $script:StatusLabel.ForeColor = $script:ColorInk }
+        else { $script:StatusLabel.ForeColor = $script:ColorMuted }
+    }
+    Set-EntryColors $script:FolderBox
+    foreach ($box in @($script:FolderPick, $script:OverPick, $script:JobBox, $script:CpuUseBox, $script:FindBox)) {
+        Set-EntryColors $box
+    }
+    if ($script:Files) {
+        $script:Files.BackColor = $script:ColorCard
+        $script:Files.ForeColor = $script:ColorInk
+    }
+    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:RecycleCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
+        if (-not $chk) { continue }
+        $chk.ForeColor = $script:ColorInk
+        $chk.BackColor = $script:ColorCard
+    }
+    if ($script:DarkModeCheck) {
+        $script:DarkModeCheck.ForeColor = [Drawing.Color]::White
+        $script:DarkModeCheck.BackColor = $script:ColorHeader
+    }
+    if ($script:DynamicCheck) {
+        $script:DynamicCheck.ForeColor = $script:ColorInk
+        $script:DynamicCheck.BackColor = $script:ColorPage
+    }
+    if ($script:ShowMenu) {
+        $script:ShowMenu.BackColor = $script:ColorCard
+        $script:ShowMenu.ForeColor = $script:ColorInk
+    }
+    if ($script:ShowBoxes) {
+        foreach ($key in @($script:ShowBoxes.Keys)) {
+            $box = $script:ShowBoxes[$key]
+            if (-not $box) { continue }
+            $box.BackColor = $script:ColorCard
+            $box.ForeColor = $script:ColorInk
+        }
+    }
+    if ($script:FileMenu) {
+        $script:FileMenu.BackColor = $script:ColorCard
+        $script:FileMenu.ForeColor = $script:ColorInk
+    }
+    if ($script:BudgetBoxes) {
+        for ($i = 0; $i -lt @($script:BudgetBoxes).Count; $i++) {
+            $box = $script:BudgetBoxes[$i]
+            if (-not $box) { continue }
+            $mark = Get-BudgetMark ([string]$box.Tag)
+            if ($mark) {
+                $box.BackColor = $mark.Back
+                $box.ForeColor = $mark.Fore
+            }
+            if ($script:BudgetLabels -and $i -lt @($script:BudgetLabels).Count -and $script:BudgetLabels[$i]) {
+                $script:BudgetLabels[$i].BackColor = $script:ColorCard
+                $script:BudgetLabels[$i].ForeColor = $(if ($mark) { $mark.Fore } else { $script:ColorInk })
+            }
+            if ($script:BudgetSwatches -and $i -lt @($script:BudgetSwatches).Count -and $script:BudgetSwatches[$i]) {
+                $script:BudgetSwatches[$i].BackColor = $(if ($mark) { $mark.Mark } else { $script:ColorLine })
+            }
+        }
+    }
+    if ($script:ProgressTrack) { $script:ProgressTrack.BackColor = $script:ColorTrack }
+    if ($script:ProgressFill) { $script:ProgressFill.BackColor = $script:ColorPrimary }
+    if ($script:JobRows) {
+        foreach ($row in @($script:JobRows)) {
+            if (-not $row) { continue }
+            if ($row.Panel) { $row.Panel.BackColor = $script:ColorCard }
+            if ($row.Label) {
+                $row.Label.ForeColor = $script:ColorInk
+                $row.Label.BackColor = $script:ColorCard
+            }
+            if ($row.Track) { $row.Track.BackColor = $script:ColorTrack }
+            if ($row.Fill) { $row.Fill.BackColor = $script:ColorPrimary }
+        }
+    }
+    if ($script:LogHost) { $script:LogHost.BackColor = $script:ColorLogBg }
+    if ($script:Log) {
+        $script:Log.BackColor = $script:ColorLogBg
+        $script:Log.ForeColor = $script:ColorLogText
+    }
+    if ($script:Form) { Update-ButtonTree $script:Form }
+    foreach ($chk in @($script:SubfoldersCheck, $script:AutoCheck, $script:RecycleCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck, $script:DynamicCheck, $script:DarkModeCheck)) {
+        if ($chk) { $chk.Invalidate() }
+    }
+    foreach ($box in @($script:FolderPick, $script:OverPick, $script:JobBox, $script:CpuUseBox, $script:FindBox)) {
+        if ($box) { $box.Invalidate() }
+    }
+    if ($script:BudgetBoxes) {
+        foreach ($box in @($script:BudgetBoxes)) { if ($box) { $box.Invalidate() } }
+    }
+    if (Get-Command Get-EveryFileItem -ErrorAction SilentlyContinue) {
+        foreach ($item in @(Get-EveryFileItem)) { Update-ResultRow $item }
+    }
+    foreach ($panel in @($script:FolderCard, $script:OptionsCard, $script:StatusPanel, $script:ListSplit, $script:LogSplit, $script:JobSplit, $script:LogHost)) {
+        if ($panel) { $panel.Invalidate() }
+    }
+    Update-HelpTheme
+    Update-CompareTheme
 }
 
 function New-Button([string]$text, [string]$role, [int]$width, [int]$height) {
@@ -765,6 +1199,7 @@ function New-Button([string]$text, [string]$role, [int]$width, [int]$height) {
     $btn.Margin = New-Object Windows.Forms.Padding(0, 4, 8, 0)
     if ($role -eq 'primary' -or $role -eq 'alert') { $btn.Font = $script:FontButtonBold } else { $btn.Font = $script:FontButton }
     $btn.Add_EnabledChanged({ Update-ButtonFace $this })
+    $btn.Add_Paint({ Paint-ButtonFace $this $_.Graphics })
     Update-ButtonFace $btn
     return $btn
 }
@@ -775,8 +1210,9 @@ function New-Check([string]$text) {
     $chk.AutoSize = $true
     $chk.Font = $script:FontUi
     $chk.ForeColor = $script:ColorInk
-    $chk.BackColor = [Drawing.Color]::White
+    $chk.BackColor = $script:ColorCard
     $chk.UseVisualStyleBackColor = $false
+    $chk.Add_Paint({ Paint-CheckFace $this $_.Graphics })
     return $chk
 }
 
@@ -1166,6 +1602,7 @@ function Load-Settings {
         DynamicJobs = $false
         CpuTarget = 100
         FindLimit = 0
+        DarkMode = $false
     }
     if (-not (Test-Path -LiteralPath $script:SettingsPath)) { return $defaults }
     try {
@@ -1221,6 +1658,7 @@ function Load-Settings {
                 if (@(0, 5, 10, 25, 50, 100) -contains $findLimit) { $defaults.FindLimit = $findLimit }
             }
         }
+        if ($null -ne $json.darkMode) { $defaults.DarkMode = [bool]$json.darkMode }
         if ($null -ne $json.logExtra) {
             $rawLog = [string]$json.logExtra
             if ($rawLog -match '^-?\d+$') {
@@ -1287,6 +1725,7 @@ function Save-Settings {
         dynamicJobs = (Test-DynamicJobs)
         cpuTarget = (Get-CpuTarget)
         findLimit = (Get-FindLimit)
+        darkMode = [bool]$script:DarkMode
     }
     $json = $obj | ConvertTo-Json
     $utf8 = New-Object System.Text.UTF8Encoding $true
@@ -1825,7 +2264,7 @@ function Update-BudgetCell($item) {
         $cell.ForeColor = $mark.Fore
     } else {
         $cell.ForeColor = $script:ColorInk
-        $cell.BackColor = [Drawing.Color]::White
+        $cell.BackColor = $script:ColorCard
     }
 }
 
@@ -1844,15 +2283,22 @@ function Update-OverCell($item) {
         $cell.BackColor = $script:ColorOverExtremeBack
     } else {
         $cell.ForeColor = $script:ColorInk
-        $cell.BackColor = [Drawing.Color]::White
+        $cell.BackColor = $script:ColorCard
     }
 }
 
 function Update-ResultRow($item) {
     if ($null -eq $item) { return }
     $tag = $item.Tag
+    $item.UseItemStyleForSubItems = $false
+    $item.ForeColor = $script:ColorInk
+    $item.BackColor = $script:ColorCard
     $item.Text = Get-RowText $tag 0
-    for ($i = 1; $i -le 11; $i++) { $item.SubItems[$i].Text = Get-RowText $tag $i }
+    for ($i = 1; $i -le 11; $i++) {
+        $item.SubItems[$i].Text = Get-RowText $tag $i
+        $item.SubItems[$i].ForeColor = $script:ColorInk
+        $item.SubItems[$i].BackColor = $script:ColorCard
+    }
     Update-OverCell $item
     Update-BudgetCell $item
     $tip = [string]$tag.Path
@@ -3896,14 +4342,14 @@ function New-ShutdownForm {
     $form.KeyPreview = $true
     $form.ClientSize = New-Object Drawing.Size(480, 176)
     $form.Font = $script:FontUi
-    $form.BackColor = [Drawing.Color]::White
+    $form.BackColor = $script:ColorCard
     $icon = Get-AppIcon
     if ($icon) { $form.Icon = $icon }
     $script:ShutdownSeconds = 60
     $label = New-Object Windows.Forms.Label
     $label.Font = $script:FontUi
     $label.ForeColor = $script:ColorInk
-    $label.BackColor = [Drawing.Color]::White
+    $label.BackColor = $script:ColorCard
     $label.SetBounds(24, 20, 432, 78)
     $script:ShutdownLabel = $label
     $label.Text = "Convert finished. This computer will shut down in 60 seconds.`r`n`r`nCancel if you want to keep working. Open programs will close."
@@ -4030,13 +4476,13 @@ function New-AutoWarnForm {
     $form.KeyPreview = $true
     $form.ClientSize = New-Object Drawing.Size(520, 292)
     $form.Font = $script:FontUi
-    $form.BackColor = [Drawing.Color]::White
+    $form.BackColor = $script:ColorCard
     $icon = Get-AppIcon
     if ($icon) { $form.Icon = $icon }
     $label = New-Object Windows.Forms.Label
     $label.Font = $script:FontUi
     $label.ForeColor = $script:ColorInk
-    $label.BackColor = [Drawing.Color]::White
+    $label.BackColor = $script:ColorCard
     $label.SetBounds(24, 16, 472, 168)
     $label.Text = "Delete originals automatically removes each original as soon as its new file checks out.`r`n`r`nThe check looks at size, length, picture size, audio, subtitles, and whether the start and end play. When a header says the file is longer than the picture and sound inside it, the length check uses that picture and sound. It does not judge how the picture looks.`r`n`r`nAfter the original is deleted, Compare and Undo cannot bring it back."
     $hide = New-Check "Don't show this again"
@@ -4188,17 +4634,18 @@ function New-ForcePickForm {
     $form.KeyPreview = $true
     $form.ClientSize = New-Object Drawing.Size(560, 268)
     $form.Font = $script:FontUi
-    $form.BackColor = [Drawing.Color]::White
+    $form.BackColor = $script:ColorCard
     $icon = Get-AppIcon
     if ($icon) { $form.Icon = $icon }
     $label = New-Object Windows.Forms.Label
     $label.Font = $script:FontUi
     $label.ForeColor = $script:ColorInk
-    $label.BackColor = [Drawing.Color]::White
+    $label.BackColor = $script:ColorCard
     $label.SetBounds(20, 16, 520, 88)
     $label.Text = "Manual converts a file or a folder even when Scan would leave it alone. Test savings reads the files and estimates the new size. It does not encode. Convert now starts immediately. A result that is not smaller is thrown away."
     $path = New-Object Windows.Forms.TextBox
     $path.Font = $script:FontUi
+    Set-EntryColors $path
     $path.SetBounds(20, 112, 400, 26)
     $path.Text = Get-ForceStartPath
     $fileBtn = New-Button 'Browse file' 'secondary' 120 30
@@ -4270,7 +4717,7 @@ function New-ForceReportForm {
     $form.KeyPreview = $true
     $form.ClientSize = New-Object Drawing.Size(560, 400)
     $form.Font = $script:FontUi
-    $form.BackColor = [Drawing.Color]::White
+    $form.BackColor = $script:ColorCard
     $icon = Get-AppIcon
     if ($icon) { $form.Icon = $icon }
     $box = New-Object Windows.Forms.TextBox
@@ -4278,6 +4725,7 @@ function New-ForceReportForm {
     $box.ReadOnly = $true
     $box.ScrollBars = 'Vertical'
     $box.Font = $script:FontUi
+    Set-EntryColors $box
     $box.SetBounds(20, 16, 520, 300)
     $box.Text = $Report
     $proceed = New-Button 'Proceed' 'primary' 120 34
@@ -4552,13 +5000,13 @@ function New-RecycleProblemForm($Problems) {
     $form.ClientSize = New-Object Drawing.Size(560, 500)
     $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
     $form.Font = $script:FontUi
-    $form.BackColor = [Drawing.Color]::White
+    $form.BackColor = $script:ColorCard
     $icon = Get-AppIcon
     if ($icon) { $form.Icon = $icon }
     $intro = New-Object Windows.Forms.Label
     $intro.Font = $script:FontUi
     $intro.ForeColor = $script:ColorInk
-    $intro.BackColor = [Drawing.Color]::White
+    $intro.BackColor = $script:ColorCard
     $intro.SetBounds(24, 16, 512, 210)
     $intro.Text = "The original is already deleted from the library. The drive recycle bin may still have a copy, and the program could not remove it.`r`n`r`nThe link below opens the manual steps. Those steps remove only .vd-originals folders inside #recycle. A share that does not keep a recycle bin can show this same window, and then there is nothing to remove.`r`n`r`nMute hides this window after this one time. The activity list still records a later failure, and the steps stay in How this works."
     $detail = New-Object Windows.Forms.TextBox
@@ -4566,13 +5014,15 @@ function New-RecycleProblemForm($Problems) {
     $detail.ReadOnly = $true
     $detail.ScrollBars = 'Vertical'
     $detail.Font = $script:FontUi
+    Set-EntryColors $detail
     $detail.SetBounds(24, 234, 512, 128)
     $detail.Text = Format-RecycleProblemText $Problems
     $link = New-Object Windows.Forms.LinkLabel
     $link.Text = 'Show the manual deletion steps'
     $link.Font = $script:FontUi
-    $link.LinkColor = [Drawing.Color]::FromArgb(37, 99, 235)
-    $link.ActiveLinkColor = [Drawing.Color]::FromArgb(29, 78, 216)
+    $link.LinkColor = $script:ColorLink
+    $link.ActiveLinkColor = $script:ColorLinkActive
+    $link.BackColor = $script:ColorCard
     $link.AutoSize = $true
     $link.Location = New-Object Drawing.Point(24, 374)
     $mute = New-Button 'Mute' 'secondary' 110 34
@@ -4650,13 +5100,13 @@ function New-AutoAskForm {
     $form.KeyPreview = $true
     $form.ClientSize = New-Object Drawing.Size(540, 326)
     $form.Font = $script:FontUi
-    $form.BackColor = [Drawing.Color]::White
+    $form.BackColor = $script:ColorCard
     $icon = Get-AppIcon
     if ($icon) { $form.Icon = $icon }
     $label = New-Object Windows.Forms.Label
     $label.Font = $script:FontUi
     $label.ForeColor = $script:ColorInk
-    $label.BackColor = [Drawing.Color]::White
+    $label.BackColor = $script:ColorCard
     $label.SetBounds(24, 16, 492, 176)
     $label.Text = "Auto is on.`r`n`r`nAfter each file checks out, its original is deleted. The new file stays in the original's place. There will be nothing left to compare. When Clear the drive recycle copy is on, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder."
     $hide = New-Check 'Stop asking'
@@ -4727,13 +5177,13 @@ function New-DeleteConfirmForm([int]$Count) {
     $form.KeyPreview = $true
     $form.ClientSize = New-Object Drawing.Size(540, 320)
     $form.Font = $script:FontUi
-    $form.BackColor = [Drawing.Color]::White
+    $form.BackColor = $script:ColorCard
     $icon = Get-AppIcon
     if ($icon) { $form.Icon = $icon }
     $label = New-Object Windows.Forms.Label
     $label.Font = $script:FontUi
     $label.ForeColor = $script:ColorInk
-    $label.BackColor = [Drawing.Color]::White
+    $label.BackColor = $script:ColorCard
     $label.SetBounds(24, 16, 492, 168)
     $label.Text = "Delete $Count $word?`r`n`r`nThe new smaller files stay where the originals were. When Clear the drive recycle copy is on, the matching copy in #recycle is removed when the path and the size match. The .plexignore from that convert is removed when it only hides the holding folder."
     $hide = New-Check "Don't show this in the future"
@@ -4741,7 +5191,7 @@ function New-DeleteConfirmForm([int]$Count) {
     $hint = New-Object Windows.Forms.Label
     $hint.Font = $script:FontHint
     $hint.ForeColor = $script:ColorMuted
-    $hint.BackColor = [Drawing.Color]::White
+    $hint.BackColor = $script:ColorCard
     $hint.SetBounds(24, 224, 492, 28)
     $hint.Text = 'This question comes back when a new version of the program is installed.'
     $delete = New-Button 'Delete' 'primary' 140 34
@@ -5079,13 +5529,13 @@ function New-BugReportForm {
     $form.KeyPreview = $true
     $form.ClientSize = New-Object Drawing.Size(520, 262)
     $form.Font = $script:FontUi
-    $form.BackColor = [Drawing.Color]::White
+    $form.BackColor = $script:ColorCard
     $icon = Get-AppIcon
     if ($icon) { $form.Icon = $icon }
     $label = New-Object Windows.Forms.Label
     $label.Font = $script:FontUi
     $label.ForeColor = $script:ColorInk
-    $label.BackColor = [Drawing.Color]::White
+    $label.BackColor = $script:ColorCard
     $label.SetBounds(24, 16, 472, 128)
     $label.Text = "Report a bug opens a GitHub page. This version and the Windows version are filled in. Nothing else is added unless you check the box.`r`n`r`nInclude latest activity adds the latest lines from the activity box to that page. Those lines can include folder paths. This program does not send the report. You submit it on the GitHub page."
     $include = New-Check 'Include latest activity'
@@ -5254,14 +5704,14 @@ function Show-FaultReport {
     $form.KeyPreview = $true
     $form.ClientSize = New-Object Drawing.Size(640, 420)
     $form.Font = $script:FontUi
-    $form.BackColor = [Drawing.Color]::White
+    $form.BackColor = $script:ColorCard
     $icon = Get-AppIcon
     if ($icon) { $form.Icon = $icon }
     $word = if ($records.Count -eq 1) { 'file' } else { 'files' }
     $label = New-Object Windows.Forms.Label
     $label.Font = $script:FontUi
     $label.ForeColor = $script:ColorInk
-    $label.BackColor = [Drawing.Color]::White
+    $label.BackColor = $script:ColorCard
     $label.SetBounds(16, 12, 608, 88)
     $label.Text = "$($records.Count) $word failed the encode or the end check. The original stayed in place.`r`n`r`nOpen GitHub report fills in a new issue with the path, the probe, the failure, the encode command, and the HandBrake notes. You submit it on the GitHub page. This program does not send it. The same report is copied, in case the page cuts it off."
     $listing = New-Object Windows.Forms.TextBox
@@ -5269,6 +5719,7 @@ function Show-FaultReport {
     $listing.ReadOnly = $true
     $listing.ScrollBars = 'Vertical'
     $listing.Font = $script:FontUi
+    Set-EntryColors $listing
     $listing.SetBounds(16, 108, 608, 210)
     $shown = New-Object System.Collections.Generic.List[string]
     foreach ($record in $records) {
@@ -5284,7 +5735,7 @@ function Show-FaultReport {
     $note = New-Object Windows.Forms.Label
     $note.Font = $script:FontUi
     $note.ForeColor = $script:ColorInk
-    $note.BackColor = [Drawing.Color]::White
+    $note.BackColor = $script:ColorCard
     $note.SetBounds(16, 324, 608, 36)
     $note.Text = 'The HandBrake notes in the link are shortened. The copy has the full notes.'
     $note.Visible = [bool]$issue.Trimmed
@@ -6044,6 +6495,17 @@ function Update-ChromeLayout {
             $script:UpdateButton.Location = New-Object Drawing.Point(($right - $script:UpdateButton.Width), 18)
             $script:CheckUpdateButton.Location = New-Object Drawing.Point(($script:UpdateButton.Left - 8 - $script:CheckUpdateButton.Width), 18)
             $leftEdge = $script:CheckUpdateButton.Left
+            if ($script:DarkModeCheck) {
+                $pref = $script:DarkModeCheck.PreferredSize
+                $boxW = [int]$pref.Width
+                $boxH = [int]$pref.Height
+                if ($boxW -lt 20) { $boxW = 118 }
+                if ($boxH -lt 16) { $boxH = 22 }
+                $boxY = 18 + [int]((34 - $boxH) / 2)
+                if ($boxY -lt 8) { $boxY = 8 }
+                $script:DarkModeCheck.Location = New-Object Drawing.Point(($script:CheckUpdateButton.Left - 12 - $boxW), $boxY)
+                $leftEdge = $script:DarkModeCheck.Left
+            }
             if ($script:ReportBugButton -and $script:DonateButton) {
                 $script:ReportBugButton.Location = New-Object Drawing.Point(($right - $script:ReportBugButton.Width), 60)
                 $script:DonateButton.Location = New-Object Drawing.Point(($script:ReportBugButton.Left - 8 - $script:DonateButton.Width), 60)
@@ -6239,7 +6701,7 @@ function New-HelpForm {
     $help.Text = 'How this works'
     $help.StartPosition = 'CenterParent'
     $help.Font = $script:FontUi
-    $help.BackColor = [Drawing.Color]::White
+    $help.BackColor = $script:ColorCard
     $help.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
     $help.MinimizeBox = $false
     $help.MaximizeBox = $true
@@ -6282,21 +6744,23 @@ function New-HelpForm {
     Set-Tip $close 'Close this guide.'
     $footer.Add_Resize({ $this.Controls[0].Location = New-Object Drawing.Point(($this.ClientSize.Width - $this.Controls[0].Width - 24), 14) })
     $footer.Add_Paint({
-        $pen = New-Object Drawing.Pen $script:ColorLine
-        $_.Graphics.DrawLine($pen, 0, 0, $this.Width, 0)
+        $pen = New-Object Drawing.Pen $script:ColorRule, 2
+        $_.Graphics.DrawLine($pen, 0, 1, $this.Width, 1)
         $pen.Dispose()
     })
+    Enable-ResizeRedraw $footer
     $close.Add_Click({ $script:HelpForm.Close() })
 
     $bodyHost = New-Object Windows.Forms.Panel
     $bodyHost.Dock = 'Fill'
-    $bodyHost.BackColor = [Drawing.Color]::White
+    $bodyHost.BackColor = $script:ColorCard
     $bodyHost.Padding = New-Object Windows.Forms.Padding(24, 12, 12, 8)
     $box = New-Object Windows.Forms.RichTextBox
     $box.Dock = 'Fill'
     $box.BorderStyle = 'None'
     $box.ReadOnly = $true
-    $box.BackColor = [Drawing.Color]::White
+    $box.BackColor = $script:ColorCard
+    $box.ForeColor = $script:ColorInk
     $box.Font = $script:FontHelpBody
     $box.DetectUrls = $false
     $box.ScrollBars = 'Vertical'
@@ -6373,6 +6837,7 @@ $script:Tips.AutoPopDelay = 20000
 $script:Tips.ShowAlways = $true
 
 $settings = Load-Settings
+Set-ThemePalette ([bool]$settings.DarkMode)
 $script:AutoWarnAccepted = [bool]$settings.AutoWarnAccepted
 $script:AutoAsk = [bool]$settings.AutoAsk
 $script:UpdatePrompt = [string]$settings.UpdatePrompt
@@ -6433,8 +6898,19 @@ $script:DonateButton = New-Button 'Donate' 'secondary' 96 28
 $script:ReportBugButton = New-Button 'Report a bug' 'secondary' 132 28
 $script:FaultButton = New-Button 'Faulty source file' 'alert' 196 28
 $script:FaultButton.Enabled = $false
+$script:DarkModeCheck = New-Check 'Dark mode'
+$script:DarkModeCheck.ForeColor = [Drawing.Color]::White
+$script:DarkModeCheck.BackColor = $script:ColorHeader
+$script:DarkModeCheck.Checked = [bool]$settings.DarkMode
+$script:DarkModeCheck.Add_CheckedChanged({
+    if ($script:Loading) { return }
+    Set-ThemePalette ([bool]$script:DarkModeCheck.Checked)
+    Apply-MainTheme
+    Save-Settings
+})
 $script:Header.Controls.Add($script:TitleLabel)
 $script:Header.Controls.Add($script:SubtitleLabel)
+$script:Header.Controls.Add($script:DarkModeCheck)
 $script:Header.Controls.Add($script:CheckUpdateButton)
 $script:Header.Controls.Add($script:UpdateButton)
 $script:Header.Controls.Add($script:DonateButton)
@@ -6444,25 +6920,25 @@ $script:Header.Controls.Add($script:FaultButton)
 $script:StatusPanel = New-Object Windows.Forms.Panel
 $script:StatusPanel.Dock = 'Bottom'
 $script:StatusPanel.Height = 58
-$script:StatusPanel.BackColor = [Drawing.Color]::White
+$script:StatusPanel.BackColor = $script:ColorCard
 $script:StatusLabel = New-Object Windows.Forms.Label
 $script:StatusLabel.Text = 'Ready'
 $script:StatusLabel.Font = $script:FontUi
 $script:StatusLabel.ForeColor = $script:ColorMuted
 $script:StatusLabel.AutoEllipsis = $true
-$script:StatusLabel.BackColor = [Drawing.Color]::White
+$script:StatusLabel.BackColor = $script:ColorCard
 $script:EtaLabel = New-Object Windows.Forms.Label
 $script:EtaLabel.Text = ''
 $script:EtaLabel.Font = $script:FontUi
 $script:EtaLabel.ForeColor = $script:ColorInk
 $script:EtaLabel.AutoEllipsis = $true
-$script:EtaLabel.BackColor = [Drawing.Color]::White
+$script:EtaLabel.BackColor = $script:ColorCard
 $script:EtaLabel.Visible = $false
 $script:BatchLabel = New-Object Windows.Forms.Label
 $script:BatchLabel.Text = ''
 $script:BatchLabel.Font = $script:FontButtonBold
 $script:BatchLabel.ForeColor = $script:ColorInk
-$script:BatchLabel.BackColor = [Drawing.Color]::White
+$script:BatchLabel.BackColor = $script:ColorCard
 $script:BatchLabel.AutoEllipsis = $true
 $script:BatchLabel.Visible = $false
 $script:BatchTotal = 0
@@ -6470,11 +6946,11 @@ $script:VersionLabel = New-Object Windows.Forms.Label
 $script:VersionLabel.Text = Get-AppVersion
 $script:VersionLabel.Font = $script:FontHint
 $script:VersionLabel.ForeColor = $script:ColorMuted
-$script:VersionLabel.BackColor = [Drawing.Color]::White
+$script:VersionLabel.BackColor = $script:ColorCard
 $script:VersionLabel.TextAlign = 'MiddleRight'
 $script:VersionLabel.AutoSize = $true
 $script:ProgressTrack = New-Object Windows.Forms.Panel
-$script:ProgressTrack.BackColor = [Drawing.Color]::FromArgb(229, 231, 235)
+$script:ProgressTrack.BackColor = $script:ColorTrack
 $script:ProgressTrack.Height = 8
 $script:ProgressFill = New-Object Windows.Forms.Panel
 $script:ProgressFill.BackColor = $script:ColorPrimary
@@ -6483,14 +6959,14 @@ $script:ProgressFill.Width = 0
 $script:ProgressTrack.Controls.Add($script:ProgressFill)
 function New-JobRow {
     $panel = New-Object Windows.Forms.Panel
-    $panel.BackColor = [Drawing.Color]::White
+    $panel.BackColor = $script:ColorCard
     $label = New-Object Windows.Forms.Label
     $label.Font = $script:FontUi
     $label.ForeColor = $script:ColorInk
-    $label.BackColor = [Drawing.Color]::White
+    $label.BackColor = $script:ColorCard
     $label.AutoEllipsis = $true
     $track = New-Object Windows.Forms.Panel
-    $track.BackColor = [Drawing.Color]::FromArgb(229, 231, 235)
+    $track.BackColor = $script:ColorTrack
     $track.Height = 8
     $fill = New-Object Windows.Forms.Panel
     $fill.BackColor = $script:ColorPrimary
@@ -6502,7 +6978,7 @@ function New-JobRow {
     return @{ Panel = $panel; Label = $label; Track = $track; Fill = $fill }
 }
 $script:JobHost = New-Object Windows.Forms.Panel
-$script:JobHost.BackColor = [Drawing.Color]::White
+$script:JobHost.BackColor = $script:ColorCard
 $script:JobHost.Visible = $false
 $script:JobHost.Height = 0
 $jobRows = @()
@@ -6540,22 +7016,12 @@ $script:JobSplit.Height = 12
 $script:JobSplit.Visible = $false
 $script:JobSplit.Margin = New-Object Windows.Forms.Padding(0)
 $script:JobSplit.Cursor = [Windows.Forms.Cursors]::SizeNS
-$script:JobSplit.BackColor = [Drawing.Color]::White
+$script:JobSplit.BackColor = $script:ColorCard
 $script:JobSplit.TabStop = $false
 Enable-DoubleBuffer $script:JobSplit
+Enable-ResizeRedraw $script:JobSplit
 $script:JobSplit.Add_Paint({
-    $g = $_.Graphics
-    $mid = [int]($this.ClientSize.Height / 2)
-    $line = New-Object Drawing.Pen $script:ColorLine
-    $g.DrawLine($line, 0, $mid, $this.ClientSize.Width, $mid)
-    $line.Dispose()
-    $tone = $(if ($script:JobSplitHot -or $script:JobSplitDrag) { [Drawing.Color]::FromArgb(71, 85, 105) } else { [Drawing.Color]::FromArgb(148, 156, 168) })
-    $brush = New-Object Drawing.SolidBrush $tone
-    $cx = [int]($this.ClientSize.Width / 2)
-    foreach ($offset in @(-18, -6, 6, 18)) {
-        $g.FillRectangle($brush, ($cx + $offset), ($mid - 1), 4, 3)
-    }
-    $brush.Dispose()
+    Paint-SplitBar $this $_.Graphics ([bool]($script:JobSplitHot -or $script:JobSplitDrag))
 })
 $script:JobSplit.Add_MouseEnter({
     $script:JobSplitHot = $true
@@ -6607,10 +7073,11 @@ $script:StatusPanel.Controls.Add($script:BatchLabel)
 $script:StatusPanel.Controls.Add($script:VersionLabel)
 $script:StatusPanel.Controls.Add($script:ProgressTrack)
 $script:StatusPanel.Add_Paint({
-    $pen = New-Object Drawing.Pen $script:ColorLine
-    $_.Graphics.DrawLine($pen, 0, 0, $script:StatusPanel.Width, 0)
+    $pen = New-Object Drawing.Pen $script:ColorRule, 2
+    $_.Graphics.DrawLine($pen, 0, 1, $this.Width, 1)
     $pen.Dispose()
 })
+Enable-ResizeRedraw $script:StatusPanel
 
 $script:ListSplitMin = 72
 $script:LogSplitMin = 52
@@ -6649,22 +7116,22 @@ $folderCaption.ForeColor = $script:ColorInk
 $folderCaption.BackColor = $script:ColorPage
 $folderCaption.Dock = 'Fill'
 $folderCaption.TextAlign = 'BottomLeft'
+$script:FolderCaption = $folderCaption
 
 $script:FolderCard = New-Object Windows.Forms.Panel
 $script:FolderCard.Dock = 'Fill'
-$script:FolderCard.BackColor = [Drawing.Color]::White
+$script:FolderCard.BackColor = $script:ColorCard
 $script:FolderCard.Margin = New-Object Windows.Forms.Padding(0, 4, 0, 0)
 $script:FolderLabel = New-Object Windows.Forms.Label
 $script:FolderLabel.Text = 'Look in'
 $script:FolderLabel.AutoSize = $true
 $script:FolderLabel.Font = $script:FontUi
 $script:FolderLabel.ForeColor = $script:ColorInk
-$script:FolderLabel.BackColor = [Drawing.Color]::White
+$script:FolderLabel.BackColor = $script:ColorCard
 $script:FolderBox = New-Object Windows.Forms.TextBox
 $script:FolderBox.ReadOnly = $true
 $script:FolderBox.Font = $script:FontUi
-$script:FolderBox.BackColor = [Drawing.Color]::White
-$script:FolderBox.ForeColor = $script:ColorInk
+Set-EntryColors $script:FolderBox
 $script:FolderBox.BorderStyle = [Windows.Forms.BorderStyle]::FixedSingle
 $script:FolderBox.AllowDrop = $true
 $script:BrowseButton = New-Button 'Browse' 'secondary' 96 28
@@ -6673,10 +7140,9 @@ $script:FolderCard.Controls.Add($script:FolderLabel)
 $script:FolderCard.Controls.Add($script:FolderBox)
 $script:FolderCard.Controls.Add($script:BrowseButton)
 $script:FolderCard.Add_Paint({
-    $pen = New-Object Drawing.Pen $script:ColorLine
-    $_.Graphics.DrawRectangle($pen, 0, 0, ($script:FolderCard.Width - 1), ($script:FolderCard.Height - 1))
-    $pen.Dispose()
+    Paint-RuleBorder $_.Graphics $this.Width $this.Height
 })
+Enable-ResizeRedraw $script:FolderCard
 $script:FolderCard.AllowDrop = $true
 $script:FolderCard.Add_DragEnter({
     if ($script:Work -ne 'idle') { $_.Effect = 'None'; return }
@@ -6787,7 +7253,8 @@ foreach ($pair in @(
     $box.Tag = [string]$pair.Id
     $box.AutoSize = $true
     $box.Font = $script:FontUi
-    $box.BackColor = [Drawing.Color]::White
+    $box.BackColor = $script:ColorCard
+    $box.ForeColor = $script:ColorInk
     $box.Padding = New-Object Windows.Forms.Padding(2, 1, 4, 1)
     $box.Checked = $false
     $box.Add_CheckedChanged({
@@ -6801,6 +7268,7 @@ foreach ($pair in @(
         }
     })
     $hostItem = New-Object Windows.Forms.ToolStripControlHost($box)
+    $hostItem.BackColor = $script:ColorCard
     $hostItem.AutoSize = $true
     $hostItem.Margin = New-Object Windows.Forms.Padding(2, 2, 2, 2)
     [void]$script:ShowMenu.Items.Add($hostItem)
@@ -6842,7 +7310,7 @@ $script:Files.GridLines = $false
 $script:Files.HideSelection = $false
 $script:Files.MultiSelect = $false
 $script:Files.Font = $script:FontUi
-$script:Files.BackColor = [Drawing.Color]::White
+$script:Files.BackColor = $script:ColorCard
 $script:Files.ForeColor = $script:ColorInk
 $script:Files.BorderStyle = 'FixedSingle'
 $script:Files.ShowItemToolTips = $true
@@ -6914,13 +7382,13 @@ Enable-DoubleBuffer $script:Files
 
 $script:OptionsCard = New-Object Windows.Forms.Panel
 $script:OptionsCard.Dock = 'Fill'
-$script:OptionsCard.BackColor = [Drawing.Color]::White
+$script:OptionsCard.BackColor = $script:ColorCard
 $script:OptionsCard.Margin = New-Object Windows.Forms.Padding(0, 6, 0, 6)
 $script:OptionsTitle = New-Object Windows.Forms.Label
 $script:OptionsTitle.Text = 'Options'
 $script:OptionsTitle.Font = $script:FontSection
 $script:OptionsTitle.ForeColor = $script:ColorInk
-$script:OptionsTitle.BackColor = [Drawing.Color]::White
+$script:OptionsTitle.BackColor = $script:ColorCard
 $script:SubfoldersCheck = New-Check 'Include subfolders'
 $script:AutoCheck = New-Check 'Delete originals automatically'
 $script:AutoCheck.AutoCheck = $false
@@ -6998,7 +7466,7 @@ $script:BudgetTitle = New-Object Windows.Forms.Label
 $script:BudgetTitle.Text = 'Budgets'
 $script:BudgetTitle.Font = $script:FontSection
 $script:BudgetTitle.ForeColor = $script:ColorInk
-$script:BudgetTitle.BackColor = [Drawing.Color]::White
+$script:BudgetTitle.BackColor = $script:ColorCard
 $script:BudgetLabels = @()
 $script:BudgetBoxes = @()
 $script:BudgetSwatches = @()
@@ -7010,7 +7478,7 @@ foreach ($anchor in (Get-BudgetAnchors)) {
     $name.Text = [string]$anchor.Name
     $name.Font = $script:FontUi
     $name.ForeColor = $(if ($mark) { $mark.Fore } else { $script:ColorInk })
-    $name.BackColor = [Drawing.Color]::White
+    $name.BackColor = $script:ColorCard
     $name.AutoEllipsis = $true
     $box = New-Object Windows.Forms.ComboBox
     $box.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
@@ -7045,10 +7513,9 @@ $script:BudgetLabels = @($script:BudgetLabels)
 $script:BudgetBoxes = @($script:BudgetBoxes)
 $script:OptionsCard.Controls.Add($script:BudgetTitle)
 $script:OptionsCard.Add_Paint({
-    $pen = New-Object Drawing.Pen $script:ColorLine
-    $_.Graphics.DrawRectangle($pen, 0, 0, ($script:OptionsCard.Width - 1), ($script:OptionsCard.Height - 1))
-    $pen.Dispose()
+    Paint-RuleBorder $_.Graphics $this.Width $this.Height
 })
+Enable-ResizeRedraw $script:OptionsCard
 foreach ($chk in @($script:SubfoldersCheck, $script:ReencodeCheck, $script:DetailedCheck, $script:ShutdownCheck)) {
     $chk.Add_CheckedChanged({ if (-not $script:Loading) { Save-Settings } })
 }
@@ -7084,7 +7551,7 @@ $script:FindLabel.Text = 'Find'
 $script:FindLabel.AutoSize = $true
 $script:FindLabel.Font = $script:FontUi
 $script:FindLabel.ForeColor = $script:ColorInk
-$script:FindLabel.BackColor = [Drawing.Color]::FromArgb(244, 246, 248)
+$script:FindLabel.BackColor = $script:ColorPage
 $script:FindBox = New-Object Windows.Forms.ComboBox
 $script:FindBox.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
 $script:FindBox.Font = $script:FontUi
@@ -7097,6 +7564,12 @@ $findText = if ([int]$script:FindLimit -gt 0) { [string][int]$script:FindLimit }
 $findIndex = $script:FindBox.Items.IndexOf($findText)
 $script:FindBox.SelectedIndex = $(if ($findIndex -ge 0) { $findIndex } else { 0 })
 $script:FindBox.Add_SelectedIndexChanged({ if (-not $script:Loading) { Save-Settings } })
+foreach ($box in @($script:FolderPick, $script:OverPick, $script:JobBox, $script:CpuUseBox, $script:FindBox)) {
+    Install-ComboDraw $box
+}
+foreach ($box in @($script:BudgetBoxes)) {
+    Install-ComboDraw $box
+}
 $script:CancelButton.Enabled = $false
 $script:StopAfterButton.Enabled = $false
 $script:ContinueButton.Enabled = $false
@@ -7141,12 +7614,14 @@ $activityLabel.ForeColor = $script:ColorInk
 $activityLabel.BackColor = $script:ColorPage
 $activityLabel.Dock = 'Fill'
 $activityLabel.TextAlign = 'BottomLeft'
+$script:ActivityLabel = $activityLabel
 
 $logHost = New-Object Windows.Forms.Panel
 $logHost.Dock = 'Fill'
 $logHost.BackColor = $script:ColorLogBg
 $logHost.Padding = New-Object Windows.Forms.Padding(10, 8, 10, 8)
 $logHost.Margin = New-Object Windows.Forms.Padding(0, 4, 0, 0)
+$script:LogHost = $logHost
 $script:Log = New-Object Windows.Forms.RichTextBox
 $script:Log.Dock = 'Fill'
 $script:Log.BorderStyle = 'None'
@@ -7160,10 +7635,9 @@ $script:Log.WordWrap = $true
 $script:Log.ShortcutsEnabled = $true
 $logHost.Controls.Add($script:Log)
 $logHost.Add_Paint({
-    $pen = New-Object Drawing.Pen ([Drawing.Color]::FromArgb(55, 65, 81))
-    $_.Graphics.DrawRectangle($pen, 0, 0, ($this.Width - 1), ($this.Height - 1))
-    $pen.Dispose()
+    Paint-RuleBorder $_.Graphics $this.Width $this.Height
 })
+Enable-ResizeRedraw $logHost
 
 $script:ListSplit = New-Object Windows.Forms.Panel
 $script:ListSplit.Dock = 'Fill'
@@ -7173,19 +7647,9 @@ $script:ListSplit.Cursor = [Windows.Forms.Cursors]::SizeNS
 $script:ListSplit.BackColor = $script:ColorPage
 $script:ListSplit.TabStop = $false
 Enable-DoubleBuffer $script:ListSplit
+Enable-ResizeRedraw $script:ListSplit
 $script:ListSplit.Add_Paint({
-    $g = $_.Graphics
-    $mid = [int]($this.ClientSize.Height / 2)
-    $line = New-Object Drawing.Pen $script:ColorLine
-    $g.DrawLine($line, 0, $mid, $this.ClientSize.Width, $mid)
-    $line.Dispose()
-    $tone = $(if ($script:ListSplitHot -or $script:ListSplitDrag) { [Drawing.Color]::FromArgb(71, 85, 105) } else { [Drawing.Color]::FromArgb(148, 156, 168) })
-    $brush = New-Object Drawing.SolidBrush $tone
-    $cx = [int]($this.ClientSize.Width / 2)
-    foreach ($offset in @(-18, -6, 6, 18)) {
-        $g.FillRectangle($brush, ($cx + $offset), ($mid - 1), 4, 3)
-    }
-    $brush.Dispose()
+    Paint-SplitBar $this $_.Graphics ([bool]($script:ListSplitHot -or $script:ListSplitDrag))
 })
 $script:ListSplit.Add_MouseEnter({
     $script:ListSplitHot = $true
@@ -7245,19 +7709,9 @@ $script:LogSplit.Cursor = [Windows.Forms.Cursors]::SizeNS
 $script:LogSplit.BackColor = $script:ColorPage
 $script:LogSplit.TabStop = $false
 Enable-DoubleBuffer $script:LogSplit
+Enable-ResizeRedraw $script:LogSplit
 $script:LogSplit.Add_Paint({
-    $g = $_.Graphics
-    $mid = [int]($this.ClientSize.Height / 2)
-    $line = New-Object Drawing.Pen $script:ColorLine
-    $g.DrawLine($line, 0, $mid, $this.ClientSize.Width, $mid)
-    $line.Dispose()
-    $tone = $(if ($script:LogSplitHot -or $script:LogSplitDrag) { [Drawing.Color]::FromArgb(71, 85, 105) } else { [Drawing.Color]::FromArgb(148, 156, 168) })
-    $brush = New-Object Drawing.SolidBrush $tone
-    $cx = [int]($this.ClientSize.Width / 2)
-    foreach ($offset in @(-18, -6, 6, 18)) {
-        $g.FillRectangle($brush, ($cx + $offset), ($mid - 1), 4, 3)
-    }
-    $brush.Dispose()
+    Paint-SplitBar $this $_.Graphics ([bool]($script:LogSplitHot -or $script:LogSplitDrag))
 })
 $script:LogSplit.Add_MouseEnter({
     $script:LogSplitHot = $true
@@ -7320,6 +7774,7 @@ Set-Tip $script:RecycleCheck 'Remove the matching #recycle copy after a delete. 
 Set-Tip $script:ReencodeCheck 'Turn audio that cannot be copied, such as Windows Media Audio, into AAC.'
 Set-Tip $script:DetailedCheck 'List each encode step. The percent stays on the bar.'
 Set-Tip $script:ShutdownCheck 'Turn the computer off after Convert finishes. You get one minute to cancel.'
+Set-Tip $script:DarkModeCheck 'Dark window. The lines between the list, options, and activity are light in this mode and dark in the bright window.'
 Set-Tip $script:ClearSkipsButton 'Forget files skipped because the new copy was larger. Scan again to list them.'
 Set-Tip $script:BudgetTitle 'Size line for each picture. Recommended is the starting choice.'
 Update-BudgetTips
@@ -7481,11 +7936,64 @@ if ($waiting.Count -gt 0) {
 Warn-MissingTools
 Update-Buttons
 Set-Status 'Ready' 'idle'
+Apply-MainTheme
 Update-Shortcut
 Update-ChromeLayout
 
 function Assert-True([bool]$condition, [string]$message) {
     if (-not $condition) { throw $message }
+}
+
+function Test-RedrawOnResize($control) {
+    if (-not $control) { return $false }
+    $flags = [Reflection.BindingFlags]'Instance,NonPublic'
+    $method = $control.GetType().GetMethod('GetStyle', $flags)
+    if (-not $method) { return $false }
+    return [bool]$method.Invoke($control, @([Windows.Forms.ControlStyles]::ResizeRedraw))
+}
+
+function Assert-DisabledReadable($btn, [string]$name) {
+    Assert-True ($null -ne $btn) "$name is missing"
+    Assert-True (-not $btn.Enabled) "$name was enabled during the dark check"
+    Assert-True ($btn.ForeColor.ToArgb() -eq $script:ColorDisabledText.ToArgb()) "$name text stayed dim"
+    Assert-True ($btn.BackColor.ToArgb() -eq $script:ColorDisabled.ToArgb()) "$name face stayed dim"
+    $bmp = New-Object Drawing.Bitmap $btn.Width, $btn.Height
+    try {
+        $btn.DrawToBitmap($bmp, (New-Object Drawing.Rectangle 0, 0, $btn.Width, $btn.Height))
+        $light = 0
+        for ($y = 2; $y -lt ($bmp.Height - 2); $y++) {
+            for ($x = 2; $x -lt ($bmp.Width - 2); $x++) {
+                $c = $bmp.GetPixel($x, $y)
+                if ($c.R -ge 220 -and $c.G -ge 220 -and $c.B -ge 220) { $light++ }
+            }
+        }
+        Assert-True ($light -gt 12) "$name has no light text in dark mode"
+    } finally {
+        $bmp.Dispose()
+    }
+}
+
+function Assert-MutedFace($control, [string]$name) {
+    Assert-True ($null -ne $control) "$name is missing"
+    Assert-True (-not $control.Enabled) "$name stayed active while grayed out"
+    $bmp = New-Object Drawing.Bitmap $control.Width, $control.Height
+    try {
+        $control.DrawToBitmap($bmp, (New-Object Drawing.Rectangle 0, 0, $control.Width, $control.Height))
+        $light = 0
+        $x0 = 8
+        if ($control -is [Windows.Forms.CheckBox]) { $x0 = 22 }
+        $x1 = $bmp.Width - 8
+        if ($control -is [Windows.Forms.ComboBox]) { $x1 = $bmp.Width - 18 }
+        for ($y = 4; $y -lt ($bmp.Height - 4); $y++) {
+            for ($x = $x0; $x -lt $x1; $x++) {
+                $c = $bmp.GetPixel($x, $y)
+                if ($c.R -ge 190 -and $c.G -ge 190 -and $c.B -ge 190) { $light++ }
+            }
+        }
+        Assert-True ($light -gt 12) "$name is still too dark when grayed out"
+    } finally {
+        $bmp.Dispose()
+    }
 }
 
 function Save-FormImage($targetForm, [string]$path) {
@@ -7595,7 +8103,7 @@ function Invoke-OverCheck {
     Assert-True ($heavy.SubItems[6].BackColor.ToArgb() -eq $script:ColorOverHeavyBack.ToArgb()) 'Heavy was not yellow'
     Assert-True ($extreme.SubItems[6].BackColor.ToArgb() -eq $script:ColorOverExtremeBack.ToArgb()) 'Extreme was not red'
     Assert-True ($done.SubItems[6].Text -eq '4.00x') 'A finished row hid its ratio'
-    Assert-True ($done.SubItems[6].BackColor.ToArgb() -eq [Drawing.Color]::White.ToArgb()) 'A finished row was colored as an offender'
+    Assert-True ($done.SubItems[6].BackColor.ToArgb() -eq $script:ColorCard.ToArgb()) 'A finished row was colored as an offender'
     Assert-True ($script:OverPick.Items[0] -match 'Slight' -and $script:OverPick.Items[0] -match '1 file') 'Slight count'
     Assert-True ($script:OverPick.Items[2] -match 'Extreme' -and $script:OverPick.Items[2] -match '1 file') 'Extreme count'
     $script:OverPick.SelectedIndex = 2
@@ -8299,7 +8807,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:CheckUpdateButton.Text -eq 'Check for updates') 'Check for updates was missing'
     Assert-True (-not $script:UpdateButton.Enabled) 'Update started enabled'
     Assert-True ($script:CheckUpdateButton.Parent -eq $script:Header) 'Check for updates is not in the header'
-    Assert-True ((Get-AppVersion) -eq '1.1.3.1') 'Version file was not 1.1.3.1'
+    Assert-True ((Get-AppVersion) -eq '1.1.3.2') 'Version file was not 1.1.3.2'
     Assert-True ($null -ne $script:Form.Icon) 'The window has no icon'
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $script:Root 'Video Dehydrator.lnk'))
     Assert-True ($shortcut.IconLocation -match 'vd-icon\.ico') 'The shortcut icon was not vd-icon.ico'
@@ -8310,7 +8818,7 @@ function Invoke-SmokeTest {
     Assert-True ($script:Tips.GetToolTip($script:ReportBugButton) -match 'GitHub bug report') 'Report a bug tooltip'
     $bugUrl = Get-BugReportUrl
     Assert-True ($bugUrl.StartsWith('https://github.com/philipvern-dot/video-dehydrator/issues/new?template=bug_report.yml&')) 'Bug report link was not the GitHub form'
-    Assert-True ($bugUrl -match 'version=1\.1\.3\.1') 'Bug report link was missing the version'
+    Assert-True ($bugUrl -match 'version=1\.1\.3\.2') 'Bug report link was missing the version'
     Assert-True ($bugUrl -match 'windows=Windows%20(10|11)%20\(build%20\d+\)') 'Bug report link was missing the Windows version'
     Assert-True ($script:HelpBox.Text -match 'Report a bug opens a GitHub page') 'The guide was missing Report a bug'
     Assert-True ($script:HelpBox.Text -match 'Include latest activity is a choice') 'The guide was missing the activity choice'
@@ -8545,6 +9053,13 @@ function Invoke-SmokeTest {
     $script:Form.ClientSize = New-Object Drawing.Size(900, $script:Form.ClientSize.Height)
     Update-ChromeLayout
     Assert-True ($script:TitleLabel.Right -le $script:CheckUpdateButton.Left) 'The title overlaps Check for updates'
+    Assert-True ($script:DarkModeCheck.Parent -eq $script:Header) 'Dark mode is not in the header'
+    Assert-True ($script:DarkModeCheck.Width -gt 40) 'Dark mode checkbox has no width'
+    Assert-True ($script:DarkModeCheck.Right -le ($script:CheckUpdateButton.Left + 1)) 'Dark mode overlaps Check for updates'
+    Assert-True ($script:DarkModeCheck.Left -lt $script:CheckUpdateButton.Left) 'Dark mode is not left of Check for updates'
+    Assert-True ($script:TitleLabel.Right -le $script:DarkModeCheck.Left) 'The title overlaps Dark mode'
+    Assert-True ($script:DarkModeCheck.Bottom -le $script:DonateButton.Top) 'Dark mode overlaps Donate'
+    Assert-True ($script:DarkModeCheck.ForeColor.ToArgb() -eq [Drawing.Color]::White.ToArgb()) 'Dark mode label is not white on the header'
     Assert-True ($script:UpdateButton.Right -le ($script:Header.ClientSize.Width - 8)) 'Update sits outside the header'
     Assert-True ($script:ReportBugButton.Right -le ($script:Header.ClientSize.Width - 8)) 'Report a bug sits outside the header'
     Assert-True ($script:DonateButton.Right -le ($script:ReportBugButton.Left + 1)) 'Donate overlaps Report a bug'
@@ -8835,6 +9350,77 @@ function Invoke-SmokeTest {
     Assert-True (-not $recycleProblem.Shown) 'Smoke test opened the recycle window'
     Clear-RecycleResults
     if ($script:HelpForm) { $script:HelpForm.Close() }
+    Assert-True ($null -ne $script:DarkModeCheck) 'Dark mode is missing'
+    Assert-True ($script:DarkModeCheck.Text -eq 'Dark mode') 'Dark mode label'
+    Assert-True ($script:DarkModeCheck.Parent -eq $script:Header) 'Dark mode left the header'
+    Assert-True ($script:ClearSkipsButton.Top -gt $script:ShutdownCheck.Bottom) 'Clear skips covers Shutdown'
+    $skipsFit = ($script:ClearSkipsButton.Bottom -le $script:OptionsCard.ClientSize.Height) -or [bool]$script:OptionsCard.AutoScroll
+    Assert-True $skipsFit 'Clear skips is clipped with no scroll'
+    Assert-True ($script:DarkModeCheck.Checked -eq [bool]$script:DarkMode) 'Dark mode did not follow its setting'
+    foreach ($panel in @($script:FolderCard, $script:OptionsCard, $script:LogHost, $script:StatusPanel, $script:ListSplit, $script:LogSplit, $script:JobSplit)) {
+        Assert-True (Test-RedrawOnResize $panel) 'A separator does not repaint when the window is resized'
+    }
+    $ruleNow = $script:ColorRule.ToArgb()
+    $ruleWant = $(if ($script:DarkMode) { [Drawing.Color]::FromArgb(229, 231, 235).ToArgb() } else { [Drawing.Color]::FromArgb(31, 41, 55).ToArgb() })
+    Assert-True ($ruleNow -eq $ruleWant) 'The separator lines do not match the saved mode'
+    Set-ThemePalette $true
+    Apply-MainTheme
+    Assert-True ($script:Form.BackColor.ToArgb() -eq [Drawing.Color]::FromArgb(15, 23, 42).ToArgb()) 'Dark mode left the window bright'
+    Assert-True ($script:ColorRule.ToArgb() -eq [Drawing.Color]::FromArgb(229, 231, 235).ToArgb()) 'Dark mode lines are not light'
+    Assert-True ($script:OptionsCard.BackColor.ToArgb() -eq $script:ColorCard.ToArgb()) 'Options did not turn dark'
+    Assert-True ($script:Files.BackColor.ToArgb() -eq $script:ColorCard.ToArgb()) 'The file list did not turn dark'
+    Assert-True ($script:FolderCard.BackColor.ToArgb() -eq $script:ColorCard.ToArgb()) 'The folder card did not turn dark'
+    Assert-True ($script:StatusPanel.BackColor.ToArgb() -eq $script:ColorCard.ToArgb()) 'The status bar did not turn dark'
+    Assert-True ($script:DynamicCheck.BackColor.ToArgb() -eq $script:ColorPage.ToArgb()) 'Dynamic jobs did not match the dark page'
+    Assert-True ($script:DarkModeCheck.BackColor.ToArgb() -eq $script:ColorHeader.ToArgb()) 'Dark mode checkbox left the header'
+    Assert-True ($script:DarkModeCheck.ForeColor.ToArgb() -eq [Drawing.Color]::White.ToArgb()) 'Dark mode label went dark'
+    Assert-True ($script:ColorDisabledText.R -gt 200) 'Disabled text stayed dim in dark mode'
+    foreach ($pair in @(
+        @{ Name = 'Faulty source file'; Button = $script:FaultButton },
+        @{ Name = 'Update'; Button = $script:UpdateButton },
+        @{ Name = 'Select folder'; Button = $script:SelectFolderButton },
+        @{ Name = 'Clear'; Button = $script:ClearButton },
+        @{ Name = 'Optimize'; Button = $script:ConvertButton },
+        @{ Name = 'Cancel'; Button = $script:CancelButton },
+        @{ Name = 'Compare'; Button = $script:CompareButton },
+        @{ Name = 'Stop after current file'; Button = $script:StopAfterButton },
+        @{ Name = 'Continue'; Button = $script:ContinueButton }
+    )) {
+        $wasOn = [bool]$pair.Button.Enabled
+        if ($wasOn) { $pair.Button.Enabled = $false }
+        Assert-DisabledReadable $pair.Button $pair.Name
+        if ($wasOn) { $pair.Button.Enabled = $true }
+    }
+    Assert-True ($script:ColorDisabled.R -gt 90) 'The grayed-out face is still too dark'
+    Assert-True ($script:ColorDisabledInk.R -gt 190 -and $script:ColorDisabledInk.G -gt 190 -and $script:ColorDisabledInk.B -gt 190) 'Grayed-out writing is still too dark'
+    foreach ($pair in @(
+        @{ Name = 'Include subfolders'; Control = $script:SubfoldersCheck },
+        @{ Name = 'Delete originals automatically'; Control = $script:AutoCheck },
+        @{ Name = 'Dynamic encode batch jobs'; Control = $script:DynamicCheck },
+        @{ Name = 'Find'; Control = $script:FindBox },
+        @{ Name = 'Parallel jobs'; Control = $script:JobBox },
+        @{ Name = 'CPU use'; Control = $script:CpuUseBox },
+        @{ Name = 'Budgets'; Control = $script:BudgetBoxes[0] }
+    )) {
+        $wasOn = [bool]$pair.Control.Enabled
+        if ($wasOn) { $pair.Control.Enabled = $false }
+        $pair.Control.Refresh()
+        Assert-MutedFace $pair.Control $pair.Name
+        if ($wasOn) { $pair.Control.Enabled = $true }
+    }
+    Update-Buttons
+    Assert-True ($script:Log.BackColor.ToArgb() -eq [Drawing.Color]::FromArgb(28, 36, 48).ToArgb()) 'The activity box left its dark background'
+    Assert-True ($script:ScanButton.BackColor.ToArgb() -eq $script:ColorPrimary.ToArgb()) 'Scan lost its blue button'
+    Assert-True ($script:HelpButton.ForeColor.ToArgb() -eq $script:ColorInk.ToArgb()) 'A plain button kept bright-mode text'
+    Set-ThemePalette $false
+    Apply-MainTheme
+    Assert-True ($script:Form.BackColor.ToArgb() -eq [Drawing.Color]::FromArgb(238, 241, 244).ToArgb()) 'Bright mode did not return'
+    Assert-True ($script:OptionsCard.BackColor.ToArgb() -eq [Drawing.Color]::White.ToArgb()) 'Options did not return to white'
+    Assert-True ($script:ColorRule.ToArgb() -eq [Drawing.Color]::FromArgb(31, 41, 55).ToArgb()) 'Bright mode lines did not return'
+    Assert-True ($script:DarkModeCheck.ForeColor.ToArgb() -eq [Drawing.Color]::White.ToArgb()) 'Dark mode label is dark in the bright window'
+    Assert-True ($script:UpdateButton.ForeColor.R -lt 180) 'Disabled text stayed bright in the bright window'
+    Set-ThemePalette ([bool]$script:DarkModeCheck.Checked)
+    Apply-MainTheme
     Invoke-PlayerCheck
     $script:Form.Close()
     Write-Output 'SMOKE OK'
